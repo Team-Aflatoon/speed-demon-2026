@@ -224,3 +224,62 @@ stream here is on the critical path there.
   instructions and 10% less wall time, so selection is the largest single cost left.
 - **Pieces of 512 KB or 2 MB** instead of 1 MB, **sorting groups of up to 64 or 128**
   instead of 32: within noise.
+
+## v8: reading with pread, decided on the box
+
+v7 landed at 24.5 ms on the box against 13 ms here, a wider gap than the clock ratio
+explains, and the read-floor probe (14.6 ms just to scan the mapped input) said where to
+look: on the box the mapping's page faults are expensive, and here they are not. Local
+timing could not decide between reading paths (mmap and pread were within noise of each
+other), so two correct builds that differ only in how they read went to the board head to
+head, in consecutive slots:
+
+| Build | Input read by | Run ID | T (s) | M (MB) | K |
+|---|---|---|---|---|---|
+| a12 | private read-only mmap (v7's way), one fault per 64 KB | run-5450dc2d90d1 | 0.0245 | 17.6 | 43.11 |
+| a13 | `pread` of each 128 KB piece into a per-worker buffer | run-cbad326faf08 | 0.0207 | 18.5 | 46.55 |
+
+The two builds share everything but the reading (and the piece size that goes with it:
+1 MB mapped, 128 KB read), so the 3.8 ms (15%) is the cost of faulting the input in on
+the box. The extra copy into a buffer that stays in L2 costs
+less than the faults it replaces, and there is no mapping to tear down at exit. The
+buffers cost 0.9 MB of M.
+
+(Two earlier read-floor probes, run-f70b36471354 and run-f71c8ec82249, aborted at startup:
+the probe programs took their mode from argv, and the probe runner builds a probe with
+track-a's own Dockerfile, which passes none. The probes were rewritten to need no
+arguments, but by then every board push had to pass, so the question was settled with
+the two correct builds above.)
+
+The other changes from v7 to v8 are measured locally, by deterministic cachegrind counts
+and interleaved runs:
+
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 42 | The hour cache compared as one 16-byte SSE load (13 bytes masked) instead of two words: 679M to 657M instructions, since it frees registers in the hot loop | | 0.013 | 17.9 | |
+| 43 | Second line-end candidate as the lowest set bit once the lowest is cleared (`blsr` + `tzcnt` instead of `lzcnt` arithmetic): 663M to 654M | | 0.013 | 17.9 | |
+| 44 | The plan's condition variable is signalled only when a worker waits: about 1,900 `futex` calls fewer per run | | 0.013 | 17.9 | |
+| 45 | Names stored with the space that follows them, so one masked 64-byte compare also checks the length (no separate length compare) | | 0.013 | 17.9 | |
+| 46 | Memory released before the peak: report scratch pooled at most two, no text pooled for the last hours, the last worker unmaps the logs (and their page tables) | | 0.013 | 16.3 | |
+| 47 | a12 on the board: steps 42-46 on v7's mmap reading | run-5450dc2d90d1 | 0.0245 | 17.6 | 81.7 |
+| 48 | a13 on the board: the same with `pread` in 128 KB pieces; each worker frees its buffer after one of the last pieces | run-cbad326faf08 | 0.0207 | 18.5 | 83.4 |
+| 49 | Count pass tallied by the record's top 12 bits (endpoint id and 5xx flag together), one increment per record instead of a packed 64-bit add: 654M to 628M instructions | | 0.013 | 16.5 | |
+| 50 | Log blocks of 4 KB (one page per worker) instead of 1 KB: page faults 9.1k to 6.3k, since four workers no longer race to fault in the same fresh page | | 0.013 | 17.0 | |
+| 51 | Each hour's text reserves room for all its lines at once (untouched pages cost nothing), so it never grows by copying: M median 17.1 to 15.9 MB, 300 fewer page faults | | 0.013 | 15.9 | |
+| 52 | **v8 as submitted**: steps 42-51 (a13's reading with steps 49 to 51); 628M instructions, 6.2k page faults; S 530 | | | | |
+
+On the box, instruction counts matter less than kernel work: a12 does 5% fewer
+instructions than v7 and ran in the same 24.5 ms, while removing the input's faults saved
+3.8 ms. So the last step went after faults too.
+
+### v8 experiments that did not make it
+
+- **`MADV_POPULATE_READ` per piece** on the mapping (a12 plus one call per piece that
+  fills its page-table entries instead of faults): run-d5a15d3df29a, 26.0 ms, slower than
+  plain mmap on the box (24.5 ms); pread is the way.
+- **Splitting the reports of the hours left when parsing ends into four parts** for the
+  idle workers: the tail after parsing stayed at about 1 ms (each part repeats the count
+  and scatter, and needs its own scratch).
+- **Per-stretch block reservation**, so no line checks for the end of its block: 5M fewer
+  instructions (0.8%), not worth eight more lines.
+- **Pointer pairs instead of indices for the open blocks:** no change in instructions.
