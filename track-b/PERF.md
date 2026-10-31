@@ -23,6 +23,7 @@ per step. Compare a step's A/B with its parent, not its local T with another row
 | 8 | Term table slots shrunk from 24 to 16 bytes (first 12 bytes of the term inline, id and length packed into one word; longer terms are confirmed against their text), so four slots share a cache line and the table is 2 MB instead of 3. A/B against v2: 207.8 vs 215.0 ms, CPU 1,986 vs 2,008 ms, M 0.7 MiB lower: a small win, within noise. (The local T of 0.20 looks worse than step 7's only because it was measured on a busier machine.) | | 0.20 (local) | 51 (local) | |
 | 9 | Dense bits written into a one-word-per-term stripe for the current 64 documents and flushed into the bitmaps every 64 documents, instead of into a full transposed copy of every bitmap. It stays as L1-friendly as step 4, drops a ~770 KB buffer per thread and the per-batch transpose. A/B: M 38.7 vs 50.9 MiB, 194 vs 202 ms median, CPU 1,956 vs 1,897 ms (within noise). M is now under the 44 MB cap of the memory axis. | | 0.19 (local) | 40 (local) | |
 | 10 | Line count, no behaviour change: `query.rs` folded into `main.rs`, `Answer::merge` reduced to a sort of at most 20 ids. S 1,013 to 1,006. **This is v3.** | run-d53081aa4120 (reruns run-4f979d5ac144: 0.3021 s, 39.7 MB; run-a5f9c82b0e45: 0.3070 s) | 0.3035 | 39.1 | ≈ 65.9 (computed) |
+| 11 | Clean-room redesign, built separately and adopted whole (see "v4" below): phrases checked during the scan against each document's token ids, so they need no index; postings built once per 8 MB segment by partition instead of a throwaway index per 4,096 documents; BOOL queries answered once per segment instead of once per batch; corpus read with `pread`; parallel query parse into a lock-free table. Head-to-head on the board: T 184.3 vs ~302 ms, K 25.45 vs 20.87. S rose from 993 to 1,364. **This is v4.** | run-64a666bd15fb | 0.1843 | 35.8 | |
 
 **What the board says.** Board T stayed at 302-316 ms from v1 to v3: the local gains of
 steps 5-10 (a few percent each in A/B) are within the board's run-to-run spread. The board win
@@ -94,3 +95,89 @@ stage in a copy of the program.
   deterministic, moved exactly as measured.
 - Ideas that remove work in one place often add it in another: the global classes and the anchor
   offsets were both clean on paper and net losses in measurement.
+
+## v4: clean-room redesign
+
+v1 to v3 plateaued at about 302 ms on the board while the local time kept falling. The design
+itself had a ceiling: every 4,096-document batch built a throwaway index and then answered all
+50,000 queries against it, about 84 passes over the query set, and phrase candidates were
+re-read from the text. v4 was written from scratch in a separate folder and adopted whole once
+it beat v3 on the board.
+
+**Board head-to-head:** run-64a666bd15fb, T 184.3 ms, M 35.8 MB, S 1,364, K 25.45, against
+v3's ~302 ms, 39.1 MB, S 993, K 20.87. The time gain outweighs the longer code by far: S costs
+about 5% of K, T gains about 28%.
+
+What changed, and why:
+
+1. **Phrases are checked during the scan, with no index.** Each phrase gets one anchor: the
+   term with the fewest occurrences in `queries.txt` (longest on a tie). Common words appear in
+   many queries and rare ones in one or two, so this finds rare words without a pass over the
+   corpus. On seed 1 the anchors occur 1.26 M times in `docs.txt`, against 0.92 M for the true
+   rarest terms (measured offline) and 52 M for v3's "longest term". The scan keeps every
+   token's term id; at the end of a document each phrase anchored there is compared with the
+   ids around the anchor. v3's route, candidates from postings and then the text, would be
+   214,000 candidate documents re-read, a `pread` each now that the corpus is not mapped.
+2. **`pread` into 128 KB per-thread buffers instead of `mmap`.** Track A measured this 15%
+   faster on the box (its page-fault path is slow); locally the two were the same.
+3. **Postings built once per 8 MB segment, by partition.** Each document's distinct BOOL terms
+   go into 64 streams by `id % 64`; one build task per stream counting-sorts it into `u16`
+   lists, plus bitmaps for terms in more than 1/16 of the segment. Each build task touches about
+   100 KB.
+4. **BOOL queries answered once per segment** (32 segments instead of ~84 batches), against
+   real lists: AND/NOT against a dense term test its bitmap; two lists are combined by
+   spreading one into an L1 mask and testing the other; gallop when one is 16x longer.
+5. **One task queue instead of phase barriers**, with chunk streams double buffered by
+   segment parity, so the next segment is scanned while one is built and answered. Waiting
+   is about 1% of CPU time.
+6. **Parallel query parse into a lock-free table** (CAS on a slot's first word) with dense ids
+   from per-thread blocks.
+
+### Steps (local)
+
+Local figures are from `bench/bench.sh b` or a dev runner with the same cpuset; v3 measured
+165-175 ms on the bench in the same session.
+
+| Step | Change | Local T | M |
+|---|---|---|---|
+| a | First correct build, 16 MB segments | 121-127 ms | 54.6 MB |
+| b | Scanner arrays grown on demand instead of zero-filled to a worst-case size (9.4 MB across 12 threads); dense term ids instead of table-slot ids (the seen bitset shrinks from 32 to 9.5 KB per thread, per-partition metadata from 2 MB to 0.6 MB) | 118-135 ms | 44.3-44.8 MB |
+| c | 8 MB segments: chunk streams and postings halve. Eval cost hardly depends on the segment size (15.7% of CPU at 8 MB, 14.0% at 32 MB) | 125-132 ms | 35.0-36.1 MB |
+| d | Eval: no lookups once an AND or NOT has emptied the result; a dense first term filters the list instead of merging with it | eval CPU 257 to 246 ms | |
+| e | Eval: AND/NOT of two lists through an L1 mask (`sift`) instead of a branch-free merge, whose steps depend on each other | 103-112 ms; eval CPU 246 to ~190 ms | |
+| f | Scan: local slices instead of fields (no reloads of vector headers after every store, fewer bounds checks), token ids per region instead of a per-document vector, a dummy id for misses so recording a token is branch-free | 101-106 ms; scan CPU ~880 to ~820 ms | 35.4-36.1 MB |
+
+CPU split of step f (sum over 12 threads, about 1.2 s): scan ~820 ms, eval ~190, build ~75,
+waiting ~10; the parallel query parse takes 5.5-6.4 ms of wall time before the scan starts.
+Scan ablation (before step f): read + classify + flatten 165 ms, + key/hash/prefetch 380, +
+table lookups 766, + per-document recording 870, + writing the postings 960.
+
+### Experiments that did not help (v4)
+
+- 16, 32 or 128 tokens per prefetch round instead of 64: the same.
+- No slot prefetch at all: the same locally (the laptop's out-of-order window hides L3 hits);
+  kept for the box, whose L2 is smaller.
+- A 2 MB table (load 0.58) instead of 4 MB (load 0.29): the same locally.
+- `_MM_HINT_T1` instead of `_MM_HINT_T0`: worse.
+- Union-to-bitmap thresholds of 1/32, 1/64 and 1/128 of the documents instead of 1/16: the
+  same.
+
+### Correctness checks
+
+Besides seeds 1 and 7, 23 cases against the reference: the spec's worked example, every
+hand-written case of `tests/test_b_index.py`, generated tiny seeds 1-6 and sample seeds 2-3,
+and random cases with long tokens (12, 13, 17, 32 and 33+ bytes), terms sharing their first 12
+bytes, a line longer than a read buffer, op words as terms and NOT emptying a set. The same 23
+also pass with a stress build whose read buffer, chunk and segment are 1 KB, 4 KB and 64 KB,
+which exercises every boundary path. Fuzzing found one bug before submission: two threads
+failing on malformed queries could both call `exit` and hang; only the first now reports.
+
+### Lessons (v4)
+
+- A design's ceiling is set by its structure, not its tuning. Ten steps of v1 to v3 moved the
+  board 3%; changing what is repeated (84 query passes, candidate re-reads) moved it 39%.
+- Statistics before code: one offline pass over the corpus (term frequencies, phrase candidate
+  counts, anchor costs under several heuristics) chose the phrase design before any of it was
+  written.
+- Memory was found by accounting, not guessing: printing every buffer's capacity showed zero-
+  filled worst-case scratch arrays and slot-indexed per-term arrays as the two big items.

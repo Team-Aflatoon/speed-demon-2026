@@ -1,82 +1,75 @@
 # Track B: Index
 
-Team Aflatoon: Dhruv Sharma (@spiritsfuse), Anushika Chauhan (@Anushika06), Pratyush Mishra (@PratyushMishra-2nd).
+Team Aflatoon: Dhruv Sharma (@Spiritsfuse), Anushika Chauhan (@Anushika06), Pratyush Mishra (@PratyushMishra-2nd).
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 
 ## Approach
 
-The queries are part of the input, so we never build a general index. The program reads
-`queries.txt` first and puts every distinct query term (about 76,000) into one
-open-addressing hash table with 16-byte slots (the first 12 bytes of the term inline, its id
-and length packed into one word). Any corpus token that is not in that table is dropped the moment
-it is seen, and that covers most of the 600,000-word vocabulary.
+The queries are part of the input, so the program reads `queries.txt` first and indexes
+only its terms. Twelve threads parse line-aligned ranges of the file and insert every word
+into one open-addressing hash table at the same time: a thread claims an empty slot with a
+compare-and-swap on its first word, so no locks are needed. A slot is 16 bytes: the first
+12 bytes of the term inline, its length, a dense term id and two flags (the term appears in a
+BOOL query; the term anchors a phrase). Ids come from per-thread blocks of 1,024, so handing
+them out costs no shared counter per term.
 
-`docs.txt` is memory-mapped. The harness has already loaded it into the page cache, so the
-mapping adds nothing to our memory peak. The file is cut into 3 MB blocks of whole lines, and
-up to 12 worker threads claim blocks from an atomic counter. A worker handles a block in
-batches of up to 4,096 documents. For each batch it builds a small inverted index of the query
-terms, answers all 50,000 queries against it, and folds each non-empty answer into that query's
-running total. Count and sum just add up, and the ten smallest ids merge like two sorted lists.
-So the index never spans more than one batch, and its memory stays at a few hundred kilobytes
-per thread whatever the corpus size.
+**Phrases need no index.** Every phrase gets one anchor term: the one that occurs least often
+in `queries.txt`, the longest on a tie. Common words appear in many queries and rare words in
+one or two, so this picks rare corpus words without reading the corpus: on seed 1 the chosen
+anchors occur 1.26 million times in `docs.txt`, against 0.92 million for the truly rarest
+terms and 52 million for "the longest term". While scanning a document the program keeps
+the term id of every token (a dummy id for tokens that are no query term). When the document
+ends, each phrase anchored at one of its tokens is compared with the ids around that token.
+Positions are never stored and no document is read twice.
 
-**Tokenizing.** Each 64-byte chunk becomes two bitmasks (token bytes and LFs) from a few AVX2
-compares. Token starts are `alnum & !(alnum << 1)`, and the lexer visits starts and line ends
-with trailing-zero counts, so it branches once per token instead of once per byte. A token is
-lowercased by a single `| 0x20` on its first 16 bytes, loaded as two `u64`s. That works because
-every token byte is a letter or a digit, and digits already have that bit set. The two words
-are the hash key.
+**Reading and tokenizing.** `docs.txt` is read with `pread` into a 128 KB buffer per
+thread, cut at the last line end, with the partial line carried to the next read. Each
+64-byte block becomes three bitmasks (token bytes, LFs and TABs) from a few AVX2 compares.
+Every line starts with "id TAB", so a prefix XOR of the LF and TAB bits marks exactly those
+bytes and the ids never become tokens. Token starts and ends are extracted from the masks
+into two arrays. Tokens are then keyed (`| 0x20` lowercases letters and leaves digits alone),
+hashed and their table slots prefetched 64 at a time, and only then looked up, so the cache
+misses of rare words overlap.
 
-**Parsing the queries** is serial, so it is two passes: parse every line, then insert the
-words into a term table pre-sized from the word count, each insert prefetching the slot of the
-word 16 places ahead.
+**Postings.** The corpus is cut into segments of about 8 MB (some 8,000 documents), and
+documents are numbered from 0 within a segment as `u16`. For each document the scan writes
+its distinct BOOL terms (found with an L1-sized bitset) as `doc << 16 | id / 64` into one of
+64 streams, chosen by `id % 64`. One build task per stream counting-sorts it into a sorted
+list per term and adds a bitmap for terms found in more than 1/16 of the segment's documents.
+Everything a build task touches fits in about 100 KB.
 
-**Hiding memory latency.** Most lookups of rare words miss the cache. A document is therefore
-handled in three passes: hash every token and prefetch its table slot, resolve the tokens to
-term ids and prefetch each term's state word, then record the terms. About 150 lookups per
-document overlap instead of queueing one after another.
+**BOOL queries** are answered once per segment, strictly left to right. The first term's set
+is borrowed until a second set has to be combined with it. AND and NOT against a dense term
+test its bitmap. Between two lists, one is spread into a small bitmap and the other tested
+against it, which is about three times faster than a merge (whose steps depend on each
+other); when one list is 16 times longer, the short one gallops through it instead. A large OR
+goes to a bitmap. Answers add up across segments in id order: count and sum add, and the ten
+smallest ids are the first ten that arrive. The sum of the ids in a bitmap word comes from six
+masked popcounts rather than a visit to every bit.
 
-**Postings.** In a batch, a rare term keeps a sorted list of local document numbers (`u16`),
-built by a counting sort of the batch's (document, term) hits. A term that once appears in more
-than 64 of every 4,096 documents of a batch becomes "dense" for that worker. From then on the
-scan sets its bit in a 512-byte bitmap directly, with no duplicate check and no list.
-
-A worker's first batch is a 512-document warm-up, so that twelve first batches, in which every
-term is still a list, don't set the memory peak. During the scan, dense bits go into a
-one-word-per-term stripe for the current 64 documents, which stays in L1. It is flushed into the
-bitmaps every 64 documents: one write per dense term instead of one cache line per hit.
-
-**BOOL queries** run strictly left to right as a small state machine. A one-term query, or
-`x AND <absent>`, only borrows the term's set; a combined result lives in a scratch bitmap,
-where OR and NOT with a list set or clear its bits directly and AND goes through a mask.
-A 10 KB per-batch presence bitset answers "is this term in the batch at all?" from L1, which is
-the usual case for rare terms. The sum of the ids in a bitmap word is computed without visiting
-the bits: bit k of a position is set exactly under the mask `0xAAAA..`, `0xCCCC..`, `0xF0F0..`
-and so on, so the sum is `Σ popcount(w & mask_k) << k`.
-
-**PHRASE queries** first AND their terms to get the candidate documents. In each candidate the
-program then looks for whole-token occurrences of the phrase's longest term (usually its rare
-anchor), using an AVX2 test of each position's first and last byte, 32 positions at a time. From
-each occurrence it reads tokens outwards, only as far as the phrase reaches. No positions are
-stored.
+**One task queue.** Scanning, building and answering are tasks taken in the order
+`scan 0, scan 1, build 0, answer 0, scan 2, build 1, answer 1, ...`. A task waits only for the
+tasks whose output it reads. The streams are double buffered by segment parity, so threads go
+on scanning the next segment while the last one is built and answered, and no thread idles at
+a phase boundary.
 
 All I/O errors and malformed input end the program with a message on stderr and exit code 1.
-`unsafe` appears only in the hand-declared `mmap`/`munmap`/`prctl`, the prefetch hint and the AVX2
-loads, each with a `SAFETY` note.
+`unsafe` appears only in the hand-declared `prctl`, the prefetch hint and the AVX2 loads, each
+with a `SAFETY` note.
 
 ## Dependencies
 
-None. The Rust standard library only. `mmap`, `munmap` and `prctl` are declared by hand with
-`extern "C"`. The build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`) and refuses to
-compile without it.
+None. The Rust standard library only. `prctl` is declared by hand with `extern "C"`. The
+build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`) and refuses to compile without it.
 
 ## With another 24 hours
 
-- The term table lookups were the largest single cost, at about 28 ms per thread, when we
-  measured them with the earlier 24-byte slots. The 16-byte slots helped only within noise, so
-  that cost is probably still there. A small separate table for the few hundred hottest terms is
-  the next thing to try.
-- Two ideas measured worse for us and are logged in PERF.md: global term classes from a sample,
-  and a positional index for phrase anchors. Each would need a cheaper build step to pay off.
-- Fewer lines: the evaluator's match arms grow a lot under rustfmt.
+- The query parse runs before the scan can start and takes about 6 ms of wall time, most of
+  it in table inserts that miss the cache one after another. Prefetching a few words ahead and
+  allocating the table lazily should halve it.
+- About 40% of the scan's CPU time is the table lookup itself. A smaller table, or a
+  separate small table for the few hundred hottest words, would keep more lookups in L2 on the
+  scoring box, whose L2 is smaller than our laptops'.
+- Writing the BOOL postings costs about 4 ns per (term, document) pair; fewer, larger writes
+  per document should make that cheaper.
