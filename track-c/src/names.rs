@@ -77,7 +77,7 @@ impl Names {
         }
         for ((at, key), n) in at.iter_mut().zip(&keys).zip(batch) {
             *at = 4 * self.id(key, b, n)? + usize::from(n.group / 64);
-            prefetch(&self.pairs[*at]);
+            crate::prefetch_write(&self.pairs[*at]); // PROBE
         }
         for (&at, n) in at.iter().zip(batch) {
             let bit = 1 << (n.group % 64);

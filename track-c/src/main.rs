@@ -67,6 +67,14 @@ pub fn prefetch<T>(value: &T) {
     unsafe { _mm_prefetch::<_MM_HINT_T0>((value as *const T).cast()) }
 }
 
+/// PROBE: like `prefetch`, but asks for the line in exclusive (writable)
+/// state (PREFETCHW), so a later atomic RMW does not wait for ownership.
+pub fn prefetch_write<T>(value: &T) {
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_ET0};
+    // SAFETY: as for `prefetch`; PREFETCHW is enabled in the Dockerfile.
+    unsafe { _mm_prefetch::<_MM_HINT_ET0>((value as *const T).cast()) }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
