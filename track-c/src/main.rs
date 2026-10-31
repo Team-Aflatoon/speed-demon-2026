@@ -18,7 +18,7 @@ const SLOTS: usize = 1 << 17;
 /// Chunks per worker. More, smaller chunks even out the workers' finish times.
 const CHUNKS_PER_WORKER: usize = 16;
 /// The most worker threads (the scoring machine gives us twelve).
-const MAX_THREADS: usize = 12;
+const MAX_THREADS: usize = 6; // PROBE: one worker per P-core
 /// Groups: `_UNMATCHED` (0) and up to 255 countries.
 pub const GROUPS: usize = 256;
 
