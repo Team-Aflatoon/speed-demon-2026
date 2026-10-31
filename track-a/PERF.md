@@ -26,7 +26,11 @@ says which. The first board run showed the box at about 2x our quiet local wall 
 | 11 | Report and write overlapped: workers report the hours in order and the main thread writes each one as soon as all earlier ones are out (buffered writes; a bounded channel caps the texts in flight) | | min 28.7 vs 33.9 ms, median 38.6 vs 46.3 ms, interleaved, under load | 36 (local) | |
 | 12 | Per-worker, per-hour logs of 4-byte records (`id << 20 \| 5xx << 19 \| latency`, latencies of 2^19 and up kept aside) in 256 KB chunks; each hour reported by counting-sorting its logs by endpoint into one array, so every group is one contiguous slice; each hour's chunks are freed (unmapped) as soon as it is reported, so the logs shrink while the output's page cache grows | | CPU 128 vs 159 ms; min 22.8 vs 26.1 ms, interleaved | 25-28 (local) | |
 | 13 | `prctl(PR_SET_THP_DISABLE)` at start: the box's M was 47.5 MB against about 32 MB locally, consistent with transparent huge pages set to `always` there (Debian's default) backing malloc's per-thread arenas with 2 MB pages. Locally THP is `madvise`, so this cannot be measured here; the call returns 0 (checked with `perf trace`) | | no local change (expected) | no local change (expected) | |
-| 14 | v2 as it stands: steps 9-13, no text-buffer pool (no measurable effect, so removed) | | median 25.5 vs 34.9 ms for v1, interleaved in the sandbox, under load; CPU 141 vs 175 ms | median 24.9 vs 32.5 for v1 | |
+| 14 | v2 as submitted (commit 51067d3): steps 9-13, no text-buffer pool (no measurable effect, so removed) | | median 25.5 vs 34.9 ms for v1, interleaved in the sandbox, under load; CPU 141 vs 175 ms | median 24.9 vs 32.5 for v1 | |
+| 15 | Timeline instrumentation (per-thread phase events, temporary build): ingest threads started 0.2-2.5 ms apart and finished 4-4.5 ms apart (static equal ranges), the endpoint merge took 0.7 ms on one thread, reporting ~8 ms with ~30% idle, the writer finishing 0.8-1.5 ms after the last report. Fix for the first two: the file is cut into ~1 MB pieces; each worker owns a contiguous run and steals from the back of others' runs when done (a shared counter over all pieces scattered every worker over every hour: 12 x 72 log chunks, ingest 18 ms instead of 12, so it was replaced by owned runs) | | ingest ends now within 0.3-0.6 ms of each other; whole run min 21.0 vs 21.1 ms, median 22.9 vs 23.4 ms vs v2 (interleaved) | unchanged | |
+| 16 | Piece edges found by each worker instead of by the main thread before spawning (that touched 240 pages serially: first worker started at 0.8 ms, now 0.2-0.4 ms) | | timeline only; whole-run difference within noise | unchanged | |
+| 17 | Percentiles selected low to high (p50 on all n, p95 in the n/2 above it, p99 in the n/20 above that: 1.55n steps instead of 2.94n) | | inside noise in whole runs (selection is ~10% of CPU) | unchanged | |
+| 18 | v3 as it stands: steps 15-17 | | sandbox, under load: min 25.5 / median 35.6 ms vs v2 25.5 / 34.4 in the same interleaved set (no measurable whole-run change locally; the gain is structural, on load balance and start-up, and should show on a quiet box) | 23-27 | |
 
 ## Experiments that did not make it
 
@@ -56,6 +60,22 @@ says which. The first board run showed the box at about 2x our quiet local wall 
 - **One writer turn per worker (no channel):** each worker waits for its hour's turn to
   write. It held fewer texts (M about 3 MB lower) but workers sat idle: min 26.5 vs 22.8 ms.
 - **Not freeing hours during the report at all:** same T (min 22.0 vs 21.7 ms), 4 MB more M.
+- **PGO.** A trial build trained on seed 7 cut total CPU by 6-10% and single-core time
+  by about 4%. Built properly inside the image (the allowlisted llvm-tools image,
+  training on the published generator's output, seed 2, sample and then full scale), the
+  binary showed no gain we could separate from noise: single-core minima 97.6 (full-scale
+  training) and 92.6 (sample) vs 98.2 ms without, in one interleaved set, and equal total
+  CPU (149 vs 151 ms median) in another.
+  Reverted: four more Dockerfile lines and a heavier build for nothing measurable.
+- **A simpler endpoint table** (each name in its own padded box, no record arena): 25
+  fewer lines, but 4-5% slower on a single core (min 102.3 vs 97.8 ms). Kept the arena.
+- **Formatting a line's six numbers into one stack buffer** instead of per-number pushes
+  into the text: no measurable CPU change (skipping all formatting saves 10-25 ms of the
+  ~150 ms CPU total, skipping selection 10-15 ms). Reverted.
+- **Writer tail.** One timeline showed the writer finishing 8 ms after the last report:
+  single 140 KB buffered writes took up to 1 ms each while other jobs on the machine were
+  writing (dirty-page throttling, as far as we can tell). Other runs showed 0.8-1.5 ms. Not
+  changed; it is the main risk left in the report phase.
 - **A two-pass design (count, then place every latency at its exact final slot).** Ruled
   out by measurement: one bare AVX2 newline scan over the mapped 239 MB already takes
   about 7 ms with 12 threads here (memory bandwidth), so a second pass costs more than

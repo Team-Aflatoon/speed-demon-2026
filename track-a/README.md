@@ -10,8 +10,13 @@ One Rust binary, `src/main.rs`, no crates. Two parallel phases over a memory-map
 
 **1. Ingest (one pass over the bytes).** The file is `mmap`ed read-only. The harness has
 already pulled it into the page cache, so the mapping costs only page-table entries and
-none of its pages are charged to our memory peak. The file is cut into one range of whole
-lines per worker (up to 12, one per CPU of the cpuset), and every worker scans its range:
+none of its pages are charged to our memory peak. The file is cut into pieces of whole
+lines (~1 MB each). Each of up to 12 workers (one per CPU of the cpuset) owns a
+contiguous run of pieces and works through it front to back; a worker that runs out
+steals pieces from the back of another's run. So a worker that started late or shares a
+core just does less, all finish within a piece of each other, and each still sees only a
+few hours of the file. Each worker finds its pieces' line-aligned edges itself (a piece
+holds the lines that start in its nominal range). Within a piece:
 
 - *Line ends:* 64 bytes at a time, two AVX2 compares and `movemask` give a bitmask of
   newlines. A line has at least 40 bytes, so a block holds at most two: both candidates
@@ -47,8 +52,8 @@ order is exactly `&[u8]`'s `Ord`. Then the workers take the hours in order. For 
 logs of the workers that saw it are counting-sorted by endpoint rank: one pass counts lines
 and errors per endpoint, a prefix sum gives each endpoint a slice of one array, a second
 pass drops every latency into its slice. Every group is then contiguous, and
-`select_nth_unstable` finds p99, then p95 in the part left of it, then p50 in the part left
-of that: linear time, no sort. As soon as an hour is reported its log chunks are unmapped,
+`select_nth_unstable` finds p50, then p95 in the half above it, then p99 in the twentieth
+above that: about 1.55n steps, no sort. As soon as an hour is reported its log chunks are unmapped,
 so the logs shrink while the output grows. The main thread writes each hour's text as soon
 as all earlier hours are out, so writing overlaps the work.
 
@@ -68,9 +73,13 @@ None. `mmap` and `prctl` are declared by hand with `extern "C"`; SIMD comes from
 
 ## With another 24 hours
 
-- The ingest loop is now the bulk of the time (about 11-12 ms locally against a ~7 ms
-  floor for merely streaming the input). Next: interleave two independent line streams
-  per thread so their lookup chains overlap, and drop the remaining bounds checks there.
+- The ingest loop is now the bulk of the time (about 11 ms locally against a ~7 ms floor
+  for merely streaming the input); the endpoint lookup is ~20% of all samples. Next: a
+  cheaper first-level check for the lookup (most lines hit a handful of hot endpoints)
+  and fewer bounds checks in that loop.
+- The report phase still idles about 30% (rows finish out of order and the writer must
+  go in order); finishing the formatting of a big hour in two halves would shorten the
+  tail.
 - Fewer lines (S): the report pipeline and the endpoint table can be written more
   compactly.
 - Memory: two-byte latencies with a wider escape would bring the logs to ~8 MB, at the

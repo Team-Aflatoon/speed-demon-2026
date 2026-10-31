@@ -10,10 +10,11 @@ use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, RwLock};
+use std::sync::{mpsc, Mutex, RwLock};
 use std::thread;
 
 /// Distinct endpoints one worker can hold (a record has 12 bits for the id); the spec
@@ -30,6 +31,8 @@ const MARK: u32 = (1 << 19) - 1;
 /// Records per log chunk: 256 KB, so the allocator maps each chunk on its own and
 /// unmaps it when the hour is freed.
 const CHUNK: usize = 1 << 16;
+/// Bytes of input a worker claims at a time.
+const PIECE: usize = 1 << 20;
 /// Bytes of input whose line ends are found in one go (a multiple of 64).
 const SCAN: usize = 4096;
 
@@ -73,11 +76,18 @@ fn run() -> io::Result<()> {
         .map_or(1, |n| n.get())
         .min(12);
     let base = hour_number(&data[..13]) - ROWS as i64 / 2;
+    // The file is cut into ~1 MB pieces and each worker owns a contiguous run of them,
+    // which it works through front to back; one that runs out steals pieces from the
+    // back of another's run. So a worker that started late or ran slow just does
+    // less, all finish within a piece of each other, and each still sees few hours.
+    let pieces = len.div_ceil(PIECE);
+    let runs: Vec<_> = (0..workers)
+        .map(|w| Mutex::new(pieces * w / workers..pieces * (w + 1) / workers))
+        .collect();
     let shards = thread::scope(|s| {
-        let ranges = split(data, workers);
-        let handles: Vec<_> = ranges
-            .into_iter()
-            .map(|range| s.spawn(move || Shard::ingest(data, range, base)))
+        let runs = &runs;
+        let handles: Vec<_> = (0..workers)
+            .map(|w| s.spawn(move || Shard::ingest(data, runs, w, base)))
             .collect();
         let shards = handles
             .into_iter()
@@ -149,19 +159,18 @@ fn map(file: &File, len: usize) -> io::Result<*const u8> {
     Ok(p.cast())
 }
 
-/// Cuts the file into `parts` ranges of whole lines.
-fn split(data: &[u8], parts: usize) -> Vec<(usize, usize)> {
-    let mut bounds = vec![0];
-    for i in 1..parts {
-        let from = (data.len() * i / parts).max(bounds[i - 1]);
-        let cut = data[from..]
+/// Where the first line starting at or after byte `at` starts. Piece i holds the lines
+/// that start in its nominal range [i * PIECE, (i + 1) * PIECE), so every line is in
+/// exactly one piece, and each worker finds its pieces' edges itself.
+fn line_start(data: &[u8], at: usize) -> usize {
+    match at {
+        0 => 0,
+        _ if at >= data.len() => data.len(),
+        _ => data[at - 1..]
             .iter()
             .position(|&b| b == b'\n')
-            .map_or(data.len(), |p| from + p + 1);
-        bounds.push(cut);
+            .map_or(data.len(), |p| at + p),
     }
-    bounds.push(data.len());
-    bounds.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
 /// Every endpoint any worker saw, in output order, and `ranks[w][id]`: the output
@@ -199,18 +208,49 @@ fn too_many_endpoints() -> io::Error {
     io::Error::other(format!("more than {MAX_ENDPOINTS} distinct endpoints"))
 }
 
-/// What one worker learns from its range of the file.
+/// What one worker learns from its pieces of the file.
 struct Shard<'a> {
     endpoints: Endpoints,
     hours: Vec<Hour<'a>>,
 }
 
 impl<'a> Shard<'a> {
-    fn ingest(data: &'a [u8], (start, end): (usize, usize), base: i64) -> io::Result<Self> {
+    fn ingest(
+        data: &'a [u8],
+        runs: &[Mutex<Range<usize>>],
+        me: usize,
+        base: i64,
+    ) -> io::Result<Self> {
         let mut shard = Shard {
             endpoints: Endpoints::new(),
             hours: (0..ROWS).map(|_| Hour::default()).collect(),
         };
+        let claim = |w: usize| {
+            let mut run = runs[w].lock().expect("no worker panics");
+            if w == me {
+                run.next()
+            } else {
+                run.next_back()
+            }
+        };
+        let order = (me..runs.len()).chain(0..me);
+        while let Some(piece) = order.clone().find_map(claim) {
+            let edges = (
+                line_start(data, piece * PIECE),
+                line_start(data, (piece + 1) * PIECE),
+            );
+            shard.ingest_piece(data, edges, base)?;
+        }
+        Ok(shard)
+    }
+
+    /// Files every line of `data[start..end]`.
+    fn ingest_piece(
+        &mut self,
+        data: &'a [u8],
+        (start, end): (usize, usize),
+        base: i64,
+    ) -> io::Result<()> {
         // Lines arrive in roughly time order, so the hour is cached on its 13-byte text.
         let (mut seen, mut row) = ((0, 0), 0);
         let (mut line, mut ends) = (start, [0; 2 * SCAN / 64]);
@@ -219,7 +259,7 @@ impl<'a> Shard<'a> {
                 let key = (load(data, line), load(data, line + 5));
                 if key != seen {
                     seen = key;
-                    row = shard.hour_row(data, line, base)?;
+                    row = self.hour_row(data, line, base)?;
                 }
                 let (latency, sp) = parse_latency(data, nl);
                 // The method is 3 to 7 bytes after the 27-byte timestamp and a space,
@@ -229,13 +269,13 @@ impl<'a> Shard<'a> {
                 let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
                 let (start, end) = (line + 32 + zero.trailing_zeros() as usize / 8, sp - 4);
                 let hash = endpoint_hash(data, start, end);
-                let id = shard.endpoints.id(data, start, end, hash);
+                let id = self.endpoints.id(data, start, end, hash);
                 let id = id.ok_or_else(too_many_endpoints)?;
-                shard.hours[row].push(id, latency, data[sp - 3] == b'5');
+                self.hours[row].push(id, latency, data[sp - 3] == b'5');
                 line = nl + 1;
             }
         }
-        Ok(shard)
+        Ok(())
     }
 
     /// The row of the line's hour, relative to `base`; starts the hour if new.
@@ -455,7 +495,7 @@ fn report(
     for (rank, &[count, errors]) in counts.iter().enumerate().filter(|(_, c)| c[0] > 0) {
         let group = &mut latencies[ends[rank]..ends[rank] + count as usize];
         let (count, errors) = (u64::from(count), u64::from(errors));
-        let [p99, p95, p50] = percentiles(group).map(u64::from);
+        let [p50, p95, p99] = percentiles(group).map(u64::from);
         text.extend_from_slice(prefix);
         text.extend_from_slice(b":00:00Z ");
         text.extend_from_slice(&names[rank]);
@@ -467,18 +507,19 @@ fn report(
     }
 }
 
-/// Nearest-rank p99, p95 and p50 (rank ceil(p * n / 100)), by repeated selection: each
-/// select leaves the smaller values to its left, so the next, lower rank only needs to
-/// search that prefix.
+/// Nearest-rank p50, p95 and p99 (rank ceil(p * n / 100)), by repeated selection: each
+/// select leaves the larger values to its right, so the next, higher rank only needs
+/// to search that suffix: n + n/2 + n/20 steps in all.
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
     let n = values.len();
-    let mut last = (n, 0);
-    [99, 95, 50].map(|p| {
+    let (mut from, mut value) = (0, 0); // values[from..] hold the ranks not yet fixed
+    [50, 95, 99].map(|p| {
         let rank = (p * n + 99) / 100 - 1;
-        if rank < last.0 {
-            last = (rank, *values[..last.0].select_nth_unstable(rank).1);
+        if rank >= from {
+            value = *values[from..].select_nth_unstable(rank - from).1;
+            from = rank + 1;
         }
-        last.1
+        value
     })
 }
 
