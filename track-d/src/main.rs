@@ -217,11 +217,15 @@ impl Csr {
         self.off.len() - 1
     }
 
+    /// The packed edges of row `r`.
+    fn row(&self, r: usize) -> &[u32] {
+        &self.edges[self.off[r] as usize..self.off[r + 1] as usize]
+    }
+
     /// Out-edges of row `r` as (head, weight).
     fn out(&self, r: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
         let esc = (1 << self.weight_bits) - 1;
-        let edges = &self.edges[self.off[r] as usize..self.off[r + 1] as usize];
-        edges.iter().map(move |&e| {
+        self.row(r).iter().map(move |&e| {
             let (v, w) = ((e >> self.weight_bits) as usize, e & esc);
             (v, if w < esc { w as u64 } else { self.heavy(r, v) })
         })
@@ -384,14 +388,21 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
                 next += 1;
             }
             while let Some(u) = queue.pop_front() {
-                // The queue says which rows come next: fetch them ahead of time.
+                // The queue says which rows come next, so fetch ahead in three stages: an
+                // offset 16 nodes out, the row it points to 8 out, and the claim flags of
+                // that row's heads 4 out (these are the random reads that dominate).
                 if let Some(&ahead) = queue.get(8) {
                     prefetch(&g.edges[g.off[ahead as usize] as usize..]);
                 }
                 if let Some(&ahead) = queue.get(16) {
                     prefetch(&g.off[ahead as usize..]);
                 }
-                let row = &g.edges[g.off[u as usize] as usize..g.off[u as usize + 1] as usize];
+                if let Some(&ahead) = queue.get(4) {
+                    for &e in g.row(ahead as usize) {
+                        prefetch(&ids[(e >> g.weight_bits) as usize..]);
+                    }
+                }
+                let row = g.row(u as usize);
                 rows.extend_from_slice(row);
                 degrees.push(row.len().min(255) as u8);
                 if row.len() >= 255 {

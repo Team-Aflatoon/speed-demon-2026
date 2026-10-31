@@ -39,6 +39,25 @@ rows say so. Points for runs without a board figure are computed from T, M and S
 | 16 | S trims: one blanket `Width` trait for the bounds, `distance` takes the pair of searches, in-edges back to `build_csr`, unused helpers removed: S 600 to 538 | | same (local) | 68 (local) | |
 | 16 (board) | v3 as submitted (commit b661c23), S 538 | run-184dcb5b4f5a | 0.1459 | 70.8 | 70.2 |
 | 17 | Review fixes, no change in speed: rustfmt, named libc constants, SAFETY notes. One real bug fixed: `split_lines` read `text[at - 1]` at `at == 0` when the edge text is shorter than the thread count (a one-edge graph on 12 threads aborted). New one-edge cases added to the tests. S 538 to 544 (named constants) | | same (local) | 68 (local) | |
+| 17 (board) | v3 with the review fixes (commit 2cfc0f4), S 544 | run-83d74bc76638 | 0.1421 | 71.1 | 70.5 (computed) |
+| 18 | A third prefetch stage in the BFS walk: the claim flags (`rank` entries at random old ids) of the heads of the row 4 places ahead. The profile put about 70% of the walk on those loads | | total CPU -2.4% / -4% (local, two interleaved A/B runs of 6-8, medians); wall about 100 vs 104 ms | 68 (local) | |
+
+Where the CPU goes (local, step 18, wall ms / total CPU ms / parallel efficiency, i.e.
+CPU / (wall x 12), measured from the cgroup's `cpu.stat` at each phase boundary; a
+typical run):
+
+| Phase | Wall | CPU | Efficiency |
+|---|---|---|---|
+| Parse into the first CSR: count | 6 | 52 | 74% |
+| Parse into the first CSR: scatter | 8-14 | 80 | 55-85% |
+| Counting sort, then the BFS walk | 18 | 180 | 85% |
+| Rank fix-up and layout | 4 | 22 | about 50% |
+| In-edge transpose (count, scatter, sort) | 9 | 63 | about 55% |
+| Queries | 42 | 465 | 92% |
+
+The queries are about half of all CPU and already run on all 12 threads. The build
+phases lose a quarter to a half of their threads to page faults on fresh buffers (kernel
+spinlocks and TLB-flush IPIs show up in the profile) and to the barriers between steps.
 
 Peak memory by phase (local, cgroup `memory.current` sampled every 0.1 ms, maximum per
 phase, MiB). The board's M is the largest of these, and every v3 step aimed at whichever
@@ -101,6 +120,9 @@ phase was on top.
   follows the searches running now rather than each thread's largest): -6 MiB, but +25%
   total CPU. Every unmap in a 12-thread process shoots down the TLBs of all its CPUs, and
   the pages fault back in on the next big search.
+- **Reusing the first CSR's tail side array for the in-edge build** (it has the same
+  size, so no fresh page faults): median CPU 1051 against 1069 ms, within noise, and M
+  unchanged. Not worth the extra parameter.
 - **Interleaving out- and in-edge rows behind one offset array** (the lead's idea, -5 MiB):
   not tried in the end. Building it within the current peak needs an in-place serial
   expansion of the edge array, and compressed offsets had already shown that the extra
