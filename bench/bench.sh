@@ -10,6 +10,16 @@
 # seed 7); they are pre-read before timing so, as on the box, the page cache is warm
 # and not charged to the run's cgroup.
 set -euo pipefail
+
+# One benchmark at a time on this machine: concurrent runs from parallel work skew
+# each other's wall times by up to 30%. mkdir is atomic, so it serves as the lock;
+# a lock older than 15 minutes is treated as left behind by a killed run.
+lock="${TMPDIR:-/tmp}/sd-bench.lock"
+until mkdir "$lock" 2>/dev/null; do
+  [ -n "$(find "$lock" -maxdepth 0 -mmin +15 2>/dev/null)" ] && rmdir "$lock" 2>/dev/null
+  sleep 2
+done
+trap 'rmdir "$lock"' EXIT
 track=$1
 runs=${2:-5}
 sub=${3:-$track}
