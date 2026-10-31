@@ -14,12 +14,15 @@ use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex, RwLock};
+use std::sync::{mpsc, Mutex};
 use std::thread;
 
 /// Distinct endpoints one worker can hold (a record has 12 bits for the id); the spec
 /// promises 1,842 per seed.
 const MAX_ENDPOINTS: usize = 3072;
+/// A record has 12 bits for an endpoint id or rank, so at most 4,096 names in all.
+const NAMES: usize = 1 << 12;
+const _: () = assert!(MAX_ENDPOINTS <= NAMES && MAX_ENDPOINTS < SLOTS);
 /// Slots of the open-addressing endpoint table: a power of two, at most 3/8 full.
 const SLOTS: usize = 8192;
 /// Hour rows: 71 either side of the first line's hour, so any 72-hour span that
@@ -43,10 +46,12 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
         -> *mut c_void;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const PR_SET_THP_DISABLE: i32 = 41;
+const M_MMAP_THRESHOLD: i32 = -3;
 
 fn main() {
     // Transparent huge pages, `always` on stock Debian, would back malloc's per-thread
@@ -54,6 +59,11 @@ fn main() {
     // out is a hint: if an old kernel refuses it, the run is just as correct.
     // SAFETY: a plain prctl that touches no memory of ours.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    // Pin malloc's mmap threshold at 128 KB (setting it also stops glibc from raising
+    // it as mapped blocks are freed), so every 256 KB log chunk is its own mapping and
+    // freeing an hour returns its memory to the system at once.
+    // SAFETY: mallopt only changes the allocator's tuning; nothing is allocated yet.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 128 << 10) };
     if let Err(e) = run() {
         eprintln!("ingest: {e}");
         std::process::exit(1);
@@ -75,6 +85,8 @@ fn run() -> io::Result<()> {
     // writes the file while we run. The harness has it in the page cache already, so
     // the mapping costs page-table entries only and its pages are not charged to us.
     let data: &[u8] = unsafe { std::slice::from_raw_parts(map(&input, len)?, len) };
+    // The scoring cpuset is 12 CPUs (6 P-cores with hyperthreads); more workers than
+    // that would only time-slice.
     let workers = thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(12);
@@ -94,15 +106,17 @@ fn run() -> io::Result<()> {
             .collect();
         let shards = handles
             .into_iter()
+            // With panic = "abort" a worker cannot unwind, so join and lock never see
+            // a panicked thread or a poisoned lock; the expects document that.
             .map(|h| h.join().expect("no worker panics"));
         shards.collect::<io::Result<Vec<_>>>()
     })?;
     let (names, rank_of) = merge_endpoints(&shards)?;
-    // From here on each worker's hour sits behind a lock, so that it can be freed as
-    // soon as it is reported, while the logs of later hours are still in use.
-    let hours: Vec<Vec<RwLock<Hour>>> = shards
+    // From here on each worker's hour sits behind a lock: the task that reports it
+    // needs it mutably, then frees it, while other tasks work on other hours.
+    let hours: Vec<Vec<Mutex<Hour>>> = shards
         .into_iter()
-        .map(|s| s.hours.into_iter().map(RwLock::new).collect())
+        .map(|s| s.hours.into_iter().map(Mutex::new).collect())
         .collect();
 
     // Workers report the hours in order while this thread writes each one as soon as
@@ -133,7 +147,7 @@ fn run() -> io::Result<()> {
                     // (each chunk is its own mapping, so the memory goes back at once).
                     for hour in hours {
                         drop(std::mem::take(
-                            &mut hour[row].write().expect("no worker panics").chunks,
+                            &mut hour[row].lock().expect("no worker panics").chunks,
                         ));
                     }
                     if sender.send((row, text)).is_err() {
@@ -187,7 +201,7 @@ fn line_start(data: &[u8], at: usize) -> usize {
 /// Every endpoint any worker saw, in output order, and `ranks[w][id]`: the output
 /// rank of worker w's endpoint `id`. Deduplicating through one more hash table and
 /// sorting the ~1,842 survivors is far cheaper than sorting every worker's names.
-fn merge_endpoints(shards: &[Shard]) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u32>>)> {
+fn merge_endpoints(shards: &[Shard]) -> io::Result<(Vec<Vec<u8>>, Vec<Box<Ranks>>)> {
     let mut union = Endpoints::new();
     let global = shards
         .iter()
@@ -205,15 +219,28 @@ fn merge_endpoints(shards: &[Shard]) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u32>>)
     for (r, &g) in order.iter().enumerate() {
         rank[g] = r as u32;
     }
+    if order.len() > NAMES {
+        return Err(too_many_endpoints());
+    }
+    // Ranks are stored already shifted into a record's id bits.
     let ranks = global
         .iter()
-        .map(|g| g.iter().map(|&g| rank[g]).collect())
+        .map(|g| {
+            let mut ranks = Box::new([0; NAMES]);
+            g.iter()
+                .zip(ranks.iter_mut())
+                .for_each(|(&g, r)| *r = rank[g] << 20);
+            ranks
+        })
         .collect();
     Ok((
         order.iter().map(|&g| union.name(g).to_vec()).collect(),
         ranks,
     ))
 }
+
+/// Rank (shifted into the id bits of a record) of each of a worker's endpoint ids.
+type Ranks = [u32; NAMES];
 
 fn too_many_endpoints() -> io::Error {
     io::Error::other(format!("more than {MAX_ENDPOINTS} distinct endpoints"))
@@ -262,7 +289,8 @@ impl<'a> Shard<'a> {
         (start, end): (usize, usize),
         base: i64,
     ) -> io::Result<()> {
-        // Lines arrive in roughly time order, so the hour is cached on its 13-byte text.
+        // Lines arrive in roughly time order, so the hour is cached on its 13-byte text
+        // `YYYY-MM-DDTHH`, compared as the two overlapping 8-byte words at 0 and 5.
         let (mut seen, mut row) = (([0; 8], [0; 8]), 0);
         let (mut line, mut ends, mut padded) = (start, [0; 2 * SCAN / 64], [0; WINDOW]);
         for scan in (start..end).step_by(SCAN) {
@@ -384,7 +412,7 @@ struct Endpoints {
     /// Id -> offset of its record in `arena`.
     records: Vec<usize>,
     /// Hash slot -> 1 + offset of a record, or 0 for an empty slot.
-    slots: Vec<u32>,
+    slots: Box<[u32; SLOTS]>,
 }
 
 impl Endpoints {
@@ -392,7 +420,7 @@ impl Endpoints {
         Endpoints {
             arena: vec![0; 64],
             records: Vec::new(),
-            slots: vec![0; SLOTS],
+            slots: Box::new([0; SLOTS]),
         }
     }
 
@@ -456,7 +484,8 @@ impl Endpoints {
 fn same(a: &[u8], i: usize, b: &[u8], j: usize, n: usize) -> bool {
     match (a.get(i..i + 64), b.get(j..j + 64)) {
         (Some(x), Some(y)) if n <= 64 => {
-            // SAFETY: each load reads 32 bytes inside a 64-byte slice.
+            // SAFETY: each load reads 32 bytes inside a 64-byte slice. AVX2 is enabled
+            // crate-wide (target-cpu=x86-64-v3 in .cargo/config.toml).
             let equal = unsafe {
                 let eq = |k: usize| {
                     let x = _mm256_loadu_si256(x.as_ptr().add(k).cast());
@@ -478,8 +507,8 @@ fn same(a: &[u8], i: usize, b: &[u8], j: usize, n: usize) -> bool {
 /// sequential passes over the logs, no pointer chasing.
 fn report(
     row: usize,
-    hours: &[Vec<RwLock<Hour>>],
-    rank_of: &[Vec<u32>],
+    hours: &[Vec<Mutex<Hour>>],
+    rank_of: &[Box<Ranks>],
     names: &[Vec<u8>],
     latencies: &mut Vec<u32>,
     text: &mut Vec<u8>,
@@ -487,7 +516,7 @@ fn report(
     // Each worker read a few hours' worth of the file, so most miss most hours.
     let mut locked: Vec<_> = hours
         .iter()
-        .map(|h| h[row].write().expect("no worker panics"))
+        .map(|h| h[row].lock().expect("no worker panics"))
         .collect();
     let mut seen: Vec<_> = locked
         .iter_mut()
@@ -498,43 +527,53 @@ fn report(
         return;
     };
     // Count lines and errors per endpoint, and rewrite each record's worker-local
-    // id as the endpoint's global rank, so the second pass needs no lookup.
-    let mut counts = vec![[0u32; 2]; names.len()]; // per endpoint: lines, errors
+    // id as the endpoint's global rank, so the second pass needs no lookup. Ids and
+    // ranks are the records' top 12 bits, and these tables have 4,096 entries, so
+    // the compiler sees that no index can be out of bounds and checks none.
+    let mut counts = [[0u32; 2]; NAMES]; // per endpoint: lines, errors
     for (hour, rank_of) in &mut seen {
         let len = hour.len;
-        for record in hour.chunks.iter_mut().flat_map(|c| c.iter_mut()).take(len) {
-            let rank = rank_of[(*record >> 20) as usize];
-            counts[rank as usize][0] += 1;
-            counts[rank as usize][1] += *record >> 19 & 1;
-            *record = rank << 20 | *record & MARK;
+        for (i, chunk) in hour.chunks.iter_mut().enumerate() {
+            for record in &mut chunk[..(len - i * CHUNK).min(CHUNK)] {
+                let rank = rank_of[(*record >> 20) as usize];
+                let count = &mut counts[(rank >> 20) as usize];
+                count[0] += 1;
+                count[1] += *record >> 19 & 1;
+                *record = rank | *record & MARK;
+            }
         }
     }
-    let mut ends: Vec<usize> = counts
-        .iter()
-        .scan(0, |end, c| {
-            *end += c[0] as usize;
-            Some(*end)
-        })
-        .collect();
+    let mut ends = [0usize; NAMES];
+    let mut end = 0;
+    for (e, c) in ends.iter_mut().zip(&counts) {
+        end += c[0] as usize;
+        *e = end;
+    }
     latencies.clear();
-    latencies.resize(ends.last().map_or(0, |&e| e), 0);
+    latencies.resize(end, 0);
     // Fill each group from its end backwards, leaving `ends` at the group starts.
     let mut put = |rank: u32, latency| {
-        let end = &mut ends[rank as usize];
+        let end = &mut ends[(rank >> 20) as usize];
         *end -= 1;
         latencies[*end] = latency;
     };
     for (hour, rank_of) in &seen {
-        for &record in hour.records().flatten().filter(|&&r| r & MARK != MARK) {
-            put(record >> 20, record & MARK);
+        for chunk in hour.records() {
+            for &record in chunk.iter().filter(|&&r| r & MARK != MARK) {
+                put(record, record & MARK);
+            }
         }
         for &(id, latency) in &hour.large {
-            put(rank_of[id as usize], latency);
+            put(rank_of[id as usize & (NAMES - 1)], latency);
         }
     }
     // At most 20 + 1 + 125 + 6 * 11 + 1 bytes a line: reserve once, never regrow.
     text.reserve(counts.iter().filter(|c| c[0] > 0).count() * 213);
-    for (rank, &[count, errors]) in counts.iter().enumerate().filter(|(_, c)| c[0] > 0) {
+    for (rank, &[count, errors]) in counts[..names.len()]
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c[0] > 0)
+    {
         let group = &mut latencies[ends[rank]..ends[rank] + count as usize];
         let [p50, p95, p99] = percentiles(group);
         let ppm = (u64::from(errors) * 1_000_000 / u64::from(count)) as u32;
@@ -555,7 +594,8 @@ fn report(
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
     let n = values.len();
     if n <= 32 {
-        // Most groups are this small: one insertion sort beats three selections.
+        // Most groups are this small: one sort_unstable (an insertion sort at this size)
+        // beats three selections.
         values.sort_unstable();
         return [50, 95, 99].map(|p| values[(p * n + 99) / 100 - 1]);
     }
@@ -592,7 +632,8 @@ fn newline_mask(data: &[u8], at: usize, end: usize) -> u64 {
         padded[..data.len() - at].copy_from_slice(&data[at..]);
         &padded
     });
-    // SAFETY: both 32-byte loads read inside `chunk`, which is 64 bytes long.
+    // SAFETY: both 32-byte loads read inside `chunk`, which is 64 bytes long. AVX2 is
+    // enabled crate-wide (target-cpu=x86-64-v3).
     let mask = unsafe {
         let nl = _mm256_set1_epi8(b'\n' as i8);
         let lo = _mm256_loadu_si256(chunk.as_ptr().cast());
@@ -615,7 +656,8 @@ fn newline_mask(data: &[u8], at: usize, end: usize) -> u64 {
 #[inline(always)]
 fn parse_latency(w: &[u8; WINDOW], nl: u8) -> (u32, u8) {
     let tail: [u8; 16] = word(w, nl - 16);
-    // SAFETY: the load reads the 16 bytes of `tail`.
+    // SAFETY: the load reads the 16 bytes of `tail`. SSE4.1 and SSSE3 are enabled
+    // crate-wide (target-cpu=x86-64-v3).
     unsafe {
         let v = _mm_loadu_si128(tail.as_ptr().cast());
         let spaces = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b' ' as i8))) as u32;

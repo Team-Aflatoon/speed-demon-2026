@@ -56,8 +56,8 @@ logs of the workers that saw it are counting-sorted by endpoint rank: one pass c
 and errors per endpoint, a prefix sum gives each endpoint a slice of one array, a second
 pass drops every latency into its slice. Every group is then contiguous, and
 `select_nth_unstable` finds p50, then p95 in the half above it, then p99 in the twentieth
-above that: about 1.55n steps, no sort (groups of 32 or fewer, most of them, are simply
-insertion-sorted). The counting pass also rewrites each record's worker-local id as the
+above that: about 1.55n steps, no sort (groups of 32 or fewer, most of them, just get one
+`sort_unstable`, an insertion sort at that size). The counting pass also rewrites each record's worker-local id as the
 endpoint's rank, so the second pass needs no lookup. Digits are written ten places at a
 time from a two-digit table, with no loop whose length depends on the value; text
 buffers are reserved once and reused through a pool. As soon as an hour is reported its log chunks are unmapped,
@@ -67,15 +67,20 @@ as all earlier hours are out, so writing overlaps the work.
 **Memory.** The peak is near the end of ingest: the 3.1M records (12.4 MB), the endpoint
 tables and the first hours in flight. `prctl(PR_SET_THP_DISABLE)` keeps transparent huge
 pages, `always` on stock Debian, from backing malloc's per-thread arenas with mostly empty
-2 MB pages.
+2 MB pages (the board confirmed it: v2's M fell from 47.5 to 25.8 MB).
+`mallopt(M_MMAP_THRESHOLD)` pins the allocator's threshold at 128 KB, so each 256 KB log
+chunk is its own mapping and freeing an hour returns its memory at once.
 
-**Errors.** Every I/O failure, a timestamp outside a 72-hour window, or more than 3,072
-distinct endpoints is reported on stderr with a non-zero exit. `unsafe` is used only for
-the `mmap` and `prctl` calls and the AVX2 loads (each with why it stays in bounds).
+**Errors.** Every I/O failure, a timestamp outside a 72-hour window, more than 3,072
+distinct endpoints in one worker or 4,096 in all (a record has 12 bits for them; a
+compile-time assert ties the limits to that layout) is reported on stderr with a
+non-zero exit. `unsafe` is used only for
+the `mmap`, `prctl` and `mallopt` calls and the SIMD intrinsics (each with why it stays
+in bounds; AVX2 and SSE4.1 are enabled crate-wide by `target-cpu=x86-64-v3`).
 
 ## Dependencies
 
-None. `mmap` and `prctl` are declared by hand with `extern "C"`; SIMD comes from
+None. `mmap`, `prctl` and `mallopt` are declared by hand with `extern "C"`; SIMD comes from
 `std::arch`.
 
 ## With another 24 hours
