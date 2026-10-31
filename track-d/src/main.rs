@@ -1,19 +1,21 @@
 //! Speed Demon 2026, Track D (Traverse): exact point-to-point shortest paths.
 //!
 //! 1. Map graph.txt and parse it in parallel into a CSR of out-edges (`build_csr`).
-//! 2. Renumber the nodes in BFS order (`bfs_rank`): node ids in the file are random;
+//! 2. Renumber the nodes in BFS order (`bfs_layout`): node ids in the file are random;
 //!    renumbered, road-network neighbours sit at nearby ids, so a search touches a few
-//!    cache lines instead of one per node. Moving the rows gives the forward graph
-//!    (`permute`), and transposing that gives the in-edges (`build_csr` again).
+//!    cache lines instead of one per node. The walk lays out the forward graph in the
+//!    new order as it goes; transposing that gives the in-edges (`build_csr` again).
 //! 3. Answer the queries on all threads, each with a bidirectional Dijkstra.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Barrier, Mutex, OnceLock};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn prctl(option: i32, ...) -> i32;
 }
 
 /// Maps a whole file read-only. The harness prewarms /data into the page cache, so this
@@ -78,13 +80,60 @@ fn split_lines(text: &[u8], parts: usize) -> Vec<&[u8]> {
     cuts.windows(2).map(|w| &text[w[0]..w[1]]).collect()
 }
 
-/// Runs `f(k, states[k])` on one thread per state and collects the results in order.
+/// A fixed team of threads, started once: spawning a fresh set for each of the dozen
+/// parallel phases cost about 5 ms. The caller is member 0; the others sleep on `start`.
+struct Team {
+    size: usize,
+    job: Mutex<Option<&'static (dyn Fn(usize) + Sync)>>,
+    start: Barrier,
+    done: Barrier,
+}
+
+static TEAM: OnceLock<&'static Team> = OnceLock::new();
+
+impl Team {
+    fn start(size: usize) {
+        let [start, done] = [Barrier::new(size), Barrier::new(size)];
+        let team: &'static Team = Box::leak(Box::new(Team { size, job: Mutex::new(None), start, done }));
+        for k in 1..size {
+            std::thread::spawn(move || loop {
+                team.start.wait();
+                let job = team.job.lock().unwrap().expect("a job is set before start");
+                job(k);
+                team.done.wait();
+            });
+        }
+        TEAM.set(team).ok();
+    }
+
+    /// Calls `job(k)` for every member k, each on its own thread, and returns when all
+    /// have finished.
+    fn run(&self, job: &(dyn Fn(usize) + Sync)) {
+        // SAFETY: only the lifetime is erased. Members call the job strictly between the
+        // `start` and `done` barriers, and this function returns only after `done`, so
+        // no call can outlive the borrow.
+        let job: &'static (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(job) };
+        *self.job.lock().unwrap() = Some(job);
+        self.start.wait();
+        job(0);
+        self.done.wait();
+    }
+}
+
+/// Runs `f(k, states[k])` for every state, each on its own team member, and collects the
+/// results in order. There may be at most one state per member.
 fn parallel<S: Send, R: Send>(states: Vec<S>, f: impl Fn(usize, S) -> R + Sync) -> Vec<R> {
-    std::thread::scope(|scope| {
-        let f = &f;
-        let handles: Vec<_> = states.into_iter().enumerate().map(|(k, s)| scope.spawn(move || f(k, s))).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+    let team = TEAM.get().expect("Team::start runs first");
+    assert!(states.len() <= team.size);
+    let slots: Vec<Mutex<(Option<S>, Option<R>)>> = states.into_iter().map(|s| Mutex::new((Some(s), None))).collect();
+    team.run(&|k| {
+        if let Some(slot) = slots.get(k) {
+            let state = slot.lock().unwrap().0.take().unwrap();
+            let result = f(k, state);
+            slot.lock().unwrap().1 = Some(result);
+        }
+    });
+    slots.into_iter().map(|slot| slot.into_inner().unwrap().1.unwrap()).collect()
 }
 
 /// Anything that can list a graph's edges `(tail, head, weight)` in `parts` disjoint
@@ -97,7 +146,6 @@ trait EdgeSource: Sync {
 struct Text<'a>(Vec<&'a [u8]>);
 
 impl EdgeSource for Text<'_> {
-    #[inline(always)]
     fn each(&self, part: usize, _: usize, mut f: impl FnMut(usize, usize, u64)) {
         let (piece, mut i) = (self.0[part], 0);
         while i < piece.len() {
@@ -151,63 +199,30 @@ impl Csr {
     }
 
     /// Out-edges of row `r` as (head, weight).
-    #[inline(always)]
     fn out(&self, r: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
-        let escape = (1 << self.weight_bits) - 1;
+        let esc = (1 << self.weight_bits) - 1;
         let edges = &self.edges[self.off[r] as usize..self.off[r + 1] as usize];
         edges.iter().map(move |&e| {
-            let (v, w) = ((e >> self.weight_bits) as usize, e & escape);
-            (v, if w == escape { self.escaped(r, v) } else { w as u64 })
+            let (v, w) = ((e >> self.weight_bits) as usize, e & esc);
+            (v, if w < esc { w as u64 } else { self.heavy(r, v) })
         })
     }
 
+    /// The weight of the lightest escaped edge from row `r` to `v`.
     #[cold]
-    fn escaped(&self, r: usize, v: usize) -> u64 {
-        let i = self.escapes.partition_point(|&(x, y, _)| (x as usize, y as usize) < (r, v));
-        self.escapes[i].2 as u64
+    fn heavy(&self, r: usize, v: usize) -> u64 {
+        let key = (r as u32, v as u32, 0);
+        self.escapes[self.escapes.partition_point(|&e| e < key)].2 as u64
     }
 }
 
 /// A CSR lists its edges by contiguous ranges of rows.
 impl EdgeSource for Csr {
-    #[inline(always)]
     fn each(&self, part: usize, parts: usize, mut f: impl FnMut(usize, usize, u64)) {
         for r in part * self.rows() / parts..(part + 1) * self.rows() / parts {
             self.out(r).for_each(|(v, w)| f(r, v, w));
         }
     }
-}
-
-/// The same graph with every node u renamed `rank[u]`, rows and heads alike. Rows move
-/// as whole runs, so unlike `build_csr` nothing needs sorting: the new offsets are a
-/// prefix sum of the moved degrees, then each thread copies a range of old rows.
-fn permute(g: &Csr, rank: &[u32], parts: usize) -> Csr {
-    let n = rank.len();
-    let ranges: Vec<_> = (0..parts).map(|k| k * n / parts..(k + 1) * n / parts).collect();
-    let mut off = vec![0u32; n + 1];
-    let ends = as_atomic(&mut off[1..]);
-    parallel(ranges.clone(), |_, rows| {
-        rows.for_each(|u| ends[rank[u] as usize].store(g.off[u + 1] - g.off[u], Relaxed))
-    });
-    for r in 0..n {
-        off[r + 1] += off[r];
-    }
-    let mut edges = vec![0u32; g.edges.len()];
-    let cells = as_atomic(&mut edges);
-    let mask = (1 << g.weight_bits) - 1;
-    parallel(ranges, |_, rows| {
-        for u in rows {
-            let to = off[rank[u] as usize] as usize;
-            for (i, &e) in g.edges[g.off[u] as usize..g.off[u + 1] as usize].iter().enumerate() {
-                let head = rank[(e >> g.weight_bits) as usize];
-                cells[to + i].store(head << g.weight_bits | e & mask, Relaxed);
-            }
-        }
-    });
-    let rename = |&(t, h, w): &(u32, u32, u32)| (rank[t as usize], rank[h as usize], w);
-    let mut escapes: Vec<_> = g.escapes.iter().map(rename).collect();
-    escapes.sort_unstable();
-    Csr { off, edges, weight_bits: g.weight_bits, escapes }
 }
 
 /// Builds the CSR of n nodes holding the edge `map(u, v)` = (tail, head), of weight w,
@@ -304,26 +319,28 @@ fn build_csr(
 }
 
 /// Hints the CPU to pull the cache line holding `data[0]` into L1.
-#[inline(always)]
 fn prefetch<T>(data: &[T]) {
     use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
     // SAFETY: SSE is part of x86-64, and a prefetch never faults, whatever the address.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(data.as_ptr() as *const i8) };
 }
 
-/// A BFS numbering, `rank[old id] = new id`. Each thread walks its own share of the old
-/// ids and grows a BFS region from every one not yet claimed (nodes are claimed with an
-/// atomic flag), so the first regions spread until they meet and later roots mop up
-/// what is left; no thread idles while another still has work. Inside a region the BFS
-/// rings put road-network neighbours at nearby ids.
-fn bfs_rank(g: &Csr, threads: usize) -> Vec<u32> {
+/// Renumbers the nodes in BFS order and returns `rank` (old id -> new id) with the
+/// graph laid out in that order. Each thread walks its own share of the old ids and
+/// grows a BFS region from every one not yet claimed (nodes are claimed with an atomic
+/// flag), so the first regions spread until they meet and later roots mop up what is
+/// left; no thread idles while another still has work. Inside a region the BFS rings
+/// put road-network neighbours at nearby ids. A thread copies each row as it dequeues
+/// it, so its rows come out already in new-id order: placing them is a sequential copy
+/// that renames the heads, with no reordering pass over the whole graph.
+fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let n = g.rows();
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     // The plain load first: most neighbours are already claimed, and skipping the
     // locked swap for them keeps the walk free of fences.
     let claim = |v: usize| !claimed[v].load(Relaxed) && !claimed[v].swap(true, Relaxed);
-    let orders = parallel(vec![(); threads], |k, ()| {
-        let (mut order, mut head) = (Vec::new(), 0);
+    let walks = parallel(vec![(); threads], |k, ()| {
+        let (mut order, mut ends, mut rows, mut head) = (Vec::new(), Vec::new(), Vec::new(), 0);
         for root in k * n / threads..(k + 1) * n / threads {
             if !claim(root) {
                 continue;
@@ -338,23 +355,40 @@ fn bfs_rank(g: &Csr, threads: usize) -> Vec<u32> {
                 if let Some(&ahead) = order.get(head + 16) {
                     prefetch(&g.off[ahead as usize..]);
                 }
-                for (v, _) in g.out(u as usize) {
-                    if claim(v) {
-                        order.push(v as u32);
+                let row = &g.edges[g.off[u as usize] as usize..g.off[u as usize + 1] as usize];
+                rows.extend_from_slice(row);
+                ends.push(rows.len() as u32);
+                for &e in row {
+                    if claim((e >> g.weight_bits) as usize) {
+                        order.push(e >> g.weight_bits);
                     }
                 }
             }
         }
-        order
+        (order, ends, rows)
     });
-    // Each order is a contiguous run of new ids; write them all in parallel.
+    // Every row has been copied out, so the old arrays (same sizes) take the new graph:
+    // overwriting them costs no fresh page faults.
+    let (mut off, mut edges, weight_bits) = (g.off, g.edges, g.weight_bits);
+    // Thread k's nodes take the next run of new ids and its rows the next run of edges.
+    let starts: Vec<_> = walks.iter().scan((0, 0), |at, w| Some(std::mem::replace(at, (at.0 + w.0.len(), at.1 + w.2.len())))).collect();
     let mut rank = vec![0u32; n];
     let ranks = as_atomic(&mut rank);
-    let starts: Vec<usize> = orders.iter().scan(0, |at, o| Some(std::mem::replace(at, *at + o.len()))).collect();
-    parallel(orders, |k, order| {
-        order.iter().enumerate().for_each(|(i, &v)| ranks[v as usize].store((starts[k] + i) as u32, Relaxed))
+    parallel(walks.iter().zip(&starts).collect(), |_, ((order, _, _), &(first, _))| {
+        order.iter().enumerate().for_each(|(i, &v)| ranks[v as usize].store((first + i) as u32, Relaxed))
     });
-    rank
+    let (off_cells, edge_cells) = (as_atomic(&mut off[1..]), as_atomic(&mut edges));
+    let mask = (1 << weight_bits) - 1;
+    parallel(walks.into_iter().zip(starts).collect(), |_, ((_, ends, rows), (first, at))| {
+        ends.iter().enumerate().for_each(|(i, &end)| off_cells[first + i].store(at as u32 + end, Relaxed));
+        for (i, &e) in rows.iter().enumerate() {
+            edge_cells[at + i].store(rank[(e >> weight_bits) as usize] << weight_bits | e & mask, Relaxed);
+        }
+    });
+    let rename = |&(t, h, w): &(u32, u32, u32)| (rank[t as usize], rank[h as usize], w);
+    let mut escapes: Vec<_> = g.escapes.iter().map(rename).collect();
+    escapes.sort_unstable();
+    (rank, Csr { off, edges, weight_bits, escapes })
 }
 
 /// A monotone priority queue for Dijkstra: a key lives in the bucket of the highest bit
@@ -370,14 +404,12 @@ impl RadixHeap {
         RadixHeap { last: 0, buckets: (0..65).map(|_| Vec::new()).collect() }
     }
 
-    #[inline(always)]
     fn push(&mut self, key: u64, v: u32) {
         self.buckets[(64 - (key ^ self.last).leading_zeros()) as usize].push((key, v));
     }
 
     /// The smallest key, or u64::MAX when empty. Refills bucket 0 from the first
     /// non-empty bucket, whose minimum becomes the new reference key.
-    #[inline(always)]
     fn min(&mut self) -> u64 {
         if self.buckets[0].is_empty() {
             let Some(b) = self.buckets.iter().position(|b| !b.is_empty()) else { return u64::MAX };
@@ -393,7 +425,6 @@ impl RadixHeap {
     }
 
     /// Removes an entry with the smallest key; call `min` first.
-    #[inline(always)]
     fn pop(&mut self) -> (u64, u32) {
         self.buckets[0].pop().unwrap()
     }
@@ -428,7 +459,6 @@ impl Distances {
         Distances { dir: vec![0; n / BLOCK + 1], owners: Vec::new(), blocks }
     }
 
-    #[inline(always)]
     fn slot(&mut self, v: usize) -> &mut u64 {
         let entry = &mut self.dir[v / BLOCK];
         if *entry == 0 {
@@ -440,7 +470,6 @@ impl Distances {
     }
 
     /// The tentative distance of `v`, if this search has reached it.
-    #[inline(always)]
     fn get(&self, v: usize) -> Option<u64> {
         match self.dir[v / BLOCK] {
             0 => None,
@@ -518,16 +547,22 @@ fn distance(fwd: &Csr, bwd: &Csr, f: &mut Search, b: &mut Search, s: usize, t: u
         }
         best = if round % 2 == 0 { f.step(fwd, &b.dist, best) } else { b.step(bwd, &f.dist, best) };
     }
-    if best == u64::MAX { -1 } else { best as i64 }
+    best.try_into().unwrap_or(-1) // u64::MAX (no path) is the one value i64 cannot hold
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fix glibc's mmap threshold (M_MMAP_THRESHOLD = -3) at 1 MiB. Left dynamic, it grows
     // after the first big free, and later big buffers then come from arenas that never
     // give memory back, so every finished build phase would stay in the peak.
-    // SAFETY: plain libc call, made before any other thread exists.
-    unsafe { mallopt(-3, 1 << 20) };
-    let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(12);
+    // Also opt out of transparent huge pages (PR_SET_THP_DISABLE = 41): with THP always on,
+    // a buffer touched in a few places is charged in 2 MiB pages instead of 4 KiB ones.
+    // SAFETY: plain libc calls with constant arguments, made before any other thread exists.
+    unsafe {
+        mallopt(-3, 1 << 20);
+        prctl(41, 1u64, 0u64, 0u64, 0u64);
+    }
+    let threads = std::thread::available_parallelism().map_or(1, usize::from).min(12);
+    Team::start(threads);
     let text = map_file("/data/graph.txt")?;
     let mut i = 0;
     let n = number(text, &mut i) as usize;
@@ -535,14 +570,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = Text(split_lines(&text[i..], threads));
 
     let first = build_csr(&text, threads, n, |u, v| (u, v));
-    let rank = bfs_rank(&first, threads);
-    let fwd = permute(&first, &rank, threads);
-    drop(first);
+    let (rank, fwd) = bfs_layout(first, threads);
     let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
     let queries = std::fs::read_to_string("/data/queries.txt")?
         .lines()
         .map(|line| {
-            let (s, t) = line.split_once(' ').ok_or("queries.txt: a line is not `s t`")?;
+            let (s, t) = line.split_once(' ').ok_or("bad line in queries.txt")?;
             Ok((node(s)?, node(t)?))
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;

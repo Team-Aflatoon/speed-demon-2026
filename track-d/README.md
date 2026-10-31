@@ -36,8 +36,15 @@ over the raw graph misses the cache on almost every node. After the first build,
 are renumbered in BFS order. Every thread grows BFS regions from roots in its own share of
 the ids, claiming nodes with an atomic flag, until the regions meet. Inside a region, BFS
 rings put neighbouring streets at nearby ids. This alone made the searches about 4x faster.
-The forward graph is then produced by moving whole rows to their new places (no sorting
-needed), and the in-edge graph by transposing that in memory with the same bucketed build.
+Each thread copies every row as it dequeues it, so its rows come out already in new-id
+order. Laying out the forward graph is then one sequential copy that renames the heads,
+written into the first graph's own arrays (same sizes), which saves 27 MB of fresh page
+faults. The in-edge graph is a transpose of that, built in memory with the same bucketed
+build.
+
+**One team of threads.** The dozen parallel phases share a single team of 12 threads,
+started once and woken per phase by a barrier, with the main thread as member 0. Spawning
+a fresh set per phase had cost about 5 ms.
 
 **Queries.** Each of the 12 threads takes queries from a shared counter and answers them
 with bidirectional Dijkstra: forward from `s` on the out-edges and backward from `t` on the
@@ -56,6 +63,9 @@ in-edges, stopping once the two queue minima sum to at least the best meeting le
 no longer need (the BFS numbering is dropped as soon as the queries are translated).
 glibc's mmap threshold is pinned at 1 MiB, because left dynamic it grows after the first
 large free, and later large buffers would then come from arenas that never return memory.
+The process also opts out of transparent huge pages (`prctl(PR_SET_THP_DISABLE)`). With
+THP on, a buffer touched in a few places is charged in 2 MiB pages: the first board run
+measured 93.5 MB, against 77 MB locally where THP is opt-in only.
 
 Correctness was checked against the reference on the spec's worked example and the hand-written
 cases from the official tests, 60 random small graphs (zero and near-2^32 weights, parallel
@@ -64,17 +74,20 @@ and 7, with 1, 3 and 12 CPUs.
 
 ## Dependencies
 
-None. The two libc functions used (`mmap`, `mallopt`) are declared by hand.
+None. The three libc functions used (`mmap`, `mallopt`, `prctl`) are declared by hand.
 
 ## With another 24 hours
 
-- Shrink the row offsets (two arrays of 4 bytes per node, 14 MB) to a sparse offset per 16
-  nodes plus one-byte degrees, and store distances more compactly per search. Memory is
-  now the graph plus per-search state, so this goes straight into the peak.
-- Overlap the in-edge transpose with the first queries. A query could start on the
-  forward graph alone and switch to bidirectional once the in-edges exist.
-- Try a better locality order than BFS rings, for example ordering by a space-filling curve
-  over pseudo-coordinates from two BFS distances, and measure whether the search savings
-  pay for the extra pass.
-- Fuse the first count pass into the scatter with per-thread write-combining buffers, which
-  would save one full pass over the text.
+Ideas we measured and dropped are in PERF.md: compressed offsets, deriving in-edges from
+the near-symmetric out-edges, shared distance pairs, and pruning by the other side's
+radius. What is left to try:
+
+- Fuse the first count pass into the scatter: parse each piece once into per-thread
+  buckets sized from the piece length, with a spill list for overflow. That saves one pass
+  over the text (about 5 ms) if the memory can be kept under the query-phase peak.
+- Lower both memory peaks together: the transpose (16-bit tail side array) and the
+  query-phase distances (32-bit storage with a 64-bit fallback for the rare search that
+  crosses 2^32). Each alone does not move the peak.
+- Goal-directed search (ALT landmarks) would cut the searches, the largest phase, but one
+  full Dijkstra per landmark costs more than it saves at 2,000 short queries. Worth
+  revisiting only with a much cheaper way to get the landmark distances.
