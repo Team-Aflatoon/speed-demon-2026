@@ -1,268 +1,429 @@
-//! A throwaway inverted index over one batch of up to 4,096 consecutive
-//! documents, holding only query terms.
+//! Postings of one segment and BOOL evaluation against them.
 //!
-//! Each worker reuses one `Index`: build it from a batch, answer every query
-//! against it, move on. Batches are small, so local document numbers fit in a
-//! `u16` and a set of documents fits in a 512-byte bitmap, and the memory the
-//! index needs stays a few hundred kilobytes whatever the corpus size.
-//!
-//! A term is stored one of two ways. Rare terms keep a sorted list of local
-//! document numbers. A term that has once been seen in more than `DENSE_MIN`
-//! documents of a batch is "dense" for this worker from then on: the scan sets
-//! its bit in a bitmap directly, without the duplicate check or the list.
+//! Terms are split into `PARTS` partitions by id, so that the build of a
+//! partition only touches its own counters and lists, which stay in cache.
+//! Within a segment documents are numbered from 0 as `u16`. Every term has a
+//! sorted list; a term in more than 1/`DENSE` of the segment's documents also
+//! has a bitmap, which turns AND and NOT against it into bit tests.
 
-use crate::dict::{prefetch, Dict, Probe};
-use crate::lex::{Event, Lexer};
-use std::io;
+use crate::query::{AND, NONE, NOT, OR, SLOT_BITS};
 
-pub const WORDS: usize = 64;
-pub const BATCH_DOCS: usize = WORDS * 64;
-pub type Bits = [u64; WORDS];
+pub const PARTS: usize = 64;
+const DENSE: usize = 16;
 
-/// A bitmap costs 512 bytes and a word-wise pass per operation; a list costs
-/// 2 bytes and one random access per document. Past 64 documents per full
-/// batch (one per bitmap word) the bitmap wins on both counts.
-const DENSE_MIN: usize = 64;
-/// A worker's first batch is small: until it has seen a batch, every term is
-/// still a list, and 12 full all-list batches at once would set the memory peak.
-const WARMUP_DOCS: usize = 512;
-/// A term's state word: `DENSE | bitmap slot`, or else the global id of the last
-/// document that recorded it (ids have at most 9 digits, so bit 31 is free).
-const DENSE: u32 = 1 << 31;
-const NEVER: u32 = DENSE - 1;
+#[derive(Default)]
+pub struct Part {
+    /// Term `id` (with `id % PARTS` this partition) has the documents
+    /// `docs[offsets[l]..offsets[l + 1]]`, where `l = id / PARTS`.
+    offsets: Vec<u32>,
+    docs: Vec<u16>,
+    /// Where a dense term's bitmap starts in `bits`, or `NONE`.
+    dense: Vec<u32>,
+    bits: Vec<u64>,
+    docs_in_segment: usize,
+}
 
-/// The documents of the current batch that contain a term.
+impl Part {
+    /// Counting sort of the `doc << 16 | l` pairs of `streams` (in document
+    /// order) by `l`, for a segment of `docs` documents.
+    pub fn build<'s>(
+        &mut self,
+        streams: impl Iterator<Item = &'s [u32]> + Clone,
+        terms: usize,
+        docs: usize,
+        cursor: &mut Vec<u32>,
+    ) {
+        self.offsets.clear();
+        self.offsets.resize(terms + 1, 0);
+        streams
+            .clone()
+            .flatten()
+            .for_each(|&x| self.offsets[(x & 0xFFFF) as usize + 1] += 1);
+        for l in 0..terms {
+            self.offsets[l + 1] += self.offsets[l];
+        }
+        cursor.clear();
+        cursor.extend_from_slice(&self.offsets[..terms]);
+        self.docs.resize(self.offsets[terms] as usize, 0);
+        for &x in streams.flatten() {
+            let at = &mut cursor[(x & 0xFFFF) as usize];
+            self.docs[*at as usize] = (x >> 16) as u16;
+            *at += 1;
+        }
+        let words = docs.div_ceil(64);
+        self.docs_in_segment = docs;
+        self.dense.clear();
+        self.dense.resize(terms, NONE);
+        self.bits.clear();
+        for l in 0..terms {
+            let (from, to) = (self.offsets[l] as usize, self.offsets[l + 1] as usize);
+            if (to - from) * DENSE > docs {
+                self.dense[l] = self.bits.len() as u32;
+                let bits = self.bits.len();
+                self.bits.resize(bits + words, 0);
+                for &d in &self.docs[from..to] {
+                    self.bits[bits + usize::from(d) / 64] |= 1 << (d % 64);
+                }
+            }
+        }
+    }
+}
+
+/// The documents of one term in one segment.
 #[derive(Clone, Copy)]
-pub enum Set<'a> {
+enum Set<'a> {
     Empty,
     List(&'a [u16]),
-    Bits(&'a Bits),
+    Dense(&'a [u16], &'a [u64]),
 }
 
-pub struct Index {
-    /// Global id of local document 0.
-    pub first_doc: u32,
-    /// Byte range of each document's text in the corpus.
-    pub docs: Vec<(usize, usize)>,
-    /// One bit per term: does it occur in this batch (or is it dense)? Most
-    /// query terms are rare and absent from most batches; this 10 KB bitset
-    /// answers that from L1 without touching the larger per-term arrays.
-    present: Vec<u64>,
-    /// Per term: see `DENSE`. One word, so recording a hit costs one access.
-    state: Vec<u32>,
-    dense_terms: Vec<u32>,
-    bitmaps: Vec<Bits>,
-    /// The bitmap words of the current 64 documents, one per dense slot. A
-    /// document's dense terms all write to this small array, which stays in
-    /// L1, instead of to one cache line per term; every 64 documents it is
-    /// flushed into `bitmaps`, one write per dense term.
-    stripe: Vec<u64>,
-    terms: Vec<u32>,
-    /// Sparse (document, term) pairs in document order: `hits[hit_end[d-1]..hit_end[d]]`
-    /// are the distinct rare terms of local document `d`.
-    hits: Vec<u32>,
-    hit_end: Vec<u32>,
-    /// The inverted lists: term `t` is in `postings[bounds[t]..bounds[t + 1]]`.
-    bounds: Vec<u32>,
-    postings: Vec<u16>,
-    probes: Vec<Probe>,
-    /// Whether the warm-up batch is done.
-    warmed: bool,
+impl<'a> Set<'a> {
+    fn of(parts: &'a [&'a Part], term: usize, words: usize) -> Set<'a> {
+        let (part, l) = (parts[term % PARTS], term / PARTS);
+        let list = &part.docs[part.offsets[l] as usize..part.offsets[l + 1] as usize];
+        match list.len() {
+            0 => Set::Empty,
+            n if n * DENSE <= part.docs_in_segment => Set::List(list),
+            _ => {
+                let at = part.dense[l] as usize;
+                Set::Dense(list, &part.bits[at..at + words])
+            }
+        }
+    }
+
+    fn list(self) -> &'a [u16] {
+        match self {
+            Set::Empty => &[],
+            Set::List(list) | Set::Dense(list, _) => list,
+        }
+    }
 }
 
-impl Index {
-    pub fn new(terms: usize) -> Index {
-        Index {
-            first_doc: 0,
-            docs: Vec::with_capacity(BATCH_DOCS),
-            present: vec![0; terms.div_ceil(64)],
-            state: vec![NEVER; terms],
-            dense_terms: Vec::new(),
-            bitmaps: Vec::new(),
-            stripe: Vec::new(),
-            terms: Vec::new(),
-            hits: Vec::new(),
-            hit_end: Vec::new(),
-            bounds: vec![0; terms + 2],
-            postings: Vec::new(),
-            probes: Vec::new(),
-            warmed: false,
-        }
-    }
+/// The running result of a BOOL query. The first term's set is borrowed
+/// until a second one has to be combined with it; after that the result is
+/// the evaluator's `list` or its `bits`.
+#[derive(Clone, Copy)]
+enum Acc<'a> {
+    Empty,
+    Term(Set<'a>),
+    List,
+    Bits,
+}
 
-    /// Indexes the lines of `data[pos..end]` (both line starts) until `end` or
-    /// a full batch, and returns where it stopped.
-    pub fn build(&mut self, data: &[u8], pos: usize, end: usize, dict: &Dict) -> io::Result<usize> {
-        let limit = if self.warmed { BATCH_DOCS } else { WARMUP_DOCS };
-        self.warmed = true;
-        self.docs.clear();
-        self.hits.clear();
-        self.hit_end.clear();
-        self.bitmaps.iter_mut().for_each(|b| *b = [0; WORDS]);
-        self.stripe.clear();
-        self.stripe.resize(self.bitmaps.len(), 0);
-        let mut lexer = Lexer::new(data, pos, end);
-        let mut line = pos;
-        while line < end && self.docs.len() < limit {
-            // A line is its id (the first token, right before a TAB), the text, an LF.
-            let (id, text) = match lexer.next() {
-                Some(Event::Token(s, e)) if s == line && data[e] == b'\t' => {
-                    (parse_id(&data[s..e])?, e + 1)
-                }
-                _ => return Err(bad_corpus("a line does not start with an id and a TAB")),
-            };
-            let local = self.docs.len();
-            if local > 0 && local.is_multiple_of(64) {
-                self.flush_stripe(local / 64 - 1);
-            }
-            if local == 0 {
-                self.first_doc = id;
-            } else if id != self.first_doc + local as u32 {
-                return Err(bad_corpus("document ids are not dense and ascending"));
-            }
-            let lf = self.scan(&mut lexer, data, local, id, dict)?;
-            self.docs.push((text, lf));
-            self.hit_end.push(self.hits.len() as u32);
-            line = lf + 1;
-        }
-        if !self.docs.is_empty() {
-            self.flush_stripe((self.docs.len() - 1) / 64);
-        }
-        self.invert();
-        Ok(line)
-    }
+#[derive(Default)]
+pub struct Evaluator {
+    list: Vec<u16>,
+    out: Vec<u16>,
+    bits: Vec<u64>,
+    /// A list spread into bitmap form while another is tested against it;
+    /// all zero between uses.
+    mask: Vec<u64>,
+}
 
-    /// Moves the stripe into word `w` of the dense bitmaps.
-    fn flush_stripe(&mut self, w: usize) {
-        for (bits, word) in self.bitmaps.iter_mut().zip(&mut self.stripe) {
-            bits[w] = std::mem::take(word);
-        }
-    }
-
-    /// Records the query terms of one document's text; returns the LF ending it.
-    ///
-    /// Each pass prefetches what the next one reads: the first hashes every
-    /// token and prefetches its table slot, the second resolves the tokens to
-    /// terms and prefetches their state words, the third records them. A
-    /// document's lookups (about 150) then wait on memory together instead of
-    /// one after another.
-    fn scan(
+impl Evaluator {
+    /// Adds the documents of segment `parts` (numbered from `base`, `docs` of
+    /// them) that match the BOOL query `steps` to `answer`.
+    pub fn run(
         &mut self,
-        lexer: &mut Lexer,
-        data: &[u8],
-        local: usize,
-        id: u32,
-        dict: &Dict,
-    ) -> io::Result<usize> {
-        let mut probes = std::mem::take(&mut self.probes);
-        probes.clear();
-        let lf = loop {
-            match lexer.next() {
-                Some(Event::Token(start, end)) => probes.extend(dict.probe(data, start, end)),
-                Some(Event::LineEnd(lf)) => break lf,
-                None => return Err(bad_corpus("a line has no LF")),
+        parts: &[&Part],
+        steps: &[u32],
+        docs: usize,
+        base: u32,
+        answer: &mut Answer,
+    ) {
+        let words = docs.div_ceil(64);
+        self.bits.resize(words, 0);
+        self.mask.resize(words, 0);
+        let mut acc = Acc::Empty;
+        for &step in steps {
+            let op = step >> SLOT_BITS;
+            if let (Acc::Empty, AND | NOT) = (acc, op) {
+                continue; // nothing to intersect with or subtract from
+            }
+            let set = Set::of(parts, (step & ((1 << SLOT_BITS) - 1)) as usize, words);
+            acc = self.step(acc, op, set, docs);
+        }
+        match acc {
+            Acc::Empty => {}
+            Acc::Term(set) => answer.add_list(set.list(), base),
+            Acc::List => answer.add_list(&self.list, base),
+            Acc::Bits => answer.add_bits(&self.bits, base),
+        }
+    }
+
+    fn step<'a>(&mut self, acc: Acc<'a>, op: u32, set: Set<'a>, docs: usize) -> Acc<'a> {
+        if let Set::Empty = set {
+            return if op == AND { Acc::Empty } else { acc };
+        }
+        let r = match acc {
+            Acc::Empty if op == OR => return Acc::Term(set),
+            Acc::Empty => return Acc::Empty,
+            Acc::Bits => return self.bits_op(op, set),
+            Acc::Term(r) => r,
+            Acc::List => Set::List(&[]), // stands for `self.list`, taken below
+        };
+        let mine = std::mem::take(&mut self.list);
+        let list = if let Acc::List = acc {
+            &mine[..]
+        } else {
+            r.list()
+        };
+        let next = match (op, set, r) {
+            // Two dense sets: one pass over the words.
+            (AND | NOT, Set::Dense(_, b), Set::Dense(_, a)) => {
+                let not = if op == NOT { !0 } else { 0 };
+                self.bits
+                    .iter_mut()
+                    .zip(a.iter().zip(b))
+                    .for_each(|(o, (&a, &b))| *o = a & (b ^ not));
+                Acc::Bits
+            }
+            (AND | NOT, Set::Dense(_, b), _) => filter(list, b, op == NOT, &mut self.out),
+            // A dense set and a list: test the list against the bitmap.
+            (AND, Set::List(b), Set::Dense(_, a)) => filter(b, a, false, &mut self.out),
+            (NOT, Set::List(_), Set::Dense(_, a)) => {
+                self.bits.copy_from_slice(a);
+                self.list = mine;
+                return self.bits_op(NOT, set);
+            }
+            (AND, Set::List(b), _) => intersect(list, b, &mut self.mask, &mut self.out),
+            (NOT, Set::List(b), _) => difference(list, b, &mut self.mask, &mut self.out),
+            _ if (list.len() + set.list().len()) * DENSE <= docs => {
+                union(list, set.list(), &mut self.out)
+            }
+            // A large OR: spread both sides into the bitmap.
+            _ => {
+                match r {
+                    Set::Dense(_, a) => self.bits.copy_from_slice(a),
+                    _ => {
+                        self.bits.fill(0);
+                        set_bits(&mut self.bits, list);
+                    }
+                }
+                self.list = mine;
+                return self.bits_op(OR, set);
             }
         };
-        self.terms.clear();
-        for probe in &probes {
-            if let Some(term) = dict.resolve(probe, data) {
-                prefetch(&self.state[term as usize]);
-                self.terms.push(term);
+        self.list = mine;
+        if let Acc::List = next {
+            std::mem::swap(&mut self.list, &mut self.out);
+            if self.list.is_empty() {
+                return Acc::Empty;
             }
         }
-        for i in 0..self.terms.len() {
-            self.record(self.terms[i] as usize, local, id);
-        }
-        self.probes = probes;
-        Ok(lf)
+        next
     }
 
-    #[inline]
-    fn record(&mut self, term: usize, local: usize, id: u32) {
-        let state = self.state[term];
-        if state & DENSE != 0 {
-            self.stripe[(state ^ DENSE) as usize] |= 1 << (local % 64);
-        } else if state != id {
-            self.state[term] = id;
-            self.hits.push(term as u32);
-        }
-    }
-
-    /// Counting sort of the sparse hits into per-term lists, then promotion of
-    /// the terms whose list came out long to bitmaps.
-    fn invert(&mut self) {
-        self.bounds.fill(0);
-        self.present.fill(0);
-        let mut heavy = Vec::new();
-        // The threshold scales with the batch size, but stays at least 1: a
-        // short last batch must not promote every term it saw twice.
-        let dense_min = (DENSE_MIN * self.docs.len() / BATCH_DOCS).max(1) as u32;
-        // Count into `bounds[t + 2]` so that after the prefix sum `bounds[t + 1]`
-        // is where term t starts; the scatter uses it as t's cursor, which leaves
-        // it at t's end, so `bounds[t]..bounds[t + 1]` is the list of t.
-        for &t in &self.hits {
-            let count = &mut self.bounds[t as usize + 2];
-            *count += 1;
-            if *count == 1 {
-                self.present[t as usize / 64] |= 1 << (t % 64);
-            } else if *count == dense_min + 1 {
-                heavy.push(t);
+    /// `bits = bits op set`; AND with a list gives a list.
+    fn bits_op<'a>(&mut self, op: u32, set: Set<'a>) -> Acc<'a> {
+        match (op, set) {
+            (_, Set::Dense(_, b)) => self.bits.iter_mut().zip(b).for_each(|(a, &b)| {
+                *a = match op {
+                    AND => *a & b,
+                    OR => *a | b,
+                    _ => *a & !b,
+                }
+            }),
+            (AND, _) => {
+                filter(set.list(), &self.bits, false, &mut self.list);
+                return if self.list.is_empty() {
+                    Acc::Empty
+                } else {
+                    Acc::List
+                };
             }
-        }
-        for i in 2..self.bounds.len() {
-            self.bounds[i] += self.bounds[i - 1];
-        }
-        self.postings.resize(self.hits.len(), 0);
-        let mut start = 0;
-        for (local, &end) in self.hit_end.iter().enumerate() {
-            for &t in &self.hits[start..end as usize] {
-                let cursor = &mut self.bounds[t as usize + 1];
-                self.postings[*cursor as usize] = local as u16;
-                *cursor += 1;
-            }
-            start = end as usize;
-        }
-        for t in heavy {
-            let (lo, hi) = (
-                self.bounds[t as usize] as usize,
-                self.bounds[t as usize + 1] as usize,
-            );
-            let mut bits = [0; WORDS];
-            self.postings[lo..hi]
+            (OR, _) => set_bits(&mut self.bits, set.list()),
+            _ => set
+                .list()
                 .iter()
-                .for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
-            self.state[t as usize] = DENSE | self.bitmaps.len() as u32;
-            self.bitmaps.push(bits);
-            self.dense_terms.push(t);
+                .for_each(|&d| self.bits[usize::from(d) / 64] &= !(1 << (d % 64))),
         }
-        for &t in &self.dense_terms {
-            self.present[t as usize / 64] |= 1 << (t % 64);
-        }
-    }
-
-    #[inline]
-    pub fn set(&self, term: u32) -> Set<'_> {
-        let t = term as usize;
-        if self.present[t / 64] & (1 << (t % 64)) == 0 {
-            return Set::Empty;
-        }
-        match self.state[t] {
-            state if state & DENSE != 0 => Set::Bits(&self.bitmaps[(state ^ DENSE) as usize]),
-            _ => Set::List(&self.postings[self.bounds[t] as usize..self.bounds[t + 1] as usize]),
-        }
+        Acc::Bits
     }
 }
 
-/// A document id: 1 to 9 decimal digits.
-fn parse_id(digits: &[u8]) -> io::Result<u32> {
-    if digits.len() > 9 || !digits.iter().all(u8::is_ascii_digit) {
-        return Err(bad_corpus("a document id is not a number"));
-    }
-    Ok(digits
-        .iter()
-        .fold(0, |id, &d| id * 10 + u32::from(d - b'0')))
+fn set_bits(bits: &mut [u64], list: &[u16]) {
+    list.iter()
+        .for_each(|&d| bits[usize::from(d) / 64] |= 1 << (d % 64));
 }
 
-pub fn bad_corpus(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("docs.txt: {msg}"))
+/// The documents of `list` whose bit is set (clear, if `not`). Written
+/// branch-free: every document is stored, and kept by advancing the count.
+fn filter<'a>(list: &[u16], bits: &[u64], not: bool, out: &mut Vec<u16>) -> Acc<'a> {
+    out.resize(list.len(), 0);
+    let mut n = 0;
+    for &d in list {
+        out[n] = d;
+        n += usize::from((bits[usize::from(d) / 64] >> (d % 64) & 1 != 0) != not);
+    }
+    out.truncate(n);
+    Acc::List
+}
+
+/// When one list is this many times longer, the short one gallops through it.
+const GALLOP: usize = 16;
+
+/// The first index `i >= from` with `list[i] >= x`, by doubling then bisecting.
+fn seek(list: &[u16], from: usize, x: u16) -> usize {
+    let (mut lo, mut step) = (from, 1);
+    while lo + step < list.len() && list[lo + step] < x {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step + 1).min(list.len());
+    lo + list[lo..hi].partition_point(|&y| y < x)
+}
+
+/// `a` without (`not`) or with only the documents of `b`: `b` is spread into
+/// `mask` and `a` tested against it, which is about three times faster than
+/// a merge (whose steps depend on each other) once neither list is tiny.
+fn sift<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
+    set_bits(mask, b);
+    filter(a, mask, not, out);
+    b.iter().for_each(|&d| mask[usize::from(d) / 64] = 0);
+    Acc::List
+}
+
+fn intersect<'a>(a: &[u16], b: &[u16], mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
+    let (a, b) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if a.len() * GALLOP >= b.len() {
+        return sift(b, a, false, mask, out);
+    }
+    out.clear();
+    let mut at = 0;
+    for &x in a {
+        at = seek(b, at, x);
+        if at == b.len() {
+            break;
+        }
+        if b[at] == x {
+            out.push(x);
+        }
+    }
+    Acc::List
+}
+
+/// `a` without the documents of `b`.
+fn difference<'a>(a: &[u16], b: &[u16], mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
+    if a.len() * GALLOP >= b.len() {
+        return sift(a, b, true, mask, out);
+    }
+    out.clear();
+    let mut at = 0;
+    for &x in a {
+        at = seek(b, at, x);
+        if at == b.len() || b[at] != x {
+            out.push(x);
+        }
+    }
+    Acc::List
+}
+
+fn union<'a>(a: &[u16], b: &[u16], out: &mut Vec<u16>) -> Acc<'a> {
+    out.resize(a.len() + b.len(), 0);
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        out[n] = x.min(y);
+        n += 1;
+        i += usize::from(x <= y);
+        j += usize::from(y <= x);
+    }
+    out.truncate(n);
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    Acc::List
+}
+
+/// count, sum of ids and the ten smallest ids of a set of documents (spec 4).
+#[derive(Clone, Copy, Default)]
+pub struct Answer {
+    count: u32,
+    kept: u32,
+    sum: u64,
+    ten: [u32; 10],
+}
+
+impl Answer {
+    /// Adds one document; ids must arrive in ascending order.
+    pub fn push(&mut self, id: u32) {
+        self.count += 1;
+        self.sum += u64::from(id);
+        if self.kept < 10 {
+            self.ten[self.kept as usize] = id;
+            self.kept += 1;
+        }
+    }
+
+    /// Adds a sorted list of documents numbered from `base`, all above the
+    /// documents added so far.
+    fn add_list(&mut self, list: &[u16], base: u32) {
+        let n = list.len() as u32;
+        self.count += n;
+        self.sum +=
+            u64::from(n) * u64::from(base) + list.iter().map(|&d| u64::from(d)).sum::<u64>();
+        for &d in list.iter().take(10 - self.kept as usize) {
+            self.ten[self.kept as usize] = base + u32::from(d);
+            self.kept += 1;
+        }
+    }
+
+    /// Adds every document of a bitmap whose bit 0 is document `base`.
+    fn add_bits(&mut self, bits: &[u64], base: u32) {
+        for (i, &word) in bits.iter().enumerate().filter(|(_, &w)| w != 0) {
+            let first = base + 64 * i as u32;
+            let ones = word.count_ones();
+            self.count += ones;
+            self.sum += u64::from(first) * u64::from(ones) + bit_index_sum(word);
+            let mut rest = word;
+            while self.kept < 10 && rest != 0 {
+                self.ten[self.kept as usize] = first + rest.trailing_zeros();
+                self.kept += 1;
+                rest &= rest - 1;
+            }
+        }
+    }
+
+    /// Appends the output line (spec 4).
+    pub fn write(&self, out: &mut Vec<u8>) {
+        put(out, u64::from(self.count));
+        out.push(b' ');
+        put(out, self.sum);
+        for &id in &self.ten[..self.kept as usize] {
+            out.push(b' ');
+            put(out, u64::from(id));
+        }
+        out.push(b'\n');
+    }
+}
+
+/// The sum of the positions of the set bits of `w`, without visiting them:
+/// bit k of a position is set for exactly the bits under `MASKS[k]`.
+fn bit_index_sum(w: u64) -> u64 {
+    const MASKS: [u64; 6] = [
+        0xAAAA_AAAA_AAAA_AAAA,
+        0xCCCC_CCCC_CCCC_CCCC,
+        0xF0F0_F0F0_F0F0_F0F0,
+        0xFF00_FF00_FF00_FF00,
+        0xFFFF_0000_FFFF_0000,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    (0..6)
+        .map(|k| u64::from((w & MASKS[k]).count_ones()) << k)
+        .sum()
+}
+
+/// Decimal digits of `v`, without the formatting machinery.
+fn put(out: &mut Vec<u8>, mut v: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[at..]);
 }
