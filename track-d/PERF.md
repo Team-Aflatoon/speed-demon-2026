@@ -2,17 +2,21 @@
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
-T and M below are local measurements on an i7-14650HX, cpuset 0-11, under the harness's
-sandbox flags, with cgroup `memory.peak` in MiB. Unless a row says otherwise they come from
-`bench/bench.sh` or an equivalent fresh-container run. The scoring box is roughly 1.5x
-slower. For part of the work the machine was shared with other benchmark jobs, so close
-calls were decided by interleaved A/B runs of saved binaries, or by repeating a phase
-several times in one process and taking the minimum. Such rows are noted. Run IDs are
-added once a step has a board run.
+Rows marked "(local)" were measured on an i7-14650HX, cpuset 0-11, under the harness's
+sandbox flags, with `bench/bench.sh` or an equivalent fresh-container run unless the row
+says otherwise. Local M is cgroup `memory.peak` in MiB, while the board reports MB: the
+final 68 MiB locally is 71.3 MB, against the board's 70.8 MB. Rows with a run ID are board
+runs. The scoring box is roughly 1.45x slower than the local machine, and its own runs
+vary: two reruns of the same v1 took 181.9 and 166.5 ms against 156.0. For part of the
+work the local machine was shared with other benchmark jobs, so close calls were decided
+by interleaved A/B runs of saved binaries, by repeating a phase several times in one
+process and taking the minimum, or by total CPU time from the cgroup's `cpu.stat`. Such
+rows say so. Points for runs without a board figure are computed from T, M and S with
+`harness/scoring.py` and marked as such.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 72.69 | 893 | 0 |
+| 0 | The reference, unchanged (board reference figures) | | 72.69 | 893 | 0 |
 | 1 | Rust v1: mmap, parallel parse with an atomic per-node counter, CSR, serial BFS renumbering, one Dijkstra per query (binary heap) on 12 threads, block-allocated distances | | 0.42 (local) | n/a | |
 | 2 | Bucketed CSR build with per-thread cursors and a counting sort, so no locked instruction per edge (parse 24 to 11 ms per pass); BFS from one root per thread in parallel; radix heap | | 0.22 (local) | 87 (local) | |
 | 3 | SWAR parsing: eight bytes per load, separator found by bit 4, Lemire's multiply combine (11 to 5.5 ms per pass) | | 0.21 (local) | 87 (local) | |
@@ -21,15 +25,20 @@ added once a step has a board run.
 | 6 | 4-byte edges: head and 11-bit weight in one u32, heavier weights in an escape table; glibc mmap threshold pinned so freed phases leave the peak | | 0.138 to 0.127 (local, A/B) | 121 to 82 (local) | |
 | 7 | Forward graph by moving rows into BFS order, in-edges by an in-memory transpose (no second parse); BFS order freed before the move; distance blocks reserved up front; oversized heap buckets returned | | 0.126 to 0.114 (local, A/B) | 77 (local) | |
 | 8 | BFS threads keep rooting new regions in their own id range (balanced, no serial sweep); edge row prefetched when a node is first queued | | 0.108 (local, bench median of 5; seed 7: 0.110) | 77 (local) | |
-| 8 (board) | v1 as submitted (commit 984cb84) | run-0b83abcdda4d | 0.156 | 93.5 | 68.5 |
-| 9 | Opt out of transparent huge pages (`prctl(PR_SET_THP_DISABLE)`). Box-only: the box measured 93.5 MB against 77 locally, where THP is opt-in; the call shows `THP_enabled: 0` in /proc/self/status and changes nothing locally | | 0.108 (local) | 77 (local) | |
-| 10 | One persistent team of 12 threads woken by a barrier, instead of spawning threads for each of the 11 parallel phases (11 empty spawn rounds measured 5 ms) | | 0.110 to 0.107 (local, A/B medians) | 77 (local) | |
+| 8 (board) | v1 as submitted (commit 984cb84), S 505 | run-0b83abcdda4d | 0.156 | 93.5 | 68.5 |
+| 8 (board) | the same v1, rerun: box noise | run-145c9293e57e | 0.1819 | 93.5 | 66.8 (computed) |
+| 8 (board) | the same v1, rerun: box noise | run-bd48a8574757 | 0.1665 | 93.5 | 67.8 (computed) |
+| 9 | Opt out of transparent huge pages (`prctl(PR_SET_THP_DISABLE)`). A box-only effect: the box measured 93.5 MB against 77 MiB locally, where THP is opt-in. The call shows `THP_enabled: 0` in /proc/self/status and changes nothing locally; the v2 board run confirms it (93.5 to 79.8 MB) | | 0.108 (local) | 77 (local) | |
+| 10 | One persistent team of 12 threads woken by a barrier, instead of spawning threads for each of the 11 parallel phases (10 since step 11; 11 empty spawn rounds measured 5 ms) | | 0.110 to 0.107 (local, A/B medians) | 77 (local) | |
 | 11 | The BFS walk copies each row as it dequeues it, so the forward graph is laid out in new-id order with one sequential renaming copy; `permute` and its random-access passes are gone (BFS + layout 24 to 21-24 ms, in-process minima) | | 0.105 (local) | 77 (local) | |
 | 12 | The layout reuses the first graph's arrays (27 MB fewer page faults); S trims (shorter if/else and answer conversion, fewer attributes): S 553 to 525 | | 0.122 vs v1 0.135 (local, interleaved medians under heavy machine load) | 78 (local) | |
+| 12 (board) | v2 as submitted (commit 587a2e9), S 525 | run-bf037ba42528 | 0.1501 | 79.8 | 69.5 (computed) |
 | 13 | Leaner BFS phase: `rank` is the claim flag (0 until claimed, then a provisional thread-and-index id fixed up once counts are known), the queue holds only the frontier, degrees take a byte each. Drops the order list, claim flags and end offsets (BFS + layout phase 75.6 to 58 MiB) | | same CPU (local) | 76 (local) | |
 | 14 | 32-bit tentative distances; a query whose distances pass 2^32 - 2 is answered again with 64 bits, so results stay exact (query phase 76 to 71 MiB) | | same CPU: 1000 vs 1020 ms total (local) | 71 (local) | |
 | 15 | The radix heap keys in the search's width too: a 32-bit search only queues keys that fit, so entries take 8 bytes, not 16 (query phase 71 to 68 MiB) | | CPU 1075 to 1035 ms total (local, A/B medians) | 68 (local) | |
 | 16 | S trims: one blanket `Width` trait for the bounds, `distance` takes the pair of searches, in-edges back to `build_csr`, unused helpers removed: S 600 to 538 | | same (local) | 68 (local) | |
+| 16 (board) | v3 as submitted (commit b661c23), S 538 | run-184dcb5b4f5a | 0.1459 | 70.8 | 70.2 |
+| 17 | Review fixes, no change in speed: rustfmt, named libc constants, SAFETY notes. One real bug fixed: `split_lines` read `text[at - 1]` at `at == 0` when the edge text is shorter than the thread count (a one-edge graph on 12 threads aborted). New one-edge cases added to the tests. S 538 to 544 (named constants) | | same (local) | 68 (local) | |
 
 Peak memory by phase (local, cgroup `memory.current` sampled every 0.1 ms, maximum per
 phase, MiB). The board's M is the largest of these, and every v3 step aimed at whichever
@@ -47,7 +56,7 @@ phase was on top.
 ## Experiments that did not make it
 
 - **No renumbering at all.** With the file's random ids, the same searches took 4.4x longer
-  (query phase 920 ms against 210 ms in step 1). Locality, not the algorithm, is the first
+  (query phase 920 ms against 210 ms of wall time in step 1). Locality, not the algorithm, is the first
   order effect here.
 - **Bidirectional search balanced on queue keys.** This is the textbook choice, but a
   source with no in-edges reaches the graph only through two ~2^32 weights. The backward
@@ -64,7 +73,6 @@ phase was on top.
 - **Occupancy bitmask in the radix heap** (`trailing_zeros` instead of scanning 65 bucket
   headers): no measurable change.
 - **Smaller distance blocks** (32 or 64 nodes): 2-3 MB less, no change in T, not kept.
-
 - **Shared distance pairs** (`[forward, backward]` per node, so the meeting test reads the
   same line): the query phase went from 44 to 48 ms, because each side's own distances
   got half as dense.
@@ -77,14 +85,14 @@ phase was on top.
 - **Pruning pushes by the other side's smallest key** (correct: from a node the other side
   has not settled, at least that much is left): no measurable change.
 - **Expanding the side with the smaller queue** instead of taking turns: no change.
-- **32-bit distances**, measured with a deliberately unsafe build first to see the upside:
-  no speedup, so not worth the 64-bit fallback.
+- **32-bit distances, judged on speed** (v2). A deliberately unsafe build showed no
+  speedup, so they were set aside then. In v3, with memory the target, they came back
+  with an exact 64-bit retry (step 14): no T change, 5 MiB less.
 - **`malloc_trim(0)` before the queries, smaller distance blocks and heap buffers**: no
   change in M. The query phase's extra memory is the real per-search data (about 0.5 MB
   for each of the 24 searches at their largest).
 - **A 32-bit tail side array** (which drops the atomic-type trait): 9 fewer lines, but the
   transpose was about 2 ms slower. Reverted.
-
 - **In-edges by a direct atomic transpose** (count, then place each edge at its row's
   next slot; cheap after the BFS renumbering because the counters a thread bumps are its
   own): correct and as fast, and its phase drops from 67 to 57 MiB. But the query phase

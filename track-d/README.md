@@ -6,10 +6,10 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The whole run is one Rust binary, `src/main.rs`, with no dependencies. Following the spec's
-hint that the queries are local and that parsing and memory layout dominate, most of the
-work goes into getting the graph into a compact, cache-friendly shape quickly. The
-2,000 searches themselves are short.
+The whole run is one Rust binary, `src/main.rs`, with no dependencies. Most of the work
+goes into getting the graph into a compact, cache-friendly shape quickly, because that is
+what our measurements said matters: renumbering the nodes for locality alone made the
+searches 4.4x faster. The 2,000 searches themselves are short.
 
 **Parsing.** `graph.txt` is memory-mapped (the harness has it in the page cache already, so
 this costs no copy and no charged memory) and cut into one piece per thread at line
@@ -39,12 +39,12 @@ rings put neighbouring streets at nearby ids. This alone made the searches about
 Each thread copies every row as it dequeues it, so its rows come out already in new-id
 order. During the walk `rank` itself is the claim flag (a provisional thread-and-index id,
 fixed up afterwards), and the queue holds only the frontier, so the walk adds little
-memory beyond the copied rows. Laying out the forward graph is then one sequential copy that renames the heads,
-written into the first graph's own arrays (same sizes), which saves 27 MB of fresh page
-faults. The in-edge graph is a transpose of that, built in memory with the same bucketed
-build.
+memory beyond the copied rows. Laying out the forward graph is then one sequential copy
+that renames the heads, written into the first graph's own arrays (same sizes), which
+saves 27 MB of fresh page faults. The in-edge graph is a transpose of that, built in
+memory with the same bucketed build.
 
-**One team of threads.** The dozen parallel phases share a single team of 12 threads,
+**One team of threads.** The ten parallel phases share a single team of 12 threads,
 started once and woken per phase by a barrier, with the main thread as member 0. Spawning
 a fresh set per phase had cost about 5 ms.
 
