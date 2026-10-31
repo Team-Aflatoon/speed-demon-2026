@@ -127,7 +127,7 @@ impl Table {
     /// Room for about `distinct` terms (estimated; at most `words`) at a load
     /// factor of at most 2/3, and ids for `words` terms from `threads` threads.
     pub fn new(words: usize, distinct: usize, threads: usize) -> Table {
-        let n = (distinct.min(words) * 3 / 2)
+        let n = (distinct.min(words) * 3)
             .next_power_of_two()
             .max(1 << 10);
         let ids = words + threads * ID_BLOCK as usize;
