@@ -185,6 +185,14 @@ Figures below are local unless a run ID is given.
   S 551 → 495. Locally it used 8% less CPU (1,430 vs 1,559 ms) and its search phase was
   6% faster, yet the box measured it 12-16% slower than v4. Kept v4. Lesson, again: on this
   box a local CPU win is only a hypothesis until a board run confirms it.
+- **Fewer page faults** (box, full correct runs, two each). Track A's largest box wins came
+  from cutting page faults, and v4 takes ~32K minor faults per run, so two variants reused
+  buffers across phases: d11 hands each finished phase's arrays to the next (32.1K → 22.5K
+  faults; run-dbc41ae6803b 137.8 ms, run-827ac63d50c0 142.4 ms, both 73 MB), and d12 adds
+  huge pages on the big build arrays only (13.7K faults; run-457ba7431807 140.9 ms,
+  run-3662b39214de 136.3 ms, 72.5-73.1 MB). Mean T 140.1 and 138.6 ms against v4's ~143.6
+  ms over its runs: a 2-3% gain, but +2.5 MB of M and S 551 → 589/609 cancel it (K 25.15-25.60
+  against v4's 25.24-25.80). Kept v4.
 - **One parse for the first CSR** (box probe d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
   Each thread scatters into its own per-bucket runs, sized from its share of the text
   with a spill list for overflow, and a counting sort per bucket writes the final CSR
