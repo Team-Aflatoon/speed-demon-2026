@@ -1,4 +1,0 @@
-[build]
-# AVX2 and BMI2 (x86-64-v3) for the bitmask parser, PCLMULQDQ for its
-# prefix XOR; a static binary starts without the dynamic loader.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+crt-static"]

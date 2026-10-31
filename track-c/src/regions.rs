@@ -1,134 +1,106 @@
-//! regions.csv: a map from region id to group, filled in parallel pieces.
+//! regions.csv: a direct-indexed map from region id to group, filled by all
+//! workers in parallel. Group 0 is `_UNMATCHED`; countries get 1..=255 in
+//! order of first appearance, and are listed in code order at the end.
 
-use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+use crate::map::Mapped;
+use crate::records::uint;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Mutex;
 
-/// Three capital letters: 26^3 codes.
+const HEADER: &[u8] = b"region_id,country\n";
 const CODES: usize = 26 * 26 * 26;
-/// Region ids beyond this are refused (the map has a byte per id; spec
-/// 2.3 ids are below 1,000,000).
-const MAX_ID: u64 = 1 << 28;
-
-/// A filled piece's first and last region id (0, 0 if it has none).
-pub type Filled = Result<(u64, u64), String>;
+/// The largest region id the map is sized for (a byte per id).
+const MAX_ID: usize = 100_000_000;
 
 pub struct Regions {
-    /// Group by region id; 0 is `_UNMATCHED` (no such region).
-    pub map: &'static [AtomicU8],
-    /// Group by country code, numbered in order of first sight (0: unused).
+    /// Group by region id, eight per word (id 8w + k in byte k of word w);
+    /// 0 for an id the table does not contain. Lazily zeroed memory, so the
+    /// workers that fill it also fault it in, instead of the main thread.
+    ids: &'static [AtomicU64],
+    /// Group by country code index (`AAA` = 0); 0 until the code is seen.
     codes: Vec<AtomicU8>,
+    /// Groups handed out so far; held while handing out a new one.
     groups: Mutex<u8>,
-    text: &'static [u8],
-    /// Line starts that cut the lines into one piece per worker.
-    cuts: Vec<usize>,
 }
 
 impl Regions {
-    pub fn new(text: &'static [u8], len: usize, pieces: usize) -> Result<Regions, String> {
-        let body = text[..len]
-            .strip_prefix(b"region_id,country\n")
-            .ok_or("regions.csv: bad header")?;
-        let first = len - body.len();
-        if !body.is_empty() && body[body.len() - 1] != b'\n' {
-            return Err("regions.csv: no LF at the end".into());
+    /// An empty map, sized by the id on the file's last line: the largest,
+    /// as the spec lists ids in ascending order (`parse` checks that).
+    pub fn new(f: Mapped) -> Result<Self, &'static str> {
+        let (b, len) = (f.b, f.len);
+        if !b.starts_with(HEADER) || b[len - 1] != b'\n' {
+            return Err("regions.csv: bad header, or no LF at the end");
         }
-        // Ids ascend (2.3), so the last line has the largest.
-        let last = body[..body.len().saturating_sub(1)]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let max = if body.is_empty() {
-            0
-        } else {
-            parse_id(&body[last..], &mut 0)?
+        let last = b[..len - 1].iter().rposition(|&c| c == b'\n');
+        let max = uint(b, last.map_or(0, |i| i + 1)).map_or(0, |(id, _)| id as usize);
+        if max > MAX_ID {
+            return Err("regions.csv: ids over 100,000,000 (the spec's are below 1,000,000)");
+        }
+        let ids = crate::map::zeroed(max / 8 + 1).map_err(|_| "out of memory")?;
+        let (codes, groups) = (
+            (0..CODES).map(|_| AtomicU8::new(0)).collect(),
+            Mutex::new(0),
+        );
+        Ok(Regions { ids, codes, groups })
+    }
+
+    pub fn group(&self, region: u64) -> u8 {
+        let word = self.ids.get(region as usize / 8);
+        word.map_or(0, |w| (w.load(Relaxed) >> (region % 8 * 8)) as u8)
+    }
+
+    /// Starts loading the map entry for `region` into the cache.
+    pub fn prefetch(&self, region: u64) {
+        if let Some(g) = self.ids.get(region as usize / 8) {
+            crate::prefetch(g);
+        }
+    }
+
+    /// Adds share `t` of `n` of the lines `id,CCC\n`. A share runs from the
+    /// first line start at or after its nominal start to the next share's.
+    pub fn parse(&self, f: Mapped, t: usize, n: usize) -> Result<(), &'static str> {
+        let b = f.b;
+        let start = |k: usize| match k * f.len / n {
+            0 => HEADER.len(),
+            // The file ends in an LF (checked in `new`), so one is found.
+            at => at + b[at - 1..f.len].iter().position(|&c| c == b'\n').unwrap(),
         };
-        // SAFETY: all-zero bytes are valid AtomicU8 values.
-        let map = unsafe { crate::sys::zeroed::<AtomicU8>(max as usize + 1) }
-            .map_err(|e| e.to_string())?;
-        let mut cuts: Vec<usize> = (0..pieces)
-            .map(|p| first + body.len() * p / pieces)
-            .collect();
-        for c in &mut cuts[1..] {
-            *c += text[*c - 1..len]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(0);
-        }
-        cuts.push(len);
-        let codes = (0..CODES).map(|_| AtomicU8::new(0)).collect();
-        Ok(Regions {
-            map,
-            codes,
-            groups: Mutex::new(0),
-            text,
-            cuts,
-        })
-    }
-
-    /// Fills the map for the lines of piece `p`; returns its first and last
-    /// region ids (0, 0 if it has none) so that the caller can check that
-    /// they ascend across pieces too.
-    pub fn fill(&self, p: usize) -> Filled {
-        let (mut at, end) = (self.cuts[p], self.cuts[p + 1]);
-        let (mut first, mut prev) = (0, 0);
-        while at < end {
-            let id = parse_id(self.text, &mut at)?;
-            let c = &self.text[at..at + 4];
-            if id <= prev
-                || id as usize >= self.map.len()
-                || c[3] != b'\n'
-                || !c[..3].iter().all(u8::is_ascii_uppercase)
-            {
-                return Err(format!(
-                    "regions.csv: bad line at byte {at}, or ids not ascending"
-                ));
+        let (mut p, end) = (start(t), start(t + 1));
+        while p < end {
+            let (id, q) = uint(b, p).ok_or("regions.csv: bad region id")?;
+            let code = &b[q + 1..q + 4];
+            if b[q] != b',' || b[q + 4] != b'\n' || !code.iter().all(u8::is_ascii_uppercase) {
+                return Err("regions.csv: bad line");
             }
-            let code = c[..3]
-                .iter()
-                .fold(0, |v, &b| v * 26 + usize::from(b - b'A'));
-            self.map[id as usize].store(self.group(code)?, Relaxed);
-            (first, prev, at) = (if first == 0 { id } else { first }, id, at + 4);
+            let code = code.iter().fold(0, |c, &l| c * 26 + usize::from(l - b'A'));
+            let word = self.ids.get(id as usize / 8);
+            let word = word.ok_or("regions.csv: ids are not ascending")?;
+            word.fetch_or(u64::from(self.group_of(code)?) << (id % 8 * 8), Relaxed);
+            p = q + 5;
         }
-        Ok((first, prev))
+        Ok(())
     }
 
-    fn group(&self, code: usize) -> Result<u8, String> {
+    fn group_of(&self, code: usize) -> Result<u8, &'static str> {
         let g = self.codes[code].load(Relaxed);
         if g != 0 {
             return Ok(g);
         }
-        let mut n = self.groups.lock().unwrap();
+        let mut groups = self.groups.lock().unwrap();
+        // Another worker may have handed this code a group meanwhile.
         if self.codes[code].load(Relaxed) == 0 {
-            *n = n.checked_add(1).ok_or("regions.csv: over 255 countries")?;
-            self.codes[code].store(*n, Relaxed);
+            let next = groups.checked_add(1);
+            *groups = next.ok_or("regions.csv: more than 255 countries")?;
+            self.codes[code].store(*groups, Relaxed);
         }
         Ok(self.codes[code].load(Relaxed))
     }
 
-    pub fn pieces(&self) -> usize {
-        self.cuts.len() - 1
-    }
-
-    /// (country, group) in country order, which is output order.
+    /// `(code, group)` for every country seen, in code order.
     pub fn countries(&self) -> impl Iterator<Item = (String, u8)> + '_ {
-        self.codes.iter().enumerate().filter_map(|(code, g)| {
-            let g = g.load(Relaxed);
-            let letters =
-                [code / 676, code / 26 % 26, code % 26].map(|x| char::from(b'A' + x as u8));
-            (g != 0).then(|| (letters.iter().collect(), g))
-        })
+        let letters = |c: usize| [c / 676, c / 26 % 26, c % 26].map(|l| (b'A' + l as u8) as char);
+        let groups = self.codes.iter().map(|g| g.load(Relaxed)).enumerate();
+        let seen = groups.filter(|&(_, g)| g != 0);
+        seen.map(move |(c, g)| (letters(c).iter().collect(), g))
     }
-}
-
-/// The id at `t[*at..]` up to its comma, which `*at` is moved past.
-fn parse_id(t: &[u8], at: &mut usize) -> Result<u64, String> {
-    let digits = t[*at..].iter().take_while(|b| b.is_ascii_digit()).count();
-    let id = t[*at..*at + digits].iter().fold(0u64, |v, &b| {
-        v.saturating_mul(10).saturating_add(u64::from(b - b'0'))
-    });
-    if digits == 0 || t.get(*at + digits) != Some(&b',') || id > MAX_ID {
-        return Err(format!("regions.csv: bad region id at byte {at}"));
-    }
-    *at += digits + 1;
-    Ok(id)
 }

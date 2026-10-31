@@ -1,232 +1,183 @@
-//! Distinct names per group, for the names that one worker owns.
+//! Distinct names. `Names` interns every name into a dense id with one
+//! lock-free hash table shared by all workers, and records which (name,
+//! group) pairs occur in a shared bitset of 256 bits per name, one per
+//! group. A pair is new exactly when its bit flips from 0 to 1, so
+//! `names_distinct` is a count of flips, with nothing to merge at the end.
 //!
-//! Every record's name goes, as a message, to the one worker that owns it
-//! (chosen by a hash of the name), so each table here is private to its
-//! worker: no locks, no atomics, and only about 1/12 of the names.
+//! After the first few percent of the file nearly every name is already in
+//! the table, so it is read-mostly and its cache lines stay shared by all
+//! cores. Ids are exact: a lookup always compares the name's bytes.
 
-use std::arch::x86_64::*;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use crate::records::{load, Fail, Record, BATCH};
+use crate::{map, prefetch, Agg, Padded, NAMES};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 
-/// Bit words per name: one bit per group, 256 groups.
-const BITS: usize = 4;
-/// Zero words kept after the last entry, so that a 32-byte load at any
-/// key stays in bounds.
-const PAD: usize = 5;
-/// Entries start below this word offset (24 bits in a slot).
-const MAX_WORDS: usize = 1 << 24;
-/// 32 bytes of ones then 32 of zeros: a 32-byte window into it starting at
-/// `32 - n` keeps the first `n` bytes of a vector.
-static WINDOW: [u8; 64] = {
-    let mut w = [0; 64];
-    let mut i = 0;
-    while i < 32 {
-        w[i] = 0xFF;
-        i += 1;
-    }
-    w
-};
+/// Words per table slot: up to three words of name, then `meta`.
+const SLOT: usize = 4;
+/// The longest name kept in its slot; longer ones live in the arena.
+const INLINE: usize = 8 * (SLOT - 1);
+/// `meta` of a slot whose claimer is still filling it in. Otherwise `meta`
+/// is 0 for an empty slot, or `(id + 1) << 32 | length`, where a length of
+/// `LONG` or more is `LONG` and the slot's first word holds the real one.
+const FILLING: u64 = u64::MAX;
+const LONG: usize = u32::MAX as usize;
 
 pub struct Names {
-    /// Open addressing, linear probing: 0 is empty, else 8 bits of the
-    /// name's hash (to skip most other names without reading them) and
-    /// 1 + its entry's word offset in `words`.
-    slots: Vec<u32>,
-    /// The entries: `BITS` words of group bits, then the key's length (2
-    /// bytes) and bytes, zero-padded to whole words.
-    words: Vec<u64>,
-    names: usize,
-    /// Distinct names counted so far, per group.
-    pub distinct: [u32; 256],
-}
-
-/// A message's name: where its raw bytes are in the file, how many there
-/// are, its first 32 of them (zero-padded) and its hash.
-#[derive(Clone, Copy)]
-struct Key {
-    at: usize,
-    len: usize,
-    head: __m256i,
-    hash: u64,
+    /// Open addressing with linear probing over 32-byte slots, so a lookup
+    /// usually reads one cache line, with the name's words right there to
+    /// compare. Slot i is `table[SLOT * i..][..SLOT]`.
+    table: &'static [AtomicU64],
+    mask: usize,
+    /// Names longer than `INLINE`: their slot holds their length and where
+    /// their words start here.
+    arena: &'static [AtomicU64],
+    /// The groups seen with name id i are bits `4 * i * 64..` onwards.
+    pairs: &'static [AtomicU64],
+    /// Ids and arena words handed out so far, and the cap on ids that keeps
+    /// the table at most 7/8 full.
+    next_id: Padded<AtomicUsize>,
+    next_word: Padded<AtomicUsize>,
+    limit: usize,
 }
 
 impl Names {
-    /// Room for the names of one owner of twelve (spec: 100,000 in all)
-    /// before anything has to grow; untouched capacity costs no memory.
-    pub fn new() -> Names {
-        let words = Vec::with_capacity(1 << 17);
-        Names {
-            slots: vec![0; 1 << 14],
-            words,
-            names: 0,
-            distinct: [0; 256],
+    /// An empty set with `slots` table slots (a power of two) for a file of
+    /// `file_len` bytes.
+    pub fn new(slots: usize, file_len: usize) -> std::io::Result<Self> {
+        let limit = slots / 8 * 7;
+        Ok(Names {
+            table: map::zeroed(SLOT * slots)?,
+            mask: slots - 1,
+            // A long name's padded words are fewer than its record's bytes,
+            // so the arena cannot overflow.
+            arena: map::zeroed(file_len / 8 + 1)?,
+            pairs: map::zeroed(4 * limit)?,
+            next_id: Padded(AtomicUsize::new(0)),
+            next_word: Padded(AtomicUsize::new(0)),
+            limit,
+        })
+    }
+
+    /// Faults in this worker's share of the tables (see `map::touch`).
+    pub fn touch(&self, part: usize, parts: usize) {
+        map::touch(self.table, part, parts);
+        map::touch(self.pairs, parts - 1 - part, parts); // the others start here
+    }
+
+    /// Interns a batch of names and adds every new (name, group) pair to its
+    /// group's count. Each pass over the batch prefetches what the next one
+    /// reads, so the cache misses of a whole batch overlap instead of
+    /// following one another: keys and table slots, ids and bitset words,
+    /// then the bits themselves.
+    pub fn count(&self, b: &[u8], batch: &[Record], aggs: &mut [Agg]) -> Result<(), Fail> {
+        let (mut keys, mut at) = ([[0; 4]; BATCH], [0; BATCH]);
+        for (k, n) in keys.iter_mut().zip(batch) {
+            *k = key(b, n);
+            prefetch(&self.table[SLOT * (k[3] as usize & self.mask)]);
         }
-        .padded()
-    }
-
-    fn padded(mut self) -> Names {
-        self.words.extend([0; PAD]);
-        self
-    }
-
-    /// Counts the messages' (name, group) pairs (see `records::record`).
-    /// Batches of `BATCH` hide the cache misses: the names of the batch
-    /// after next, then the slots of this batch, then their entries are
-    /// prefetched before any is used.
-    pub fn add_all(&mut self, d: &[u8], msgs: &[AtomicU64]) {
-        const BATCH: usize = 16;
-        for (b, batch) in msgs.chunks(BATCH).enumerate() {
-            for m in msgs.iter().skip((b + 2) * BATCH).take(BATCH) {
-                crate::prefetch(d, m.load(Relaxed) as u32 as usize);
-            }
-            let mut keys = [(
-                Key {
-                    at: 0,
-                    len: 0,
-                    head: zero(),
-                    hash: 0,
-                },
-                0,
-            ); BATCH];
-            for (k, m) in keys.iter_mut().zip(batch) {
-                let m = m.load(Relaxed);
-                *k = (
-                    key(d, m as u32 as usize, (m >> 32) as u16 as usize),
-                    (m >> 48) as u8,
-                );
-                crate::prefetch(&self.slots, k.0.hash as usize & (self.slots.len() - 1));
-            }
-            for (k, _) in &keys[..batch.len()] {
-                let s = self.slots[k.hash as usize & (self.slots.len() - 1)];
-                crate::prefetch(&self.words, (s & 0xFF_FFFF) as usize);
-            }
-            for &(k, group) in &keys[..batch.len()] {
-                let e = self.find(d, k);
-                let (w, bit) = (
-                    &mut self.words[e + usize::from(group / 64)],
-                    1u64 << (group % 64),
-                );
-                self.distinct[usize::from(group)] += u32::from(*w & bit == 0);
-                *w |= bit;
-            }
+        for ((at, key), n) in at.iter_mut().zip(&keys).zip(batch) {
+            *at = 4 * self.id(key, b, n)? + usize::from(n.group / 64);
+            prefetch(&self.pairs[*at]);
         }
+        for (&at, n) in at.iter().zip(batch) {
+            let bit = 1 << (n.group % 64);
+            let new = self.pairs[at].fetch_or(bit, Relaxed) & bit == 0;
+            aggs[usize::from(n.group)].sums[NAMES] += i64::from(new);
+        }
+        Ok(())
     }
 
-    /// The entry of `k`, made if new.
-    fn find(&mut self, d: &[u8], k: Key) -> usize {
-        let (mask, tag) = (self.slots.len() - 1, (k.hash >> 56) as u32);
-        let mut i = k.hash as usize & mask;
+    /// The id of name `n`, whose key is `key`.
+    fn id(&self, key: &Key, b: &[u8], n: &Record) -> Result<usize, Fail> {
+        let mut i = key[3] as usize & self.mask;
         loop {
-            let s = self.slots[i];
-            if s == 0 {
-                return self.insert(i, d, k);
+            let slot = &self.table[SLOT * i..][..SLOT];
+            let mut meta = slot[SLOT - 1].load(Acquire);
+            if meta == 0 {
+                // Claim the slot first, so that only one worker writes it.
+                match slot[SLOT - 1].compare_exchange(0, FILLING, Acquire, Acquire) {
+                    Ok(_) => return self.fill(slot, key, b, n),
+                    Err(now) => meta = now,
+                }
             }
-            let e = (s & 0xFF_FFFF) as usize - 1;
-            if s >> 24 == tag && self.same(e, d, k) {
-                return e;
+            while meta == FILLING {
+                std::hint::spin_loop(); // a few stores away from done
+                meta = slot[SLOT - 1].load(Acquire);
             }
-            i = (i + 1) & mask;
-        }
-    }
-
-    /// Whether entry `e` holds the key `k`: the same length and bytes.
-    fn same(&self, e: usize, d: &[u8], k: Key) -> bool {
-        let at = (e + BITS) * 8;
-        let bytes = self.bytes();
-        let len = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-        // SAFETY: AVX2 (x86-64-v3, as the whole crate is compiled).
-        let diff = unsafe { _mm256_xor_si256(load32(bytes, at + 2), k.head) };
-        let equal = unsafe { _mm256_testz_si256(diff, window(k.len)) } == 1;
-        let rest = || bytes[at + 34..at + 2 + k.len] == d[k.at + 32..k.at + k.len];
-        usize::from(len) == k.len && equal && (k.len <= 32 || rest())
-    }
-
-    #[cold]
-    fn insert(&mut self, slot: usize, d: &[u8], k: Key) -> usize {
-        self.words.truncate(self.words.len() - PAD);
-        let e = self.words.len();
-        if e + 1 >= MAX_WORDS {
-            crate::die("over 2 million distinct names for one worker");
-        }
-        self.words.extend([0; BITS]);
-        let key = (k.len as u16)
-            .to_le_bytes()
-            .into_iter()
-            .chain(d[k.at..k.at + k.len].iter().copied());
-        let mut key = key.peekable();
-        while key.peek().is_some() {
-            self.words.push(
-                key.by_ref()
-                    .take(8)
-                    .enumerate()
-                    .fold(0, |w, (i, b)| w | u64::from(b) << (8 * i)),
-            );
-        }
-        self.words.extend([0; PAD]);
-        self.slots[slot] = ((k.hash >> 56) as u32) << 24 | (e as u32 + 1);
-        self.names += 1;
-        if self.names * 8 > self.slots.len() * 5 {
-            self.grow();
-        }
-        e
-    }
-
-    /// Doubles the slots (at 5/8 full), rehashing each entry's key.
-    fn grow(&mut self) {
-        let bigger = vec![0; 2 * self.slots.len()];
-        let old = std::mem::replace(&mut self.slots, bigger);
-        let mask = self.slots.len() - 1;
-        for s in old.into_iter().filter(|&s| s != 0) {
-            let (bytes, at) = (self.bytes(), ((s & 0xFF_FFFF) as usize - 1 + BITS) * 8);
-            let len = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-            let mut i = key(bytes, at + 2, len).hash as usize & mask;
-            while self.slots[i] != 0 {
-                i = (i + 1) & mask;
+            if meta as u32 as usize == n.len.min(LONG) && self.holds(slot, key, b, n) {
+                return Ok((meta >> 32) as usize - 1);
             }
-            self.slots[i] = s;
+            i = (i + 1) & self.mask;
         }
     }
 
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: the same memory as `words`, viewed as bytes, which have
-        // no alignment or validity requirements.
-        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.words.len() * 8) }
+    /// Writes name `n` into a slot this worker has claimed, then publishes
+    /// it: the Release store makes the words visible before the `meta`.
+    fn fill(&self, slot: &[AtomicU64], key: &Key, b: &[u8], n: &Record) -> Result<usize, Fail> {
+        let id = self.next_id.0.fetch_add(1, Relaxed);
+        if id >= self.limit {
+            // Publish a slot no lookup matches, so nobody waits on it forever.
+            slot[0].store(u64::MAX, Relaxed);
+            slot[SLOT - 1].store(LONG as u64, Release);
+            return Err(Fail::Full);
+        }
+        if n.len <= INLINE {
+            key.iter().zip(slot).for_each(|(&w, s)| s.store(w, Relaxed));
+        } else {
+            let at = self.next_word.0.fetch_add(n.len.div_ceil(8), Relaxed);
+            words(b, n)
+                .zip(&self.arena[at..])
+                .for_each(|(w, a)| a.store(w, Relaxed));
+            slot[0].store(n.len as u64, Relaxed);
+            slot[1].store(at as u64, Relaxed);
+        }
+        slot[SLOT - 1].store((id as u64 + 1) << 32 | n.len.min(LONG) as u64, Release);
+        Ok(id)
+    }
+
+    /// Whether a published slot whose length field matches holds name `n`.
+    fn holds(&self, slot: &[AtomicU64], key: &Key, b: &[u8], n: &Record) -> bool {
+        if n.len <= INLINE {
+            return (0..3).all(|k| slot[k].load(Relaxed) == key[k]);
+        }
+        let arena = &self.arena[slot[1].load(Relaxed) as usize..];
+        let same = |(w, a): (u64, &AtomicU64)| a.load(Relaxed) == w;
+        slot[0].load(Relaxed) == n.len as u64 && words(b, n).zip(arena).all(same)
     }
 }
 
-/// The key `d[at..at + len]`: its first 32 bytes, zero-padded, and a hash
-/// of them and its length (longer keys that share those differ only in
-/// the compare). Two 64x64-bit multiplies, folding the high half of each
-/// product onto its low half, mix every byte into every bit.
-fn key(d: &[u8], at: usize, len: usize) -> Key {
-    // SAFETY: AVX2 as above; any 32 bytes are a valid [u64; 4].
-    let head = unsafe { _mm256_and_si256(load32(d, at), window(len)) };
-    let [a, b, c, e] = unsafe { std::mem::transmute::<__m256i, [u64; 4]>(head) };
-    let mum = |x: u64, y: u64| {
-        let p = u128::from(x) * u128::from(y);
-        p as u64 ^ (p >> 64) as u64
-    };
-    let hash = mum(a ^ 0x9E37_79B9_7F4A_7C15, b ^ 0xC2B2_AE3D_27D4_EB4F)
-        ^ mum(c ^ len as u64, e ^ 0x1656_67B1_9E37_79F9);
-    Key {
-        at,
-        len,
-        head,
-        hash: mum(hash, 0xD6E8_FEB8_6659_FD93),
+/// A name's first 24 bytes as three zero-padded words, which for nearly
+/// every name is all of it, then its hash. Fixed-size, so hashing and
+/// comparing need no loop.
+type Key = [u64; 4];
+
+fn key(b: &[u8], n: &Record) -> Key {
+    let word = |k: usize| load(b, n.start + 8 * k) & keep(n.len.saturating_sub(8 * k));
+    let [w0, w1, w2] = [0, 1, 2].map(word);
+    let mut h = mix(w0 ^ mix(w1 ^ mix(w2 ^ n.len as u64)));
+    if n.len > INLINE {
+        h = words(b, n).skip(3).fold(h, |h, w| mix(h ^ w));
     }
+    [w0, w1, w2, h ^ h >> 32]
 }
 
-/// A vector that keeps the first `n` bytes (all of them if `n >= 32`).
-fn window(n: usize) -> __m256i {
-    load32(&WINDOW, 32 - n.min(32))
+/// A mask of the low `bytes` bytes of a word (all of it from 8 on).
+fn keep(bytes: usize) -> u64 {
+    u64::MAX
+        .checked_shr(64 - 8 * bytes.min(8) as u32)
+        .unwrap_or(0)
 }
 
-fn zero() -> __m256i {
-    // SAFETY: AVX2 as above.
-    unsafe { _mm256_setzero_si256() }
+/// One multiply-xorshift round; the multiplier is 2^64 / golden ratio.
+fn mix(x: u64) -> u64 {
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    let x = x.wrapping_mul(GOLDEN);
+    x ^ x >> 29
 }
 
-fn load32(d: &[u8], at: usize) -> __m256i {
-    assert!(at + 32 <= d.len());
-    // SAFETY: in bounds (just asserted); AVX2 as above.
-    unsafe { _mm256_loadu_si256(d.as_ptr().add(at).cast()) }
+/// The raw bytes of name `n` as little-endian 8-byte words, the last one
+/// zero-padded.
+fn words<'b>(b: &'b [u8], n: &Record) -> impl Iterator<Item = u64> + 'b {
+    let (start, len) = (n.start, n.len);
+    (0..len.div_ceil(8)).map(move |k| load(b, start + 8 * k) & keep(len - 8 * k))
 }
