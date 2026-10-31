@@ -1,2 +1,6 @@
 .out/
 data/
+data2/
+target/
+# Private team notes: not part of the submission
+team-notes/

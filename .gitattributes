@@ -1,0 +1,2 @@
+# Keep LF everywhere: the board builds on Linux and outputs are hashed byte for byte.
+* text=auto eol=lf
