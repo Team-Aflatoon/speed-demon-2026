@@ -157,6 +157,13 @@ the per-bucket working set.
   chunks into one buffer, carrying the partial last line forward. On track A the same
   change cut box T by 15%. Here it landed inside v4's 141-148 ms spread, and the same
   locally, at S +18. Kept the mapping.
+- **A clean-room rework of v4** (box, full correct run, run-2a608e748f34: T 165.2 ms,
+  M 73.2 MB, K 23.98). One persistent thread team for all phases, BFS regions capped at
+  16K nodes, a per-direction inlined search loop, queries sorted by renumbered source so
+  concurrent searches share cache, per-CSR escape tables, and 64-node distance blocks;
+  S 551 → 495. Locally it used 8% less CPU (1,430 vs 1,559 ms) and its search phase was
+  6% faster, yet the box measured it 12-16% slower than v4. Kept v4. Lesson, again: on this
+  box a local CPU win is only a hypothesis until a board run confirms it.
 - **One parse for the first CSR** (box probe d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
   Each thread scatters into its own per-bucket runs, sized from its share of the text
   with a spill list for overflow, and a counting sort per bucket writes the final CSR
