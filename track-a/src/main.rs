@@ -1,42 +1,53 @@
 //! Track A (Ingest): for every (UTC hour, endpoint) group of an HTTP request log, the
 //! request count, nearest-rank p50/p95/p99 latency and the 5xx count and rate.
 //!
-//! One parallel pass over the memory-mapped log files every latency into per-worker,
-//! per-group block chains; a second parallel pass walks the groups hour by hour and
-//! selects the three ranks; a third formats the hours and writes them in place.
-//! README.md describes the design and why.
+//! One parallel pass over the memory-mapped log appends a 4-byte record per line to a
+//! per-worker, per-hour log; then workers report the hours in order (a counting sort
+//! by endpoint, then three selections per group) while the main thread writes each
+//! hour out. README.md describes the design and why.
 
 use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Write};
-use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::ptr::null_mut;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, RwLock};
 use std::thread;
 
-/// Distinct endpoints one worker can hold. The spec promises 1,842 per seed; table rows
-/// are this wide, but only the cells of endpoints actually seen are ever touched.
-const MAX_ENDPOINTS: usize = 4096;
-/// Slots of the open-addressing endpoint table: a power of two, at most half full.
-const SLOTS: usize = 2 * MAX_ENDPOINTS;
-/// Hour rows of a group table: 71 either side of the first line's hour, so any 72-hour
-/// span that contains the first line fits without knowing where the span starts.
+/// Distinct endpoints one worker can hold (a record has 12 bits for the id); the spec
+/// promises 1,842 per seed.
+const MAX_ENDPOINTS: usize = 3072;
+/// Slots of the open-addressing endpoint table: a power of two, at most 3/4 full.
+const SLOTS: usize = 4096;
+/// Hour rows: 71 either side of the first line's hour, so any 72-hour span that
+/// contains the first line fits without knowing where the span starts.
 const ROWS: usize = 143;
-/// Latencies per arena block: one cache line, and a power of two so the slot of the
-/// next latency is a mask of the group's count.
-const BLOCK: usize = 16;
-const NONE: usize = usize::MAX;
+/// A record's latency field is 19 bits; this value (all ones) marks a latency that
+/// did not fit and is kept in `Hour::large` instead.
+const MARK: u32 = (1 << 19) - 1;
+/// Records per log chunk: 256 KB, so the allocator maps each chunk on its own and
+/// unmaps it when the hour is freed.
+const CHUNK: usize = 1 << 16;
+/// Bytes of input whose line ends are found in one go (a multiple of 64).
+const SCAN: usize = 4096;
 
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
         -> *mut c_void;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const PR_SET_THP_DISABLE: i32 = 41;
 
 fn main() {
+    // Transparent huge pages, `always` on stock Debian, would back malloc's per-thread
+    // arenas with 2 MB pages and charge mostly empty ones to our memory peak. Opting
+    // out is a hint: if an old kernel refuses it, the run is just as correct.
+    // SAFETY: a plain prctl that touches no memory of ours.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     if let Err(e) = run() {
         eprintln!("ingest: {e}");
         std::process::exit(1);
@@ -62,41 +73,68 @@ fn run() -> io::Result<()> {
         .map_or(1, |n| n.get())
         .min(12);
     let base = hour_number(&data[..13]) - ROWS as i64 / 2;
-    let shards = parallel(workers, split(data, workers), |range| {
-        Shard::ingest(data, range, base)
-    })
-    .into_iter()
-    .collect::<io::Result<Vec<_>>>()?;
-    let (union, order, ids) = merge_endpoints(&shards)?;
-    let names: Vec<&[u8]> = order.iter().map(|&g| union.name(g)).collect();
-    let hours: Vec<Option<&[u8]>> = (0..ROWS)
-        .map(|r| shards.iter().find_map(|s| s.hours[r]))
+    let shards = thread::scope(|s| {
+        let ranges = split(data, workers);
+        let handles: Vec<_> = ranges
+            .into_iter()
+            .map(|range| s.spawn(move || Shard::ingest(data, range, base)))
+            .collect();
+        let shards = handles
+            .into_iter()
+            .map(|h| h.join().expect("no worker panics"));
+        shards.collect::<io::Result<Vec<_>>>()
+    })?;
+    let (names, rank_of) = merge_endpoints(&shards)?;
+    // From here on each worker's hour sits behind a lock, so that it can be freed as
+    // soon as it is reported, while the logs of later hours are still in use.
+    let hours: Vec<Vec<RwLock<Hour>>> = shards
+        .into_iter()
+        .map(|s| s.hours.into_iter().map(RwLock::new).collect())
         .collect();
-    // Hours differ up to fivefold in traffic, so for balance each is cut into four
-    // tasks by endpoint rank; task order is still output order.
-    let n = names.len();
-    let tasks: Vec<(usize, Range<usize>)> = (0..ROWS * 4)
-        .map(|t| (t / 4, n * (t % 4) / 4..n * (t % 4 + 1) / 4))
-        .collect();
-    let groups = parallel(workers, tasks.iter().cloned(), |(row, ranks)| {
-        summarise(row, ranks, &shards, &ids)
-    });
-    // The block chains are spent: give their memory back before the output's page
-    // cache starts to grow, so the two never count towards the peak together.
-    drop(shards);
 
-    // Format the hours in parallel, then write them in order. Writes to one file
-    // serialise on its inode lock anyway, so one writer is as fast as many.
-    let texts = parallel(workers, tasks.iter().zip(&groups), |(&(row, _), groups)| {
-        let mut text = Vec::new();
-        if let Some(hour) = hours[row] {
-            groups
-                .iter()
-                .for_each(|g| g.format(hour, &names, &mut text));
+    // Workers report the hours in order while this thread writes each one as soon as
+    // all earlier ones are out, so the write overlaps the work. The bounded channel
+    // stops workers running far ahead of the writer, which bounds the texts held.
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::sync_channel(2 * workers);
+    thread::scope(|s| {
+        for _ in 0..workers {
+            let (sender, next) = (sender.clone(), &next);
+            let (hours, rank_of, names) = (&hours, &rank_of, &names);
+            s.spawn(move || {
+                let mut latencies = Vec::new();
+                loop {
+                    let row = next.fetch_add(1, Ordering::Relaxed);
+                    if row >= ROWS {
+                        return;
+                    }
+                    let mut text = Vec::new();
+                    report(row, hours, rank_of, names, &mut latencies, &mut text);
+                    // The text holds all that is left of the hour: free its logs now
+                    // (each chunk is its own mapping, so the memory goes back at once).
+                    for hour in hours {
+                        drop(std::mem::take(
+                            &mut hour[row].write().expect("no worker panics").chunks,
+                        ));
+                    }
+                    if sender.send((row, text)).is_err() {
+                        return;
+                    }
+                }
+            });
         }
-        text
-    });
-    texts.iter().try_for_each(|text| out.write_all(text))
+        drop(sender);
+        let mut pending = vec![None; ROWS];
+        let mut written = 0;
+        for (t, text) in receiver {
+            pending[t] = Some(text);
+            while let Some(text) = pending.get_mut(written).and_then(Option::take) {
+                out.write_all(&text)?;
+                written += 1;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Maps the first `len` bytes of `file`, private and read-only.
@@ -109,38 +147,6 @@ fn map(file: &File, len: usize) -> io::Result<*const u8> {
         return Err(io::Error::last_os_error());
     }
     Ok(p.cast())
-}
-
-/// Runs `task` on every item on up to `workers` threads, which take the next item
-/// from a shared queue, and returns the results in item order.
-fn parallel<I: Send, T: Send>(
-    workers: usize,
-    items: impl IntoIterator<Item = I>,
-    task: impl Fn(I) -> T + Sync,
-) -> Vec<T> {
-    let items: Vec<I> = items.into_iter().collect();
-    let threads = workers.min(items.len());
-    let queue = Mutex::new(items.into_iter().enumerate());
-    let mut done: Vec<(usize, T)> = thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let next = queue.lock().expect("no worker panics").next();
-                        let Some((i, item)) = next else { return mine };
-                        mine.push((i, task(item)));
-                    }
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("no worker panics"))
-            .collect()
-    });
-    done.sort_unstable_by_key(|&(i, _)| i);
-    done.into_iter().map(|(_, result)| result).collect()
 }
 
 /// Cuts the file into `parts` ranges of whole lines.
@@ -158,20 +164,17 @@ fn split(data: &[u8], parts: usize) -> Vec<(usize, usize)> {
     bounds.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
-/// Every endpoint any worker saw, as one table, its ids in output order, and
-/// `ids[w][r]`: worker w's id for the endpoint of rank r, or NONE. Deduplicating
-/// through one more hash table and sorting the ~1,842 survivors is far cheaper than
-/// sorting the concatenation of every worker's names.
-fn merge_endpoints(shards: &[Shard]) -> io::Result<(Endpoints, Vec<usize>, Vec<Vec<usize>>)> {
+/// Every endpoint any worker saw, in output order, and `ranks[w][id]`: the output
+/// rank of worker w's endpoint `id`. Deduplicating through one more hash table and
+/// sorting the ~1,842 survivors is far cheaper than sorting every worker's names.
+fn merge_endpoints(shards: &[Shard]) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u32>>)> {
     let mut union = Endpoints::new();
     let global = shards
         .iter()
         .map(|s| {
             let e = &s.endpoints;
-            e.entries
-                .iter()
-                .map(|&(hash, start, end)| union.id(&e.bytes, start, end, hash))
-                .collect()
+            let id = |l| union.id(&e.arena, e.records[l] + 16, e.end(l), e.hash(l));
+            (0..e.len()).map(id).collect()
         })
         .collect::<Option<Vec<Vec<usize>>>>()
         .ok_or_else(too_many_endpoints)?;
@@ -180,19 +183,16 @@ fn merge_endpoints(shards: &[Shard]) -> io::Result<(Endpoints, Vec<usize>, Vec<V
     order.sort_unstable_by_key(|&g| union.name(g));
     let mut rank = vec![0; order.len()];
     for (r, &g) in order.iter().enumerate() {
-        rank[g] = r;
+        rank[g] = r as u32;
     }
-    let ids = global
+    let ranks = global
         .iter()
-        .map(|global| {
-            let mut ids = vec![NONE; order.len()];
-            for (local, &g) in global.iter().enumerate() {
-                ids[rank[g]] = local;
-            }
-            ids
-        })
+        .map(|g| g.iter().map(|&g| rank[g]).collect())
         .collect();
-    Ok((union, order, ids))
+    Ok((
+        order.iter().map(|&g| union.name(g).to_vec()).collect(),
+        ranks,
+    ))
 }
 
 fn too_many_endpoints() -> io::Error {
@@ -202,99 +202,92 @@ fn too_many_endpoints() -> io::Error {
 /// What one worker learns from its range of the file.
 struct Shard<'a> {
     endpoints: Endpoints,
-    /// Hour row -> the `YYYY-MM-DDTHH` prefix of one of its lines, to print the hour.
-    hours: Vec<Option<&'a [u8]>>,
-    /// `row * MAX_ENDPOINTS + id` -> [count, 5xx count, 1 + newest block, or 0].
-    /// Allocated zeroed and touched sparsely, so untouched rows never cost memory.
-    groups: Vec<[u32; 3]>,
-    /// Bump arena of latency blocks, chained newest to oldest per group: `links[b]`
-    /// is 1 + the block before block b in its group's chain, or 0.
-    blocks: Vec<[u32; BLOCK]>,
-    links: Vec<u32>,
+    hours: Vec<Hour<'a>>,
 }
 
 impl<'a> Shard<'a> {
     fn ingest(data: &'a [u8], (start, end): (usize, usize), base: i64) -> io::Result<Self> {
         let mut shard = Shard {
             endpoints: Endpoints::new(),
-            hours: vec![None; ROWS],
-            groups: vec![[0; 3]; ROWS * MAX_ENDPOINTS],
-            // A line is at least 40 bytes, so this never reallocates. Untouched capacity
-            // is never faulted in, so the generous reservation is free.
-            blocks: Vec::with_capacity((end - start) / 40 + 1),
-            links: Vec::with_capacity((end - start) / 40 + 1),
+            hours: (0..ROWS).map(|_| Hour::default()).collect(),
         };
         // Lines arrive in roughly time order, so the hour is cached on its 13-byte text.
         let (mut seen, mut row) = ((0, 0), 0);
-        let mut line = start;
-        for block in (start..end).step_by(64) {
-            let mut mask = newline_mask(data, block, end);
-            while mask != 0 {
-                let nl = block + mask.trailing_zeros() as usize;
-                mask &= mask - 1;
+        let (mut line, mut ends) = (start, [0; 2 * SCAN / 64]);
+        for scan in (start..end).step_by(SCAN) {
+            for &nl in newlines(data, scan, end.min(scan + SCAN), &mut ends) {
                 let key = (load(data, line), load(data, line + 5));
                 if key != seen {
                     seen = key;
                     row = shard.hour_row(data, line, base)?;
                 }
-                shard.add(data, line, nl, row)?;
+                let (latency, sp) = parse_latency(data, nl);
+                // The method is 3 to 7 bytes after the 27-byte timestamp and a space,
+                // so the endpoint's leading '/' is one of the 8 bytes at line + 32. XOR
+                // turns '/' into a zero byte; the SWAR zero-byte test flags the first.
+                let x = load(data, line + 32) ^ 0x2f2f_2f2f_2f2f_2f2f;
+                let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+                let (start, end) = (line + 32 + zero.trailing_zeros() as usize / 8, sp - 4);
+                let hash = endpoint_hash(data, start, end);
+                let id = shard.endpoints.id(data, start, end, hash);
+                let id = id.ok_or_else(too_many_endpoints)?;
+                shard.hours[row].push(id, latency, data[sp - 3] == b'5');
                 line = nl + 1;
             }
         }
         Ok(shard)
     }
 
-    /// The row of the line's hour, relative to `base`.
+    /// The row of the line's hour, relative to `base`; starts the hour if new.
     fn hour_row(&mut self, data: &'a [u8], line: usize, base: i64) -> io::Result<usize> {
         let text = &data[line..line + 13];
         let row = usize::try_from(hour_number(text) - base)
             .ok()
             .filter(|&r| r < ROWS)
             .ok_or_else(|| io::Error::other("timestamps span more than 72 hours"))?;
-        self.hours[row].get_or_insert(text);
+        let hour = &mut self.hours[row];
+        if hour.prefix.is_empty() {
+            hour.prefix = text;
+        }
         Ok(row)
     }
+}
 
-    /// Files one line, `ts SP method SP endpoint SP status SP latency`, ending at `nl`.
-    fn add(&mut self, data: &[u8], line: usize, nl: usize, row: usize) -> io::Result<()> {
-        let (latency, sp) = parse_latency(data, nl);
-        let error = data[sp - 3] == b'5';
-        // The method is 3 to 7 bytes after the 27-byte timestamp and a space, so the
-        // endpoint's leading '/' is one of the 8 bytes at line + 32. XOR turns '/' into
-        // a zero byte, and the classic SWAR zero-byte test flags the first one.
-        let x = load(data, line + 32) ^ 0x2f2f_2f2f_2f2f_2f2f;
-        let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-        let start = line + 32 + zero.trailing_zeros() as usize / 8;
-        let end = sp - 4;
-        let id = self
-            .endpoints
-            .id(data, start, end, endpoint_hash(data, start, end))
-            .ok_or_else(too_many_endpoints)?;
+/// What one worker saw of one hour: an append-only log with one 4-byte record per
+/// line, `endpoint id << 20 | 5xx << 19 | latency`. 97% of latencies are below 2^19
+/// (0.5 s); a larger one is logged as `MARK` and kept in `large`. Appending is a
+/// sequential write per line, and the report phase reads each log front to back.
+#[derive(Default)]
+struct Hour<'a> {
+    /// The `YYYY-MM-DDTHH` of one of its lines, to print the hour; empty if none.
+    prefix: &'a [u8],
+    chunks: Vec<Box<[u32]>>,
+    len: usize,
+    /// (endpoint id, latency) of every latency of `MARK` or more.
+    large: Vec<(u32, u32)>,
+}
 
-        let group = &mut self.groups[row * MAX_ENDPOINTS + id];
-        let used = group[0] as usize % BLOCK;
-        if used == 0 {
-            self.blocks.push([0; BLOCK]);
-            self.links.push(group[2]);
-            group[2] = self.blocks.len() as u32;
+impl Hour<'_> {
+    fn push(&mut self, id: usize, latency: u32, error: bool) {
+        if latency >= MARK {
+            self.large.push((id as u32, latency));
         }
-        self.blocks[group[2] as usize - 1][used] = latency;
-        group[0] += 1;
-        group[1] += u32::from(error);
-        Ok(())
+        if self.len % CHUNK == 0 {
+            // Allocated zeroed: fresh pages from the kernel, faulted in as used.
+            self.chunks.push(vec![0; CHUNK].into_boxed_slice());
+        }
+        let record = (id as u32) << 20 | u32::from(error) << 19 | latency.min(MARK);
+        self.chunks[self.len / CHUNK][self.len % CHUNK] = record;
+        self.len += 1;
     }
 
-    /// Appends the latencies of group cell `cell` to `out`; returns its 5xx count.
-    fn collect(&self, cell: usize, out: &mut Vec<u32>) -> u32 {
-        let [count, errors, mut block] = self.groups[cell];
-        // The newest block holds 1..=BLOCK latencies, every older one is full.
-        let mut fill = (count as usize + BLOCK - 1) % BLOCK + 1;
-        while block != 0 {
-            out.extend_from_slice(&self.blocks[block as usize - 1][..fill]);
-            block = self.links[block as usize - 1];
-            fill = BLOCK;
-        }
-        errors
+    /// The log, as one slice per chunk.
+    fn records(&self) -> impl Iterator<Item = &[u32]> {
+        let used = |i: usize| (self.len - i * CHUNK).min(CHUNK);
+        self.chunks
+            .iter()
+            .enumerate()
+            .map(move |(i, c)| &c[..used(i)])
     }
 }
 
@@ -310,59 +303,75 @@ fn endpoint_hash(data: &[u8], start: usize, end: usize) -> u64 {
 
 /// Open-addressing hash table from endpoint bytes to dense ids 0, 1, 2, ...
 struct Endpoints {
-    /// Every name back to back, then 64 zero bytes so `same` can always load 64 bytes
-    /// from a name's start. Lookups compare against these few hot cache lines, not
-    /// against wherever in the input a name first appeared: that scattered the
-    /// compares over ~1,842 pages and cost a TLB miss on most lines.
-    bytes: Vec<u8>,
-    /// Id -> (hash, start, end of its name in `bytes`).
-    entries: Vec<(u64, usize, usize)>,
-    /// Hash slot -> id + 1, or 0 for an empty slot.
-    slots: Vec<u16>,
+    /// One record per name, back to back: its hash (8 bytes), its id and length (4 + 4),
+    /// the name, zero padding to a multiple of 8; then 64 zero bytes, so `same` can
+    /// always load 64 bytes from a name's start. A hit reads its slot, then one record,
+    /// usually one cache line. Keeping the names here, not pointing into the input,
+    /// matters: compares against the first occurrence of each name in the input touched
+    /// ~1,842 scattered pages and cost a TLB miss on most lines.
+    arena: Vec<u8>,
+    /// Id -> offset of its record in `arena`.
+    records: Vec<usize>,
+    /// Hash slot -> 1 + offset of a record, or 0 for an empty slot.
+    slots: Vec<u32>,
 }
 
 impl Endpoints {
     fn new() -> Self {
         Endpoints {
-            bytes: vec![0; 64],
-            entries: Vec::new(),
+            arena: vec![0; 64],
+            records: Vec::new(),
             slots: vec![0; SLOTS],
         }
     }
 
     fn len(&self) -> usize {
-        self.entries.len()
+        self.records.len()
+    }
+
+    fn hash(&self, id: usize) -> u64 {
+        load(&self.arena, self.records[id])
     }
 
     fn name(&self, id: usize) -> &[u8] {
-        let (_, start, end) = self.entries[id];
-        &self.bytes[start..end]
+        &self.arena[self.records[id] + 16..self.end(id)]
+    }
+
+    /// Where the name of `id` ends in `arena`.
+    fn end(&self, id: usize) -> usize {
+        let at = self.records[id];
+        at + 16 + (load(&self.arena, at + 8) >> 32) as usize
     }
 
     /// The id of the name `text[start..end]`, which hashes to `hash`, adding it if
     /// new; None when the table is full.
     fn id(&mut self, text: &[u8], start: usize, end: usize, hash: u64) -> Option<usize> {
+        let len = end - start;
         let mut slot = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         while self.slots[slot] != 0 {
-            let id = self.slots[slot] as usize - 1;
-            let (h, at, to) = self.entries[id];
-            if h == hash
-                && to - at == end - start
-                && same(&self.bytes, at, text, start, end - start)
+            let at = self.slots[slot] as usize - 1;
+            let id_len = load(&self.arena, at + 8);
+            if load(&self.arena, at) == hash
+                && (id_len >> 32) as usize == len
+                && same(&self.arena, at + 16, text, start, len)
             {
-                return Some(id);
+                return Some(id_len as u32 as usize);
             }
             slot = (slot + 1) % SLOTS;
         }
         if self.len() == MAX_ENDPOINTS {
             return None;
         }
-        let at = self.bytes.len() - 64;
-        self.bytes.truncate(at);
-        self.bytes.extend_from_slice(&text[start..end]);
-        self.bytes.resize(self.bytes.len() + 64, 0);
-        self.entries.push((hash, at, at + end - start));
-        self.slots[slot] = self.len() as u16;
+        let at = self.arena.len() - 64;
+        self.arena.truncate(at);
+        self.arena.extend_from_slice(&hash.to_le_bytes());
+        self.arena
+            .extend_from_slice(&((len as u64) << 32 | self.len() as u64).to_le_bytes());
+        self.arena.extend_from_slice(&text[start..end]);
+        self.arena
+            .resize(self.arena.len().next_multiple_of(8) + 64, 0);
+        self.slots[slot] = at as u32 + 1;
+        self.records.push(at);
         Some(self.len() - 1)
     }
 }
@@ -389,54 +398,73 @@ fn same(a: &[u8], i: usize, b: &[u8], j: usize, n: usize) -> bool {
     }
 }
 
-/// One output line before formatting: the endpoint's rank, then count, p50, p95,
-/// p99 and errors (24 bytes, as all 127k of them are held at the memory peak).
-struct Group(u32, [u32; 5]);
-
-impl Group {
-    /// `hour endpoint count p50 p95 p99 errors error_ppm`, from the hour's 13-byte prefix.
-    fn format(&self, hour: &[u8], names: &[&[u8]], out: &mut Vec<u8>) {
-        out.extend_from_slice(hour);
-        out.extend_from_slice(b":00:00Z ");
-        out.extend_from_slice(names[self.0 as usize]);
-        let [count, .., errors] = self.1.map(u64::from);
-        for n in self
-            .1
-            .map(u64::from)
-            .into_iter()
-            .chain([errors * 1_000_000 / count])
-        {
-            out.push(b' ');
-            push_decimal(out, n);
-        }
-        out.push(b'\n');
-    }
-}
-
-/// Every group of hour `row` whose endpoint rank is in `ranks`, in rank order.
-fn summarise(row: usize, ranks: Range<usize>, shards: &[Shard], ids: &[Vec<usize>]) -> Vec<Group> {
+/// The report lines of hour `row`, `hour endpoint count p50 p95 p99 errors error_ppm`,
+/// appended to `text`. The workers' logs of the hour are counting-sorted by endpoint
+/// rank into `latencies`, so every group ends up as one contiguous slice: two
+/// sequential passes over the logs, no pointer chasing.
+fn report(
+    row: usize,
+    hours: &[Vec<RwLock<Hour>>],
+    rank_of: &[Vec<u32>],
+    names: &[Vec<u8>],
+    latencies: &mut Vec<u32>,
+    text: &mut Vec<u8>,
+) {
     // Each worker read a few hours' worth of the file, so most miss most hours.
-    let present: Vec<_> = shards
+    let locked: Vec<_> = hours
         .iter()
-        .zip(ids)
-        .filter(|(s, _)| s.hours[row].is_some())
+        .map(|h| h[row].read().expect("no worker panics"))
         .collect();
-    let (mut groups, mut latencies) = (Vec::new(), Vec::new());
-    for rank in ranks {
-        latencies.clear();
-        let mut errors = 0;
-        for (shard, ids) in &present {
-            if ids[rank] != NONE {
-                errors += shard.collect(row * MAX_ENDPOINTS + ids[rank], &mut latencies);
-            }
-        }
-        if !latencies.is_empty() {
-            let count = latencies.len() as u32;
-            let [p99, p95, p50] = percentiles(&mut latencies);
-            groups.push(Group(rank as u32, [count, p50, p95, p99, errors]));
+    let seen: Vec<_> = locked
+        .iter()
+        .zip(rank_of)
+        .filter(|(h, _)| !h.prefix.is_empty())
+        .collect();
+    let Some(prefix) = seen.first().map(|(h, _)| h.prefix) else {
+        return;
+    };
+    let mut counts = vec![[0u32; 2]; names.len()]; // per endpoint: lines, errors
+    for (hour, rank_of) in &seen {
+        for &record in hour.records().flatten() {
+            let count = &mut counts[rank_of[(record >> 20) as usize] as usize];
+            count[0] += 1;
+            count[1] += record >> 19 & 1;
         }
     }
-    groups
+    let mut ends: Vec<usize> = counts
+        .iter()
+        .scan(0, |end, c| {
+            *end += c[0] as usize;
+            Some(*end)
+        })
+        .collect();
+    latencies.clear();
+    latencies.resize(ends.last().map_or(0, |&e| e), 0);
+    // Fill each group from its end backwards, leaving `ends` at the group starts.
+    for (hour, rank_of) in &seen {
+        let records = hour.records().flatten();
+        let small = records
+            .filter(|&&r| r & MARK != MARK)
+            .map(|&r| (r >> 20, r & MARK));
+        for (id, latency) in small.chain(hour.large.iter().copied()) {
+            let end = &mut ends[rank_of[id as usize] as usize];
+            *end -= 1;
+            latencies[*end] = latency;
+        }
+    }
+    for (rank, &[count, errors]) in counts.iter().enumerate().filter(|(_, c)| c[0] > 0) {
+        let group = &mut latencies[ends[rank]..ends[rank] + count as usize];
+        let (count, errors) = (u64::from(count), u64::from(errors));
+        let [p99, p95, p50] = percentiles(group).map(u64::from);
+        text.extend_from_slice(prefix);
+        text.extend_from_slice(b":00:00Z ");
+        text.extend_from_slice(&names[rank]);
+        for n in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
+            text.push(b' ');
+            push_decimal(text, n);
+        }
+        text.push(b'\n');
+    }
 }
 
 /// Nearest-rank p99, p95 and p50 (rank ceil(p * n / 100)), by repeated selection: each
@@ -452,6 +480,21 @@ fn percentiles(values: &mut [u32]) -> [u32; 3] {
         }
         last.1
     })
+}
+
+/// The newlines of `data[from..to]`, written to `ends`. A line has at least 40 bytes,
+/// so a 64-byte block holds at most two: both candidates are stored unconditionally
+/// and the count advances by the popcount, so the per-line loop that follows has no
+/// hard-to-predict exit at every block boundary.
+fn newlines<'e>(data: &[u8], from: usize, to: usize, ends: &'e mut [usize]) -> &'e [usize] {
+    let mut n = 0;
+    for block in (from..to).step_by(64) {
+        let mask = newline_mask(data, block, to);
+        ends[n] = block + mask.trailing_zeros() as usize;
+        ends[n + 1] = block + 63 - mask.leading_zeros() as usize;
+        n += mask.count_ones() as usize;
+    }
+    &ends[..n]
 }
 
 /// Bit i is set when `data[at + i]` is a newline before `end`: two AVX2 compares.
