@@ -152,6 +152,11 @@ the per-bucket working set.
   buckets (run-60ca41139fe7) the box measured 151.2 ms, 70.3 MB, K 24.86. With 2,048
   (run-b927b67c49d7) it measured 141.4 ms, 70.5 MB, K 25.70. Both are v4-level or worse
   against 4,096 (141-148 ms), and the same locally. Kept 4,096.
+- **Reading graph.txt with `pread` instead of `mmap`** (box, full correct run,
+  run-8c76e26ef37d: T 143.7 ms, M 70.4 MB, K 25.38). Each thread read its piece in 128 KiB
+  chunks into one buffer, carrying the partial last line forward. On track A the same
+  change cut box T by 15%. Here it landed inside v4's 141-148 ms spread, and the same
+  locally, at S +18. Kept the mapping.
 - **One parse for the first CSR** (box probe d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
   Each thread scatters into its own per-bucket runs, sized from its share of the text
   with a spill list for overflow, and a counting sort per bucket writes the final CSR
