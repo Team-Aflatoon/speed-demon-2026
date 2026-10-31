@@ -391,6 +391,9 @@ impl<'a> Job<'a> {
         stamp[..8].copy_from_slice(&h.stamp[0].load(Relaxed).to_le_bytes());
         stamp[5..13].copy_from_slice(&h.stamp[1].load(Relaxed).to_le_bytes());
         stamp[13..21].copy_from_slice(b":00:00Z ");
+        // Room for every line at once (untouched pages cost nothing), so the text never
+        // grows by copying.
+        text.reserve(256 * order.len());
         let mut start = 0;
         for &id in order.iter() {
             let n = counts[id as usize] as u32 as usize;
