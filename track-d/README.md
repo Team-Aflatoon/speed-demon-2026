@@ -4,6 +4,12 @@ Team Aflatoon: Dhruv Sharma (@spiritsfuse), Anushika Chauhan (@Anushika06), Prat
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/d-traverse.md).
 
+## Result
+
+The submitted version (commit 173a349) measured on the board as run-1d538165ea54:
+T 140.4 ms, M 70.4 MB, S 551, D 1, K 25.80 (70.58 points). The reference is 72.69 s and
+893 MB. PERF.md has every step with its board run.
+
 ## Approach
 
 The whole run is one Rust binary, `src/main.rs`, with no dependencies. Most of the work
@@ -69,8 +75,9 @@ no longer need (the BFS numbering is dropped as soon as the queries are translat
 glibc's mmap threshold is pinned at 1 MiB, because left dynamic it grows after the first
 large free, and later large buffers would then come from arenas that never return memory.
 The process also opts out of transparent huge pages (`prctl(PR_SET_THP_DISABLE)`). With
-THP on, a buffer touched in a few places is charged in 2 MiB pages: the first board run
-measured 93.5 MB, against 77 MB locally where THP is opt-in only.
+THP on, a buffer touched in a few places is charged in 2 MiB pages. The first board run
+measured 93.5 MB, against 77 MiB on our machine, where THP is opt-in only. The next board
+run, with the opt-out, measured 79.8 MB.
 
 Correctness was checked against the reference on the spec's worked example and the hand-written
 cases from the official tests, 60 random small graphs (zero and near-2^32 weights, parallel
@@ -83,13 +90,13 @@ None. The three libc functions used (`mmap`, `mallopt`, `prctl`) are declared by
 
 ## With another 24 hours
 
-Ideas we measured and dropped are in PERF.md: compressed offsets, deriving in-edges from
-the near-symmetric out-edges, shared distance pairs, and pruning by the other side's
-radius. What is left to try:
+Ideas we measured and dropped are in PERF.md, including four that were checked on the
+scoring box itself: one parse for the first CSR, smaller sort buckets, `pread` instead of
+`mmap`, and a clean-room rework. What is left to try:
 
-- Fuse the first count pass into the scatter: parse each piece once into per-thread
-  buckets sized from the piece length, with a spill list for overflow. That saves one pass
-  over the text (about 5 ms) if the memory can be kept under the query-phase peak.
+- Find out why the first CSR's counting sort costs 4-5x its local time on the box (about
+  18 ms of the 43 ms phase, from the probe split in PERF.md). Neither smaller buckets nor
+  sorting straight into the final array changed it.
 - Lower the two memory peaks together. The in-edge transpose and the queries now both
   sit at about 67 MiB. A direct atomic transpose already takes the first down to 57 MiB,
   and compressing the row offsets would take about 6 MiB off both. Each pays only if the
