@@ -1,0 +1,13 @@
+[package]
+name = "traverse"
+version = "1.0.0"
+edition = "2021"
+description = "Speed Demon 2026, Track D: exact shortest paths on a 5M-edge road graph"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
