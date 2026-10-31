@@ -29,13 +29,15 @@ use index::{Answer, Evaluator, Part, PARTS};
 use query::{Parsed, Setup, Table, MAX_QUERY_BYTES, PHRASE, QUERY_PAD, RANGE_SHIFT};
 use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 const MAX_THREADS: usize = 12;
 const SEGMENT_BYTES: u64 = 8 << 20;
 const CHUNK_BYTES: u64 = 512 << 10;
+/// Output bytes reserved per query line.
+const LINE_BYTES: usize = 32;
 
 fn main() {
     disable_huge_pages();
@@ -111,8 +113,16 @@ struct Shared<'a> {
 }
 
 fn run(data: &str, out_dir: &str) {
-    let mut queries = std::fs::read(format!("{data}/queries.txt"))
-        .unwrap_or_else(|e| fail(&format!("queries.txt: {e}")));
+    // Read straight into a buffer with room for the padding: growing it
+    // afterwards would copy the whole file into freshly faulted pages.
+    let read = |path: &str| -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let mut text = Vec::with_capacity(file.metadata()?.len() as usize + QUERY_PAD);
+        file.read_to_end(&mut text)?;
+        Ok(text)
+    };
+    let path = format!("{data}/queries.txt");
+    let mut queries = read(&path).unwrap_or_else(|e| fail(&format!("queries.txt: {e}")));
     if queries.len() >= MAX_QUERY_BYTES {
         fail("queries.txt is larger than 1 GB");
     }
@@ -337,6 +347,8 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 let bools = sh.bool_answers[r].lock().unwrap();
                 let phrases = sh.phrase_answers[r].lock().unwrap();
                 let out = &mut sh.lines[r].lock().unwrap();
+                // About 30 bytes a line on seed 1; reserving avoids copies on growth.
+                out.reserve(parsed[r].order.len() * LINE_BYTES);
                 for &entry in &parsed[r].order {
                     match entry & PHRASE {
                         0 => bools[entry as usize].write(out),
