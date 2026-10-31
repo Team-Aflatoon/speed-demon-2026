@@ -140,17 +140,18 @@ impl Shared<'_> {
         let done = s.n / 5;
         for r in 0..done {
             let lf = s.base + s.at[5 * r + 4] as usize;
-            let parsed = self.b[lf] == b'\n' && self.parse(s, 5 * r, lf, r).is_some();
+            // PROBE: no field parsing, only the terminator check.
+            let parsed = self.b[lf] == b'\n';
             if !parsed {
                 return Err(Fail::Malformed);
             }
-            self.regions.prefetch(s.batch[r].region);
             s.record = lf + 1;
         }
         s.at.copy_within(5 * done..s.n, 0);
         s.quotes.copy_within(5 * done..s.n, 0);
         s.n -= 5 * done;
-        self.join(&mut s.batch[..done], aggs)
+        aggs[0].sums[0] += done as i64; // PROBE: no join
+        Ok(())
     }
 
     /// Parses into `s.batch[r]` the record starting at `s.record`, whose
