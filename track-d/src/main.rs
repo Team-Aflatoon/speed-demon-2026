@@ -676,8 +676,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     number(text, &mut i); // m: the edge count is implied by the lines themselves
     let text = Text(split_lines(&text[i..], threads));
 
-    // PROBE d0: no parsing at all.
-    std::hint::black_box(&text);
+    // PROBE d3: build_csr's counting pass only (one full parse).
+    let buckets = (n >> 12) + 1;
+    let counts = parallel(vec![(); threads], |k, ()| {
+        let mut count = vec![0u32; buckets];
+        text.each(k, threads, |u, _, _| count[u >> 12] += 1);
+        count
+    });
+    std::hint::black_box(&counts);
     let lines = std::fs::read_to_string("/data/queries.txt")?.lines().count();
     std::fs::write("/out/distances.txt", "0\n".repeat(lines))?;
     Ok(())
