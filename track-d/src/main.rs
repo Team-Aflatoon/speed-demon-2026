@@ -300,11 +300,6 @@ fn build_csr(
         });
         escaped
     });
-    // PROBE d4: stop after the scatter, before the sort.
-    std::hint::black_box((&edges, &low, &escaped));
-    let lines = std::fs::read_to_string("/data/queries.txt").unwrap().lines().count();
-    std::fs::write("/out/distances.txt", "0\n".repeat(lines)).unwrap();
-    std::process::exit(0);
     let mut escapes = escaped.concat();
     escapes.sort_unstable();
     escapes.dedup_by_key(|e| (e.0, e.1));
