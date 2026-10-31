@@ -43,7 +43,10 @@ and each row gives the evidence. The box is about 2x slower than this laptop per
 | 25 | **v4 as submitted** (commit 338f0cb): steps 19-24; S 537. Against v3: 1,141M vs 1,358M instructions (-16%), 2.84M vs 3.71M mispredicts (-23%); local CPU min 128.7 vs 140.3 ms, single core min 84.7 vs 96.0 ms. On the box T did not move (31.9 vs 31.8 ms): v3's and v4's local CPU gains did not show up there, which led to the CPU-per-line diagnosis that the box (12 threads on 6 P-cores, turbo off) is bound by total work per line, and that the leader does about half of ours | run-f192c44a86c0 | 0.0319 | 25.9 | 77.1 |
 | 26 | Report tables indexed by the records' 12-bit id/rank field (4,096-entry arrays, ranks stored pre-shifted), so the compiler drops their bounds checks; explicit loops over the log chunks instead of a flattened iterator; slot table as a fixed-size array: 1,141M to 1,098M instructions (-4%), 2.88M mispredicts | | 0.021 | 26 | |
 | 27 | Review fixes: `Mutex` instead of a write-only `RwLock`; `mallopt(M_MMAP_THRESHOLD, 128 KB)` pins the allocator so every 256 KB log chunk really is its own mapping (glibc would otherwise raise the threshold as mapped blocks are freed); a compile-time assert ties the endpoint limits to the record's bit layout; SAFETY notes name the crate-wide target features | | 0.021 | 26 | |
-| 28 | **v5** as it stands: steps 26-27. 1,099M instructions, 2.91M mispredicts; local CPU min 137.3 vs 139.3 ms, single core min 90.7 vs 91.2 ms against v4 in the same interleaved set (a small gain); S 560 | | 0.022 | 26 | |
+| 28 | **v5 as submitted** (commit c3486cf): steps 26-27. 1,099M instructions, 2.91M mispredicts; local CPU min 137.3 vs 139.3 ms, single core min 90.7 vs 91.2 ms against v4 in the same interleaved set (a small gain); S 560 | | 0.022 | 26 | |
+| 29 | Kernel work, measured with `strace -c -f` and `perf stat -e page-faults` (software events do work here): v5 made 277 mmap and 259 munmap calls (one per 256 KB log chunk, each taking the address-space lock for writing and stalling the other threads' page faults; each munmap also flushes the TLBs of all our CPUs), 485 futex calls (0.20 s summed across threads under strace) and 9.9k page faults. Freeing the hours does lower the peak here: without it M was 37-40 MB instead of 25-29, because the output's page cache is charged to the run | | 0.022 | 26 | |
+| 30 | One log arena: a single `MAP_NORESERVE` anonymous mapping sized for the worst case, carved by a bump pointer into chunks of 16 KB doubling to 256 KB (most thread-hours hold ~3,600 records, 14 KB); an hour's chunks are given back with `madvise(MADV_DONTNEED)` (address-space lock taken for reading only) instead of munmap; the malloc threshold pin is no longer needed. mmap 277 to 119, munmap 259 to 101, futex time 0.20 to 0.05 s, faults unchanged (9.6k). The chunk being filled is held as its own field, so a push costs one compare: 1,077M instructions (v5: 1,099M) | | 0.020 | 27 | |
+| 31 | **v6** as it stands: steps 29-30. Sandbox, 6 interleaved runs each: median 20.8 vs 22.5 ms for v5, min 19.9 vs 21.1 ms; total CPU unchanged within noise (median 145.9 vs 143.9 ms; the gain is time not spent waiting on the address-space lock); M median 28.8 vs 27.5 MB (noise level); S 590 | | 0.021 | 28 | |
 
 ## Experiments that did not make it
 
@@ -104,6 +107,9 @@ and each row gives the evidence. The box is about 2x slower than this laptop per
   of that branch were kept (step 26).
 - **Masks and the name compare read straight from the window** instead of from copied
   64-byte arrays: 1,002M to 1,015M instructions, so the copies were already free.
+- **`MAP_POPULATE` on the input** (pre-map all of it in the `mmap` call): page faults fell
+  from 9.9k to 7.0k, but the single-threaded populate added about 4 ms of wall time
+  before any worker started (sandbox median 27.6 vs 21.7 ms). Reverted.
 - **A two-pass design (count, then place every latency at its exact final slot).** Ruled
   out by measurement: one bare AVX2 newline scan over the mapped 239 MB already takes
   about 7 ms with 12 threads here (memory bandwidth), so a second pass costs more than

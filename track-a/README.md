@@ -46,7 +46,10 @@ line); only the file's last few lines need a zero-padded copy of the window.
 - *Storing the line:* one 4-byte record, `endpoint id << 20 | 5xx << 19 | latency`, is
   appended to this worker's log for that hour. 97% of latencies fit in 19 bits; a larger
   one is stored as an all-ones marker plus an (id, latency) pair on the side, so the result
-  stays exact. The log grows in 256 KB chunks, each its own mapping, faulted in as written.
+  stays exact. The log grows in chunks of 16 KB doubling to 256 KB, carved by a bump
+  pointer from one anonymous `MAP_NORESERVE` mapping reserved for the worst case:
+  untouched pages cost nothing, and there is no mmap or munmap per chunk (both take the
+  address-space lock for writing and stall the other threads' page faults).
   Appending is a sequential write: no per-group counters or chains to update per line.
 
 **2. Report and write, overlapped.** The workers' endpoint tables are merged through one
@@ -60,27 +63,27 @@ above that: about 1.55n steps, no sort (groups of 32 or fewer, most of them, jus
 `sort_unstable`, an insertion sort at that size). The counting pass also rewrites each record's worker-local id as the
 endpoint's rank, so the second pass needs no lookup. Digits are written ten places at a
 time from a two-digit table, with no loop whose length depends on the value; text
-buffers are reserved once and reused through a pool. As soon as an hour is reported its log chunks are unmapped,
+buffers are reserved once and reused through a pool. As soon as an hour is reported its log chunks are released with `madvise(MADV_DONTNEED)`,
 so the logs shrink while the output grows. The main thread writes each hour's text as soon
 as all earlier hours are out, so writing overlaps the work.
 
 **Memory.** The peak is near the end of ingest: the 3.1M records (12.4 MB), the endpoint
 tables and the first hours in flight. `prctl(PR_SET_THP_DISABLE)` keeps transparent huge
 pages, `always` on stock Debian, from backing malloc's per-thread arenas with mostly empty
-2 MB pages (the board confirmed it: v2's M fell from 47.5 to 25.8 MB).
-`mallopt(M_MMAP_THRESHOLD)` pins the allocator's threshold at 128 KB, so each 256 KB log
-chunk is its own mapping and freeing an hour returns its memory at once.
+2 MB pages (the board confirmed it: v2's M fell from 47.5 to 25.8 MB). Releasing each
+hour's log as soon as it is reported matters: the output's page cache is charged to the
+run, and without the releases the peak was 37-40 MB instead of 25-29.
 
 **Errors.** Every I/O failure, a timestamp outside a 72-hour window, more than 3,072
 distinct endpoints in one worker or 4,096 in all (a record has 12 bits for them; a
 compile-time assert ties the limits to that layout) is reported on stderr with a
 non-zero exit. `unsafe` is used only for
-the `mmap`, `prctl` and `mallopt` calls and the SIMD intrinsics (each with why it stays
+the `mmap`, `madvise` and `prctl` calls, handing out the arena and the SIMD intrinsics (each with why it stays
 in bounds; AVX2 and SSE4.1 are enabled crate-wide by `target-cpu=x86-64-v3`).
 
 ## Dependencies
 
-None. `mmap`, `prctl` and `mallopt` are declared by hand with `extern "C"`; SIMD comes from
+None. `mmap`, `madvise` and `prctl` are declared by hand with `extern "C"`; SIMD comes from
 `std::arch`.
 
 ## With another 24 hours

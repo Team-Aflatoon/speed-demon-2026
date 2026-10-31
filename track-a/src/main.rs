@@ -31,8 +31,8 @@ const ROWS: usize = 143;
 /// A record's latency field is 19 bits; this value (all ones) marks a latency that
 /// did not fit and is kept in `Hour::large` instead.
 const MARK: u32 = (1 << 19) - 1;
-/// Records per log chunk: 256 KB, so the allocator maps each chunk on its own and
-/// unmaps it when the hour is freed.
+/// Records per log chunk: the first 4,096 (16 KB), then doubling up to 256 KB.
+const FIRST_CHUNK: usize = 1 << 12;
 const CHUNK: usize = 1 << 16;
 /// Bytes of the line window: room for the longest line (177 bytes) and for reads of up
 /// to 64 bytes at any u8 offset.
@@ -46,12 +46,15 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
         -> *mut c_void;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
+const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_NORESERVE: i32 = 0x4000;
+const MADV_DONTNEED: i32 = 4;
 const PR_SET_THP_DISABLE: i32 = 41;
-const M_MMAP_THRESHOLD: i32 = -3;
 
 fn main() {
     // Transparent huge pages, `always` on stock Debian, would back malloc's per-thread
@@ -59,11 +62,6 @@ fn main() {
     // out is a hint: if an old kernel refuses it, the run is just as correct.
     // SAFETY: a plain prctl that touches no memory of ours.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
-    // Pin malloc's mmap threshold at 128 KB (setting it also stops glibc from raising
-    // it as mapped blocks are freed), so every 256 KB log chunk is its own mapping and
-    // freeing an hour returns its memory to the system at once.
-    // SAFETY: mallopt only changes the allocator's tuning; nothing is allocated yet.
-    unsafe { mallopt(M_MMAP_THRESHOLD, 128 << 10) };
     if let Err(e) = run() {
         eprintln!("ingest: {e}");
         std::process::exit(1);
@@ -84,7 +82,9 @@ fn run() -> io::Result<()> {
     // SAFETY: a private read-only mapping of the whole file, never unmapped; nothing
     // writes the file while we run. The harness has it in the page cache already, so
     // the mapping costs page-table entries only and its pages are not charged to us.
-    let data: &[u8] = unsafe { std::slice::from_raw_parts(map(&input, len)?, len) };
+    let data: &[u8] = unsafe {
+        std::slice::from_raw_parts(map(Some(&input), len, PROT_READ, MAP_PRIVATE)?.cast(), len)
+    };
     // The scoring cpuset is 12 CPUs (6 P-cores with hyperthreads); more workers than
     // that would only time-slice.
     let workers = thread::available_parallelism()
@@ -99,10 +99,13 @@ fn run() -> io::Result<()> {
     let runs: Vec<_> = (0..workers)
         .map(|w| Mutex::new(pieces * w / workers..pieces * (w + 1) / workers))
         .collect();
+    // Worst case: every line its minimal 40 bytes, every chunk half full, and every
+    // worker opening a first chunk for every hour.
+    let arena = Arena::new(2 * (len / 40 + 1) + workers * ROWS * FIRST_CHUNK)?;
     let shards = thread::scope(|s| {
-        let runs = &runs;
+        let (runs, arena) = (&runs, &arena);
         let handles: Vec<_> = (0..workers)
-            .map(|w| s.spawn(move || Shard::ingest(data, runs, w, base)))
+            .map(|w| s.spawn(move || Shard::ingest(data, arena, runs, w, base)))
             .collect();
         let shards = handles
             .into_iter()
@@ -146,9 +149,7 @@ fn run() -> io::Result<()> {
                     // The text holds all that is left of the hour: free its logs now
                     // (each chunk is its own mapping, so the memory goes back at once).
                     for hour in hours {
-                        drop(std::mem::take(
-                            &mut hour[row].lock().expect("no worker panics").chunks,
-                        ));
+                        hour[row].lock().expect("no worker panics").release();
                     }
                     if sender.send((row, text)).is_err() {
                         return;
@@ -172,16 +173,16 @@ fn run() -> io::Result<()> {
     })
 }
 
-/// Maps the first `len` bytes of `file`, private and read-only.
-fn map(file: &File, len: usize) -> io::Result<*const u8> {
+/// Maps `len` bytes: of `file` if given, else anonymous memory.
+fn map(file: Option<&File>, len: usize, prot: i32, flags: i32) -> io::Result<*mut c_void> {
     // SAFETY: asks for a fresh mapping at an address of the kernel's choosing, so no
     // existing memory is affected; failure is reported as MAP_FAILED (-1).
-    let fd = file.as_raw_fd();
-    let p = unsafe { mmap(null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+    let fd = file.map_or(-1, |f| f.as_raw_fd());
+    let p = unsafe { mmap(null_mut(), len, prot, flags, fd, 0) };
     if p as isize == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(p.cast())
+    Ok(p)
 }
 
 /// Where the first line starting at or after byte `at` starts. Piece i holds the lines
@@ -255,6 +256,7 @@ struct Shard<'a> {
 impl<'a> Shard<'a> {
     fn ingest(
         data: &'a [u8],
+        arena: &Arena,
         runs: &[Mutex<Range<usize>>],
         me: usize,
         base: i64,
@@ -277,7 +279,7 @@ impl<'a> Shard<'a> {
                 line_start(data, piece * PIECE),
                 line_start(data, (piece + 1) * PIECE),
             );
-            shard.ingest_piece(data, edges, base)?;
+            shard.ingest_piece(data, arena, edges, base)?;
         }
         Ok(shard)
     }
@@ -286,6 +288,7 @@ impl<'a> Shard<'a> {
     fn ingest_piece(
         &mut self,
         data: &'a [u8],
+        arena: &Arena,
         (start, end): (usize, usize),
         base: i64,
     ) -> io::Result<()> {
@@ -323,7 +326,7 @@ impl<'a> Shard<'a> {
                 let hash = endpoint_hash(w, start, end);
                 let id = self.endpoints.id(w, start.into(), end.into(), hash);
                 let id = id.ok_or_else(too_many_endpoints)?;
-                self.hours[row].push(id, latency, w[usize::from(sp - 3)] == b'5');
+                self.hours[row].push(arena, id, latency, w[usize::from(sp - 3)] == b'5')?;
                 line += usize::from(nl) + 1;
             }
         }
@@ -348,40 +351,82 @@ impl<'a> Shard<'a> {
 /// What one worker saw of one hour: an append-only log with one 4-byte record per
 /// line, `endpoint id << 20 | 5xx << 19 | latency`. 97% of latencies are below 2^19
 /// (0.5 s); a larger one is logged as `MARK` and kept in `large`. Appending is a
-/// sequential write per line, and the report phase reads each log front to back.
+/// sequential write per line, and the report phase reads each log front to back. The
+/// log lives in chunks carved from the shared arena, 16 KB first and doubling up to
+/// 256 KB, so the many small thread-hours touch little memory.
 #[derive(Default)]
 struct Hour<'a> {
     /// The `YYYY-MM-DDTHH` of one of its lines, to print the hour; empty if none.
     prefix: &'a [u8],
-    chunks: Vec<Box<[u32; CHUNK]>>,
-    len: usize,
+    /// Full chunks, then the chunk being filled and how many records it holds.
+    full: Vec<&'static mut [u32]>,
+    tail: &'static mut [u32],
+    filled: usize,
     /// (endpoint id, latency) of every latency of `MARK` or more.
     large: Vec<(u32, u32)>,
 }
 
 impl Hour<'_> {
     #[inline(always)]
-    fn push(&mut self, id: usize, latency: u32, error: bool) {
+    fn push(&mut self, arena: &Arena, id: usize, latency: u32, error: bool) -> io::Result<()> {
         if latency >= MARK {
             self.large.push((id as u32, latency));
         }
-        if self.len % CHUNK == 0 {
-            // Allocated zeroed: fresh pages from the kernel, faulted in as used.
-            let chunk = vec![0; CHUNK].into_boxed_slice().try_into();
-            self.chunks.push(chunk.expect("a slice of CHUNK records"));
+        if self.filled == self.tail.len() {
+            let next = arena.carve((2 * self.tail.len()).clamp(FIRST_CHUNK, CHUNK))?;
+            self.full.push(std::mem::replace(&mut self.tail, next));
+            self.filled = 0;
         }
         let record = (id as u32) << 20 | u32::from(error) << 19 | latency.min(MARK);
-        self.chunks[self.len / CHUNK][self.len % CHUNK] = record;
-        self.len += 1;
+        self.tail[self.filled] = record;
+        self.filled += 1;
+        Ok(())
     }
 
     /// The log, as one slice per chunk.
-    fn records(&self) -> impl Iterator<Item = &[u32]> {
-        let used = |i: usize| (self.len - i * CHUNK).min(CHUNK);
-        self.chunks
-            .iter()
-            .enumerate()
-            .map(move |(i, c)| &c[..used(i)])
+    fn records(&mut self) -> impl Iterator<Item = &mut [u32]> {
+        let tail = std::iter::once(&mut self.tail[..self.filled]);
+        self.full.iter_mut().map(|c| &mut c[..]).chain(tail)
+    }
+
+    /// Gives the log's memory back to the system (the arena itself stays mapped).
+    fn release(&mut self) {
+        let tail = std::mem::take(&mut self.tail);
+        for chunk in self.full.drain(..).chain([tail]).filter(|c| !c.is_empty()) {
+            // SAFETY: the chunk is ours alone and page-aligned (the arena is, and chunk
+            // sizes are multiples of 16 KB); MADV_DONTNEED only drops its pages, which
+            // read as zeros if touched again. Failure would merely keep the memory.
+            unsafe { madvise(chunk.as_mut_ptr().cast(), 4 * chunk.len(), MADV_DONTNEED) };
+        }
+    }
+}
+
+/// All the logs live in one anonymous mapping, reserved up front for the worst case
+/// and carved by a bump pointer. Untouched pages cost nothing, and there is no mmap or
+/// munmap per chunk: those take the address-space lock for writing, stalling every
+/// other thread's page faults, and an munmap also interrupts every CPU of ours to
+/// flush its TLB.
+struct Arena(Mutex<&'static mut [u32]>);
+
+impl Arena {
+    fn new(records: usize) -> io::Result<Self> {
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+        let p = map(None, 4 * records, PROT_READ | PROT_WRITE, flags)?;
+        // SAFETY: a fresh private mapping of `records` u32s (zero-filled, aligned),
+        // never unmapped, so this is the only reference to it, for 'static.
+        Ok(Arena(Mutex::new(unsafe {
+            std::slice::from_raw_parts_mut(p.cast(), records)
+        })))
+    }
+
+    fn carve(&self, records: usize) -> io::Result<&'static mut [u32]> {
+        let mut rest = self.0.lock().expect("no worker panics");
+        if rest.len() < records {
+            return Err(io::Error::other("log arena exhausted"));
+        }
+        let (chunk, tail) = std::mem::take(&mut *rest).split_at_mut(records);
+        *rest = tail;
+        Ok(chunk)
     }
 }
 
@@ -532,9 +577,8 @@ fn report(
     // the compiler sees that no index can be out of bounds and checks none.
     let mut counts = [[0u32; 2]; NAMES]; // per endpoint: lines, errors
     for (hour, rank_of) in &mut seen {
-        let len = hour.len;
-        for (i, chunk) in hour.chunks.iter_mut().enumerate() {
-            for record in &mut chunk[..(len - i * CHUNK).min(CHUNK)] {
+        for chunk in hour.records() {
+            for record in chunk {
                 let rank = rank_of[(*record >> 20) as usize];
                 let count = &mut counts[(rank >> 20) as usize];
                 count[0] += 1;
@@ -557,7 +601,7 @@ fn report(
         *end -= 1;
         latencies[*end] = latency;
     };
-    for (hour, rank_of) in &seen {
+    for (hour, rank_of) in &mut seen {
         for chunk in hour.records() {
             for &record in chunk.iter().filter(|&&r| r & MARK != MARK) {
                 put(record, record & MARK);
