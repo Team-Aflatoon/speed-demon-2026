@@ -23,8 +23,6 @@ const PAD: usize = 64;
 /// Tokens hashed, with their slots prefetched, before the first is resolved,
 /// so that the cache misses of rare words overlap.
 const BATCH: usize = 64;
-/// Bytes of whole lines tokenized at a time (a read is cut into such runs).
-const REGION_BYTES: usize = 16 << 10;
 /// Documents are numbered from 0 in each segment and stored as `u16`.
 pub const MAX_SEGMENT_DOCS: u32 = 1 << 16;
 
@@ -145,17 +143,7 @@ impl<'a> Scanner<'a> {
                         local.unwrap_or_else(|| fail("document ids are not ascending"));
                     known = true;
                 }
-                // In runs of whole lines of about `REGION_BYTES`, so that the
-                // per-token arrays stay small and in cache.
-                let mut at = start;
-                while at < end {
-                    let next = (at + REGION_BYTES).min(end);
-                    // `end - 1` is an LF, so the run ends at the first one from `next - 1`.
-                    let lf = self.buf[next - 1..end].iter().position(|&b| b == b'\n');
-                    let stop = next + lf.unwrap_or(end - next);
-                    self.region(at, stop, out);
-                    at = stop;
-                }
+                self.region(start, end, out);
             }
             if done {
                 return;
