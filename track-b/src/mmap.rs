@@ -16,11 +16,22 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
         -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
+    fn prctl(option: i32, ...) -> i32;
 }
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FAILED: *mut c_void = !0 as *mut c_void;
+const PR_SET_THP_DISABLE: i32 = 41;
+
+/// Turns transparent huge pages off for this process. With THP set to
+/// "always", every partly used 2 MB heap region (thread arenas, growing
+/// vectors) would be backed by a whole huge page and counted in our memory
+/// peak. It is only a hint, so a failure is ignored.
+pub fn disable_huge_pages() {
+    // SAFETY: PR_SET_THP_DISABLE takes integer arguments and touches no memory of ours.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+}
 
 pub struct Mmap {
     ptr: *mut c_void,

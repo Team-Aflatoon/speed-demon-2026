@@ -27,6 +27,10 @@ lowercased by a single `| 0x20` on its first 16 bytes, loaded as two `u64`s. Tha
 every token byte is a letter or a digit, and digits already have that bit set. The two words
 are the hash key.
 
+**Parsing the queries** is serial, so it is two passes: parse every line, then insert the
+words into a term table pre-sized from the word count, each insert prefetching the slot of the
+word 16 places ahead.
+
 **Hiding memory latency.** Most lookups of rare words miss the cache. A document is therefore
 handled in three passes: hash every token and prefetch its table slot, resolve the tokens to
 term ids and prefetch each term's state word, then record the terms. About 150 lookups per
@@ -35,13 +39,14 @@ document overlap instead of queueing one after another.
 **Postings.** In a batch, a rare term keeps a sorted list of local document numbers (`u16`),
 built by a counting sort of the batch's (document, term) hits. A term that once appears in more
 than 64 documents of a batch becomes "dense" for that worker. From then on the scan sets its bit
-in a 512-byte bitmap directly, with no duplicate check and no list. During the scan the dense
+in a 512-byte bitmap directly, with no duplicate check and no list. A worker's first batch
+is a 512-document warm-up, so twelve all-list first batches don't set the memory peak. During the scan the dense
 bitmaps are stored transposed (all dense terms' words for the same 64 documents sit side by
 side), so a document's writes stay in L1. They are transposed back once per batch.
 
 **BOOL queries** run strictly left to right as a small state machine. A one-term query, or
-`x AND <absent>`, only borrows the term's set. A combined result lives in scratch space as a
-sorted list while it is small (ANDing with a list can only shrink it) and as a bitmap otherwise.
+`x AND <absent>`, only borrows the term's set; a combined result lives in a scratch bitmap,
+where OR and NOT with a list set or clear its bits directly and AND goes through a mask.
 A 10 KB per-batch presence bitset answers "is this term in the batch at all?" from L1, which is
 the usual case for rare terms. The sum of the ids in a bitmap word is computed without visiting
 the bits: bit k of a position is set exactly under the mask `0xAAAA..`, `0xCCCC..`, `0xF0F0..`
@@ -54,7 +59,7 @@ each occurrence it reads tokens outwards, only as far as the phrase reaches. No 
 stored.
 
 All I/O errors and malformed input end the program with a message on stderr and exit code 1.
-`unsafe` appears only in the hand-declared `mmap`/`munmap`, the prefetch hint and the AVX2
+`unsafe` appears only in the hand-declared `mmap`/`munmap`/`prctl`, the prefetch hint and the AVX2
 loads, each with a `SAFETY` note.
 
 ## Dependencies
@@ -63,11 +68,11 @@ None. The Rust standard library only. `mmap` is declared by hand with `extern "C
 
 ## With another 24 hours
 
-- The serial query parse (about 17 ms of a 200 ms run locally) could overlap with the corpus
-  scan, or the term table could be built in parallel.
-- The per-thread term arrays (about 600 KB per thread) are the next memory cost. Picking dense
-  terms globally from a sample would let the dense flag live in the shared hash slot and save a
-  random access per token.
-- Batch-level work for phrases could use stored anchor offsets instead of searching candidate
-  documents.
+- The term table lookups are the largest single cost, at about 28 ms per thread. A 16-byte
+  slot (2 MB instead of 3 MB) and a small separate table for the few hundred hottest terms
+  would cut the cache misses.
+- The per-thread term arrays (about 600 KB per thread) are the next memory cost, together with
+  the 1.5 MB of output page cache, which O_DIRECT writes would avoid.
+- Two ideas measured worse here and are logged in PERF.md: global term classes from a sample,
+  and a positional index for phrase anchors. Each would need a cheaper build step to pay off.
 - Fewer lines: the evaluator's match arms grow a lot under rustfmt.

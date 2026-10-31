@@ -20,9 +20,12 @@ pub const BATCH_DOCS: usize = WORDS * 64;
 pub type Bits = [u64; WORDS];
 
 /// A bitmap costs 512 bytes and a word-wise pass per operation; a list costs
-/// 2 bytes and one random access per document. Past 64 documents per batch
-/// (one per bitmap word) the bitmap wins on both counts.
-const DENSE_MIN: u32 = 64;
+/// 2 bytes and one random access per document. Past 64 documents per full
+/// batch (one per bitmap word) the bitmap wins on both counts.
+const DENSE_MIN: usize = 64;
+/// A worker's first batch is small: until it has seen a batch, every term is
+/// still a list, and 12 full all-list batches at once would set the memory peak.
+const WARMUP_DOCS: usize = 512;
 /// A term's state word: `DENSE | bitmap slot`, or else the global id of the last
 /// document that recorded it (ids have at most 9 digits, so bit 31 is free).
 const DENSE: u32 = 1 << 31;
@@ -77,7 +80,7 @@ impl Index {
             scan_bits: Vec::new(),
             terms: Vec::new(),
             hits: Vec::new(),
-            hit_end: Vec::with_capacity(BATCH_DOCS),
+            hit_end: Vec::new(),
             bounds: vec![0; terms + 2],
             postings: Vec::new(),
             probes: Vec::new(),
@@ -87,6 +90,11 @@ impl Index {
     /// Indexes the lines of `data[pos..end]` (both line starts) until `end` or
     /// a full batch, and returns where it stopped.
     pub fn build(&mut self, data: &[u8], pos: usize, end: usize, dict: &Dict) -> io::Result<usize> {
+        let limit = if self.hit_end.capacity() == 0 {
+            WARMUP_DOCS
+        } else {
+            BATCH_DOCS
+        };
         self.docs.clear();
         self.hits.clear();
         self.hit_end.clear();
@@ -94,7 +102,7 @@ impl Index {
         self.scan_bits.resize(WORDS * self.bitmaps.len(), 0);
         let mut lexer = Lexer::new(data, pos, end);
         let mut line = pos;
-        while line < end && self.docs.len() < BATCH_DOCS {
+        while line < end && self.docs.len() < limit {
             // A line is its id (the first token, right before a TAB), the text, an LF.
             let (id, text) = match lexer.next() {
                 Some(Event::Token(s, e)) if s == line && data[e] == b'\t' => {
@@ -179,6 +187,7 @@ impl Index {
         self.bounds.fill(0);
         self.present.fill(0);
         let mut heavy = Vec::new();
+        let dense_min = (DENSE_MIN * self.docs.len() / BATCH_DOCS) as u32;
         // Count into `bounds[t + 2]` so that after the prefix sum `bounds[t + 1]`
         // is where term t starts; the scatter uses it as t's cursor, which leaves
         // it at t's end, so `bounds[t]..bounds[t + 1]` is the list of t.
@@ -187,7 +196,7 @@ impl Index {
             *count += 1;
             if *count == 1 {
                 self.present[t as usize / 64] |= 1 << (t % 64);
-            } else if *count == DENSE_MIN + 1 {
+            } else if *count == dense_min + 1 {
                 heavy.push(t);
             }
         }

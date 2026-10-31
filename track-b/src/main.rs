@@ -31,6 +31,7 @@ const BLOCK_BYTES: usize = 3 << 20;
 const MAX_THREADS: usize = 12;
 
 fn main() {
+    mmap::disable_huge_pages();
     if let Err(err) = run(Path::new("/data"), Path::new("/out")) {
         eprintln!("track-b: {err}");
         std::process::exit(1);
@@ -38,15 +39,14 @@ fn main() {
 }
 
 fn run(data_dir: &Path, out_dir: &Path) -> io::Result<()> {
-    let mut dict = Dict::new();
-    let queries = query::parse(&Mmap::open(&data_dir.join("queries.txt"))?, &mut dict)?;
+    let (queries, dict) = query::parse(&Mmap::open(&data_dir.join("queries.txt"))?)?;
     let docs = Mmap::open(&data_dir.join("docs.txt"))?;
     if !docs.is_empty() && !docs.ends_with(b"\n") {
         return Err(bad_corpus("the last line has no LF"));
     }
     let answers = search(&docs, &dict, &queries)?;
     let mut out =
-        io::BufWriter::with_capacity(1 << 20, std::fs::File::create(out_dir.join("results.txt"))?);
+        io::BufWriter::with_capacity(1 << 16, std::fs::File::create(out_dir.join("results.txt"))?);
     answers
         .iter()
         .try_for_each(|answer| write_answer(&mut out, answer))?;

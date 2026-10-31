@@ -90,27 +90,26 @@ fn bit_index_sum(w: u64) -> u64 {
 
 /// The running result of a query within a batch. Until two sets really have
 /// to be combined only the first one is borrowed (`Term`), so a single-term
-/// query or `t AND <absent>` costs nothing. A combined result lives in the
-/// evaluator's scratch space: as a sorted list while it is small (ANDing with a
-/// list can only shrink it, so that never touches a bitmap), else as a bitmap.
+/// query or `t AND <absent>` costs nothing; after that the result is the
+/// evaluator's scratch bitmap.
 #[derive(Clone, Copy)]
 enum Acc<'a> {
     Empty,
     Term(Set<'a>),
-    List,
     Bits,
 }
 
 pub struct Evaluator {
     bits: Bits,
-    list: Vec<u16>,
+    /// A list spread into bitmap form; all zero between uses.
+    mask: Bits,
 }
 
 impl Evaluator {
     pub fn new() -> Evaluator {
         Evaluator {
             bits: [0; WORDS],
-            list: Vec::new(),
+            mask: [0; WORDS],
         }
     }
 
@@ -132,7 +131,12 @@ impl Evaluator {
         }
         let mut answer = Answer::default();
         let base = index.first_doc;
-        match (phrase, self.view(acc)) {
+        let set = match acc {
+            Acc::Empty => Set::Empty,
+            Acc::Term(set) => set,
+            Acc::Bits => Set::Bits(&self.bits),
+        };
+        match (phrase, set) {
             (false, Set::Bits(bits)) => answer.push_bits(bits, base),
             (false, set) => for_each_doc(set, |d| answer.push(base + u32::from(d))),
             // A phrase's AND gives the documents holding all its terms; check each.
@@ -146,82 +150,47 @@ impl Evaluator {
         answer
     }
 
-    fn view<'a>(&'a self, acc: Acc<'a>) -> Set<'a> {
-        match acc {
-            Acc::Empty => Set::Empty,
-            Acc::Term(set) => set,
-            Acc::List => Set::List(&self.list),
-            Acc::Bits => Set::Bits(&self.bits),
-        }
-    }
-
     fn step<'a>(&mut self, acc: Acc<'a>, op: Op, set: Set<'a>) -> Acc<'a> {
         match (acc, op, set) {
             (_, Op::And, Set::Empty) => Acc::Empty,
             (acc, _, Set::Empty) => acc,
             (Acc::Empty, Op::Or, set) => Acc::Term(set),
             (Acc::Empty, _, _) => Acc::Empty,
-            (Acc::Term(Set::List(first)), op, set) => {
-                self.list.clear();
-                self.list.extend_from_slice(first);
-                self.on_list(op, set)
-            }
-            (Acc::Term(Set::Bits(first)), op, set) => {
-                self.bits = *first;
-                self.on_bits(op, set)
-            }
-            (Acc::Term(Set::Empty), _, _) => unreachable!("a borrowed term is never empty"),
-            (Acc::List, op, set) => self.on_list(op, set),
-            (Acc::Bits, op, set) => self.on_bits(op, set),
-        }
-    }
-
-    /// `list = list op set`, for a non-empty `set`.
-    fn on_list<'a>(&mut self, op: Op, set: Set<'a>) -> Acc<'a> {
-        match (op, set) {
-            (Op::Or, set) => {
+            (Acc::Term(first), op, set) => {
                 self.bits = [0; WORDS];
-                self.list
-                    .iter()
-                    .for_each(|&d| self.bits[d as usize / 64] |= 1 << (d % 64));
-                return self.on_bits(Op::Or, set);
+                self.apply(Op::Or, first);
+                self.apply(op, set)
             }
-            (Op::And, Set::Bits(bits)) => self.list.retain(|&d| has(bits, d)),
-            (Op::Not, Set::Bits(bits)) => self.list.retain(|&d| !has(bits, d)),
-            (Op::And, Set::List(other)) => retain_sorted(&mut self.list, other, true),
-            (Op::Not, Set::List(other)) => retain_sorted(&mut self.list, other, false),
-            (_, Set::Empty) => {}
-        }
-        if self.list.is_empty() {
-            Acc::Empty
-        } else {
-            Acc::List
+            (Acc::Bits, op, set) => self.apply(op, set),
         }
     }
 
-    /// `bits = bits op set`, for a non-empty `set`.
-    fn on_bits<'a>(&mut self, op: Op, set: Set<'a>) -> Acc<'a> {
+    /// `bits = bits op set`.
+    fn apply<'a>(&mut self, op: Op, set: Set<'a>) -> Acc<'a> {
         let bits = &mut self.bits;
         match (op, set) {
-            (Op::And, Set::List(list)) => {
-                self.list.clear();
-                self.list.extend(list.iter().filter(|&&d| has(bits, d)));
-                return if self.list.is_empty() {
-                    Acc::Empty
-                } else {
-                    Acc::List
-                };
-            }
+            (_, Set::Empty) => {}
             (Op::Or, Set::List(list)) => list
                 .iter()
                 .for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64)),
             (Op::Not, Set::List(list)) => list
                 .iter()
                 .for_each(|&d| bits[d as usize / 64] &= !(1 << (d % 64))),
-            (Op::Or, Set::Bits(other)) => bits.iter_mut().zip(other).for_each(|(a, b)| *a |= b),
-            (Op::Not, Set::Bits(other)) => bits.iter_mut().zip(other).for_each(|(a, b)| *a &= !b),
-            (Op::And, Set::Bits(other)) => bits.iter_mut().zip(other).for_each(|(a, b)| *a &= b),
-            (_, Set::Empty) => {}
+            (Op::And, Set::List(list)) => {
+                // Spread the list into the mask, then AND and clear it in one pass.
+                list.iter()
+                    .for_each(|&d| self.mask[d as usize / 64] |= 1 << (d % 64));
+                bits.iter_mut()
+                    .zip(&mut self.mask)
+                    .for_each(|(a, m)| *a &= std::mem::take(m));
+            }
+            (op, Set::Bits(other)) => bits.iter_mut().zip(other).for_each(|(a, &b)| {
+                *a = match op {
+                    Op::And => *a & b,
+                    Op::Or => *a | b,
+                    Op::Not => *a & !b,
+                }
+            }),
         }
         // Once AND or NOT has emptied the result, later ANDs and NOTs are free.
         if op != Op::Or && bits.iter().all(|&w| w == 0) {
@@ -230,23 +199,6 @@ impl Evaluator {
             Acc::Bits
         }
     }
-}
-
-#[inline]
-fn has(bits: &Bits, d: u16) -> bool {
-    bits[d as usize / 64] >> (d % 64) & 1 != 0
-}
-
-/// Keeps the elements of the sorted `list` that are (or with `keep_common`
-/// false, are not) in the sorted `other`, in one merge pass.
-fn retain_sorted(list: &mut Vec<u16>, other: &[u16], keep_common: bool) {
-    let mut j = 0;
-    list.retain(|&d| {
-        while j < other.len() && other[j] < d {
-            j += 1;
-        }
-        (j < other.len() && other[j] == d) == keep_common
-    });
 }
 
 fn for_each_doc(set: Set, mut f: impl FnMut(u16)) {

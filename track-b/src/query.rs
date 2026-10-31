@@ -39,33 +39,55 @@ impl Queries {
     }
 }
 
-pub fn parse(text: &[u8], dict: &mut Dict) -> io::Result<Queries> {
+/// Parses every line, then numbers the terms.
+///
+/// The term table is filled in a second pass: about 150,000 inserts into a
+/// fresh table would each wait on a cache miss, so each one first prefetches
+/// the slot of the word 16 places ahead.
+pub fn parse(text: &[u8]) -> io::Result<(Queries, Dict)> {
     let mut queries = Queries {
         list: Vec::new(),
         steps: Vec::new(),
     };
+    let mut words = Vec::new();
     for line in text.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
         let start = queries.steps.len() as u32;
-        let phrase = parse_line(line, dict, &mut queries.steps).ok_or_else(|| bad_query(line))?;
-        queries.list.push(Query {
-            phrase,
-            start,
-            end: queries.steps.len() as u32,
-        });
+        let phrase =
+            parse_line(line, &mut queries.steps, &mut words).ok_or_else(|| bad_query(line))?;
+        let end = queries.steps.len() as u32;
+        queries.list.push(Query { phrase, start, end });
     }
-    Ok(queries)
+    let mut dict = Dict::with_capacity(words.len() / 2);
+    for (i, step) in queries.steps.iter_mut().enumerate() {
+        if let Some(ahead) = words.get(i + 16) {
+            dict.prefetch_term(ahead);
+        }
+        step.term = dict.insert(words[i]);
+    }
+    Ok((queries, dict))
 }
 
-/// Appends the steps of one line; returns whether it is a phrase.
-fn parse_line(line: &[u8], dict: &mut Dict, steps: &mut Vec<Step>) -> Option<bool> {
+/// Appends the steps of one line, and their words to `words`; returns whether
+/// it is a phrase. Term ids are filled in later.
+fn parse_line<'a>(
+    line: &'a [u8],
+    steps: &mut Vec<Step>,
+    words: &mut Vec<&'a [u8]>,
+) -> Option<bool> {
+    let mut push = |op, word: &'a [u8]| {
+        let valid = (1..=32).contains(&word.len())
+            && word
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        steps.push(Step { op, term: 0 });
+        words.push(word);
+        valid.then_some(())
+    };
     if let Some(rest) = line.strip_prefix(b"BOOL ") {
         let mut words = rest.split(|&b| b == b' ');
         let mut op = Op::Or;
         loop {
-            steps.push(Step {
-                op,
-                term: term(words.next()?, dict)?,
-            });
+            push(op, words.next()?)?;
             op = match words.next() {
                 None => return Some(false),
                 Some(b"AND") => Op::And,
@@ -77,21 +99,9 @@ fn parse_line(line: &[u8], dict: &mut Dict, steps: &mut Vec<Step>) -> Option<boo
     }
     let inner = line.strip_prefix(b"PHRASE \"")?.strip_suffix(b"\"")?;
     for (i, word) in inner.split(|&b| b == b' ').enumerate() {
-        let op = if i == 0 { Op::Or } else { Op::And };
-        steps.push(Step {
-            op,
-            term: term(word, dict)?,
-        });
+        push(if i == 0 { Op::Or } else { Op::And }, word)?;
     }
     Some(true)
-}
-
-fn term(word: &[u8], dict: &mut Dict) -> Option<u32> {
-    let valid = (1..=32).contains(&word.len())
-        && word
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-    valid.then(|| dict.insert(word))
 }
 
 fn bad_query(line: &[u8]) -> io::Error {

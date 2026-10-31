@@ -93,12 +93,20 @@ pub struct Dict {
 }
 
 impl Dict {
-    pub fn new() -> Dict {
+    /// An empty table sized for about `terms` terms (it grows if needed).
+    pub fn with_capacity(terms: usize) -> Dict {
+        let slots = (terms * 4 / 3).next_power_of_two().max(1 << 12);
         Dict {
-            slots: vec![EMPTY_SLOT; 1 << 12],
+            slots: vec![EMPTY_SLOT; slots],
             text: Vec::new(),
             spans: Vec::new(),
         }
+    }
+
+    /// Starts loading the slot `insert(term)` will look at first.
+    pub fn prefetch_term(&self, term: &[u8]) {
+        let key = Key::new(term, 0, term.len());
+        prefetch(&self.slots[key.hash() & (self.slots.len() - 1)]);
     }
 
     pub fn len(&self) -> usize {
