@@ -6,9 +6,10 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The queries are part of the input, so the program never builds a general index. It reads
+The queries are part of the input, so we never build a general index. The program reads
 `queries.txt` first and puts every distinct query term (about 76,000) into one
-open-addressing hash table. Any corpus token that is not in that table is dropped the moment
+open-addressing hash table with 16-byte slots (the first 12 bytes of the term inline, its id
+and length packed into one word). Any corpus token that is not in that table is dropped the moment
 it is seen, and that covers most of the 600,000-word vocabulary.
 
 `docs.txt` is memory-mapped. The harness has already loaded it into the page cache, so the
@@ -38,11 +39,13 @@ document overlap instead of queueing one after another.
 
 **Postings.** In a batch, a rare term keeps a sorted list of local document numbers (`u16`),
 built by a counting sort of the batch's (document, term) hits. A term that once appears in more
-than 64 documents of a batch becomes "dense" for that worker. From then on the scan sets its bit
-in a 512-byte bitmap directly, with no duplicate check and no list. A worker's first batch
-is a 512-document warm-up, so twelve all-list first batches don't set the memory peak. During the scan, dense bits go into a one-word-per-term stripe for the current 64 documents,
-which stays in L1. It is flushed into the bitmaps every 64 documents, one write per dense term
-instead of one cache line per hit.
+than 64 of every 4,096 documents of a batch becomes "dense" for that worker. From then on the
+scan sets its bit in a 512-byte bitmap directly, with no duplicate check and no list.
+
+A worker's first batch is a 512-document warm-up, so that twelve first batches, in which every
+term is still a list, don't set the memory peak. During the scan, dense bits go into a
+one-word-per-term stripe for the current 64 documents, which stays in L1. It is flushed into the
+bitmaps every 64 documents: one write per dense term instead of one cache line per hit.
 
 **BOOL queries** run strictly left to right as a small state machine. A one-term query, or
 `x AND <absent>`, only borrows the term's set; a combined result lives in a scratch bitmap,
@@ -64,13 +67,16 @@ loads, each with a `SAFETY` note.
 
 ## Dependencies
 
-None. The Rust standard library only. `mmap` is declared by hand with `extern "C"`.
+None. The Rust standard library only. `mmap`, `munmap` and `prctl` are declared by hand with
+`extern "C"`. The build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`) and refuses to
+compile without it.
 
 ## With another 24 hours
 
-- The term table lookups are still the largest single cost, at about 28 ms per thread, even
-  with 16-byte slots. A small separate table for the few hundred hottest terms is the next
-  thing to try there.
-- Two ideas measured worse here and are logged in PERF.md: global term classes from a sample,
+- The term table lookups were the largest single cost, at about 28 ms per thread, when we
+  measured them with the earlier 24-byte slots. The 16-byte slots helped only within noise, so
+  that cost is probably still there. A small separate table for the few hundred hottest terms is
+  the next thing to try.
+- Two ideas measured worse for us and are logged in PERF.md: global term classes from a sample,
   and a positional index for phrase anchors. Each would need a cheaper build step to pay off.
 - Fewer lines: the evaluator's match arms grow a lot under rustfmt.

@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 
-/// About 3,500 average documents, so most blocks are a single batch.
+/// About 3,100 average documents (3 MiB at ~1,015 bytes each), so most blocks
+/// are a single batch.
 const BLOCK_BYTES: usize = 3 << 20;
 const MAX_THREADS: usize = 12;
 
@@ -79,6 +80,9 @@ fn search(docs: &[u8], dict: &Dict, queries: &Queries) -> io::Result<Vec<Answer>
             }
         }
     };
+    // The `unwrap`s on `join` and `lock` cannot fire: with `panic = "abort"` a
+    // panicking thread ends the process, so no thread result is a panic and no
+    // mutex is ever poisoned.
     thread::scope(|s| {
         let handles: Vec<_> = (0..threads).map(|_| s.spawn(worker)).collect();
         handles.into_iter().try_for_each(|h| h.join().unwrap())

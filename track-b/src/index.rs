@@ -66,6 +66,8 @@ pub struct Index {
     bounds: Vec<u32>,
     postings: Vec<u16>,
     probes: Vec<Probe>,
+    /// Whether the warm-up batch is done.
+    warmed: bool,
 }
 
 impl Index {
@@ -84,17 +86,15 @@ impl Index {
             bounds: vec![0; terms + 2],
             postings: Vec::new(),
             probes: Vec::new(),
+            warmed: false,
         }
     }
 
     /// Indexes the lines of `data[pos..end]` (both line starts) until `end` or
     /// a full batch, and returns where it stopped.
     pub fn build(&mut self, data: &[u8], pos: usize, end: usize, dict: &Dict) -> io::Result<usize> {
-        let limit = if self.hit_end.capacity() == 0 {
-            WARMUP_DOCS
-        } else {
-            BATCH_DOCS
-        };
+        let limit = if self.warmed { BATCH_DOCS } else { WARMUP_DOCS };
+        self.warmed = true;
         self.docs.clear();
         self.hits.clear();
         self.hit_end.clear();
@@ -194,7 +194,9 @@ impl Index {
         self.bounds.fill(0);
         self.present.fill(0);
         let mut heavy = Vec::new();
-        let dense_min = (DENSE_MIN * self.docs.len() / BATCH_DOCS) as u32;
+        // The threshold scales with the batch size, but stays at least 1: a
+        // short last batch must not promote every term it saw twice.
+        let dense_min = (DENSE_MIN * self.docs.len() / BATCH_DOCS).max(1) as u32;
         // Count into `bounds[t + 2]` so that after the prefix sum `bounds[t + 1]`
         // is where term t starts; the scatter uses it as t's cursor, which leaves
         // it at t's end, so `bounds[t]..bounds[t + 1]` is the list of t.

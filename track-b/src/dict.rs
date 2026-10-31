@@ -150,6 +150,8 @@ impl Dict {
         self.slots[i] = Slot {
             lo: key.lo,
             hi: key.hi as u32,
+            // 26 bits of id are plenty: there are at most 400,000 query words
+            // (50,000 queries of up to 8 terms), and 6 bits hold a length <= 32.
             meta: id << 6 | key.len,
         };
     }

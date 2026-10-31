@@ -9,14 +9,15 @@ use crate::{Op, Step};
 #[derive(Clone, Copy, Default)]
 pub struct Answer {
     pub count: u32,
-    pub len: u32,
+    /// How many of `ten` are filled: min(10, count).
+    pub kept: u32,
     pub sum: u64,
     pub ten: [u32; 10],
 }
 
 impl Answer {
     pub fn ten(&self) -> &[u32] {
-        &self.ten[..self.len as usize]
+        &self.ten[..self.kept as usize]
     }
 
     /// Adds a document; ids must arrive in ascending order.
@@ -24,9 +25,9 @@ impl Answer {
     fn push(&mut self, id: u32) {
         self.count += 1;
         self.sum += u64::from(id);
-        if self.len < 10 {
-            self.ten[self.len as usize] = id;
-            self.len += 1;
+        if self.kept < 10 {
+            self.ten[self.kept as usize] = id;
+            self.kept += 1;
         }
     }
 
@@ -38,27 +39,29 @@ impl Answer {
             self.count += ones;
             self.sum += u64::from(first) * u64::from(ones) + bit_index_sum(word);
             let mut rest = word;
-            while self.len < 10 && rest != 0 {
-                self.ten[self.len as usize] = first + rest.trailing_zeros();
-                self.len += 1;
+            while self.kept < 10 && rest != 0 {
+                self.ten[self.kept as usize] = first + rest.trailing_zeros();
+                self.kept += 1;
                 rest &= rest - 1;
             }
         }
     }
 
-    /// Adds the answer for another, disjoint set of documents.
+    /// Adds the answer for another, disjoint set of documents. `other` must be
+    /// non-empty (the caller only merges answers with `count > 0`), so
+    /// `other.ten[0]` is a real id.
     pub fn merge(&mut self, other: &Answer) {
         self.count += other.count;
         self.sum += other.sum;
-        if self.len == 10 && other.ten[0] > self.ten[9] {
+        if self.kept == 10 && other.ten[0] > self.ten[9] {
             return; // the usual case: later batches only hold larger ids
         }
-        let (n, m) = (self.len as usize, other.len as usize);
+        let (n, m) = (self.kept as usize, other.kept as usize);
         let mut all = [0; 20];
         all[..n].copy_from_slice(self.ten());
         all[n..n + m].copy_from_slice(other.ten());
         all[..n + m].sort_unstable();
-        self.len = (n + m).min(10) as u32;
+        self.kept = (n + m).min(10) as u32;
         self.ten.copy_from_slice(&all[..10]);
     }
 }
