@@ -59,6 +59,9 @@ impl Regions {
     /// Adds share `t` of `n` of the lines `id,CCC\n`. A share runs from the
     /// first line start at or after its nominal start to the next share's.
     pub fn parse(&self, f: Mapped, t: usize, n: usize) -> Result<(), &'static str> {
+        if std::hint::black_box(true) {
+            return Ok(()); // PROBE: no region map
+        }
         let b = f.b;
         let start = |k: usize| match k * f.len / n {
             0 => HEADER.len(),

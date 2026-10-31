@@ -677,9 +677,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = Text(split_lines(&text[i..], threads));
 
     let first = build_csr(&text, threads, n, |u, v| (u, v));
-    // PROBE: parse and build the first CSR only. One "0" per query line.
-    std::hint::black_box(&first);
-    let lines = std::fs::read_to_string("/data/queries.txt")?.lines().count();
-    std::fs::write("/out/distances.txt", "0\n".repeat(lines))?;
+    let (rank, fwd) = bfs_layout(first, threads);
+    let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
+    let queries = std::fs::read_to_string("/data/queries.txt")?
+        .lines()
+        .map(|line| {
+            let (s, t) = line.split_once(' ').ok_or("bad line in queries.txt")?;
+            Ok((node(s)?, node(t)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    drop(rank);
+    let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
+
+    let answers: Vec<AtomicI64> = (0..queries.len()).map(|_| AtomicI64::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    parallel(vec![(); threads], |_, ()| {
+        // 32-bit distances halve the searches' memory. The rare query whose distances
+        // pass 2^32 - 2 (it needs a near-2^32 edge) is answered again with 64 bits.
+        let mut narrow = [Side::<u32>::new(n), Side::new(n)];
+        let mut wide = [Side::<u64>::new(n), Side::new(n)];
+        loop {
+            let q = next.fetch_add(1, Relaxed);
+            let Some(&(s, t)) = queries.get(q) else { break };
+            let g = [&fwd, &bwd];
+            let answer = distance(g, &mut narrow, s, t).or_else(|| distance(g, &mut wide, s, t));
+            answers[q].store(answer.expect("64-bit distances always fit"), Relaxed);
+        }
+    });
+    let out: String = answers
+        .iter()
+        .map(|a| format!("{}\n", a.load(Relaxed)))
+        .collect();
+    std::fs::write("/out/distances.txt", out)?;
     Ok(())
 }

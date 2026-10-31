@@ -104,13 +104,14 @@ impl Shared<'_> {
             if opens | closes | cr & !ins & !lf_after != 0 {
                 return Err(Fail::Malformed);
             }
-            s.push((comma | lf) & !ins, (o - base) as u32, quote, quotes);
+            // PROBE: count records (LFs outside quotes) instead of flattening.
+            aggs[0].sums[0] += i64::from((lf & !ins).count_ones());
             quotes += quote.count_ones();
             inside = ((ins as i64) >> 63) as u64; // bit 63, broadcast
             sep_before = sep >> 63;
-            if s.n >= FLUSH {
-                self.records(&mut s, aggs)?;
-            }
+        }
+        if std::hint::black_box(true) {
+            return Ok(u64::from(quotes)); // PROBE: no field parsing
         }
         self.records(&mut s, aggs)?;
         // The final record may end at end of file without a terminator.

@@ -73,9 +73,6 @@ impl Names {
     /// following one another: keys and table slots, ids and bitset words,
     /// then the bits themselves.
     pub fn count(&self, b: &[u8], batch: &[Record], aggs: &mut [Agg]) -> Result<(), Fail> {
-        if std::hint::black_box(true) {
-            return Ok(()); // PROBE: no interning, no pair bits; names_distinct stays 0
-        }
         let (mut keys, mut at) = ([[0; 4]; BATCH], [0; BATCH]);
         for (k, n) in keys.iter_mut().zip(batch) {
             *k = key(b, n);
