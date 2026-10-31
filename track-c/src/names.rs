@@ -60,9 +60,6 @@ impl Names {
 
     /// Faults in this worker's share of the tables (see `map::touch`).
     pub fn touch(&self, part: usize, parts: usize) {
-        if std::hint::black_box(true) {
-            return; // PROBE: no name tables
-        }
         map::touch(self.table, part, parts);
         map::touch(self.pairs, parts - 1 - part, parts); // the others start here
     }
