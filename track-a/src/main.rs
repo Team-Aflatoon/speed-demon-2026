@@ -218,27 +218,8 @@ impl<'a> Job<'a> {
             }
             drop(sender);
             // Hours finish out of order; each is written once all earlier ones are out.
-            // Between writes, the main thread parses pieces too, so all 12 CPUs parse.
             let (mut pending, mut written) = (vec![None; HOURS], 0);
-            let (mut open, mut parsed, mut lines, mut buf) = ([(0, 0); HOURS], None, 0, vec![]);
-            loop {
-                let next = match receiver.try_recv() {
-                    Err(mpsc::TryRecvError::Empty) => match self.next_task(parsed.take(), true) {
-                        Task::Piece(i) => {
-                            // SAFETY: `read` leaves SLACK zero bytes after the piece's lines.
-                            let piece = self.read(i, &mut buf);
-                            match piece.and_then(|piece| unsafe { self.parse(&mut open, piece) }) {
-                                Ok(n) => lines += n,
-                                Err(e) => _ = lock(&self.plan).failure.get_or_insert(e),
-                            }
-                            parsed = Some(i);
-                            continue;
-                        }
-                        _ => receiver.recv().ok(),
-                    },
-                    next => next.ok(),
-                };
-                let Some((hour, text)) = next else { break };
+            for (hour, text) in receiver {
                 pending[hour] = Some(text);
                 while let Some(mut text) = pending.get_mut(written).and_then(Option::take) {
                     out.write_all(&text)?;
@@ -252,7 +233,6 @@ impl<'a> Job<'a> {
                     written += 1;
                 }
             }
-            self.lines.fetch_add(lines, Relaxed);
             Ok::<_, io::Error>(())
         })?;
         lock(&self.plan).failure.take().map_or(Ok(()), Err)?;
@@ -266,7 +246,7 @@ impl<'a> Job<'a> {
     fn work(&self, sender: mpsc::Sender<(usize, Vec<u8>)>) {
         let (mut open, mut parsed, mut lines, mut buf) = ([(0, 0); HOURS], None, 0, vec![]);
         loop {
-            match self.next_task(parsed.take(), false) {
+            match self.next_task(parsed.take()) {
                 Task::Piece(i) => {
                     // SAFETY: `read` leaves SLACK zero bytes after the piece's lines.
                     let piece = self.read(i, &mut buf);
@@ -309,7 +289,7 @@ impl<'a> Job<'a> {
 
     /// Marks piece `parsed` done and picks the next task: an hour that is due, else a
     /// piece, else (once all pieces are taken) it waits for more hours to come due.
-    fn next_task(&self, parsed: Option<usize>, pieces_only: bool) -> Task {
+    fn next_task(&self, parsed: Option<usize>) -> Task {
         let mut plan = lock(&self.plan);
         if let Some(i) = parsed {
             plan.parsing.retain(|&j| j != i);
@@ -330,7 +310,7 @@ impl<'a> Job<'a> {
             };
             if plan.failure.is_some() || plan.next_hour == HOURS {
                 return Task::Stop;
-            } else if plan.next_hour < due && !pieces_only {
+            } else if plan.next_hour < due {
                 plan.next_hour += 1;
                 return Task::Hour(plan.next_hour - 1);
             } else if plan.next_piece < self.pieces {
@@ -338,8 +318,6 @@ impl<'a> Job<'a> {
                 plan.parsing.push(i);
                 plan.next_piece += 1;
                 return Task::Piece(i);
-            } else if pieces_only {
-                return Task::Stop;
             }
             plan.waiting += 1;
             plan = self.changed.wait(plan).expect("no worker panics");

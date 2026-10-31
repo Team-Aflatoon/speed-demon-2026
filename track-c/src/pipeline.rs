@@ -6,14 +6,12 @@
 //!
 //! Choosing the chunk cuts is where the quote-parity problem lives; see `run`.
 
-use crate::map::{Mapped, PAD};
+use crate::map::Mapped;
 use crate::names::Names;
 use crate::records::{Fail, BOM_FIRST};
 use crate::regions::Regions;
 use crate::{die, Agg, GROUPS};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
-use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 use std::thread::{self, Scope};
 
@@ -22,21 +20,17 @@ use std::thread::{self, Scope};
 const TOUCHERS: usize = 4;
 /// Stack size for workers, which need about 40 KiB.
 const STACK: usize = 256 << 10;
-/// Bytes read past a chunk's nominal end to find its real end, at first;
-/// a longer last record doubles it until the end is found.
-const SLACK: usize = 4 << 10;
 
 /// Everything the workers share: records.csv, the tables records are joined
-/// and counted into, and the chunks. Chunk c covers nominally the `piece`
-/// bytes from `c * piece` (see `read`); `next` is the next one to claim, and
-/// `quotes[c]` the quote bytes found in chunk c. `fail` is the worst `Fail`
-/// of any chunk, 0 for none.
+/// and counted into, and the chunks. Chunk c is `cuts[c]..cuts[c + 1]`;
+/// `next` is the next one to claim, and `quotes[c]` the quote bytes found in
+/// chunk c. `fail` is the worst `Fail` of any chunk, 0 for none.
 pub struct Shared<'a> {
-    file: &'a File,
-    len: usize,
-    piece: usize,
+    pub b: &'a [u8],
+    pub len: usize,
     pub regions: &'a Regions,
     pub names: Names,
+    cuts: Vec<usize>,
     next: AtomicUsize,
     quotes: Vec<AtomicU64>,
     fail: AtomicU8,
@@ -56,18 +50,27 @@ pub struct Shared<'a> {
 /// returns `Fail::Malformed`, and the caller retries with a single chunk.
 pub fn run(
     threads: usize,
-    piece: usize,
+    chunks: usize,
     slots: usize,
-    records: (&File, usize),
+    records: Mapped,
     regions: (&Regions, Mapped),
 ) -> Result<Vec<Agg>, Fail> {
-    let ((file, len), piece) = (records, piece.max(1));
+    let (b, len) = (records.b, records.len);
     let names = Names::new(slots, len).unwrap_or_else(|e| die(&format!("memory: {e}")));
-    let chunks = len.div_ceil(piece).max(1);
+    let boundary = |i: usize| b[i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == BOM_FIRST);
+    let (cuts, next) = (cuts(len, chunks, boundary), AtomicUsize::new(0));
     let quotes = (0..chunks).map(|_| AtomicU64::new(0)).collect();
-    let (next, fail) = (AtomicUsize::new(0), AtomicU8::new(0));
-    let regions_map = regions.0;
-    let shared = Shared { file, len, piece, regions: regions_map, names, next, quotes, fail };
+    let fail = AtomicU8::new(0);
+    let shared = Shared {
+        b,
+        len,
+        regions: regions.0,
+        names,
+        cuts,
+        next,
+        quotes,
+        fail,
+    };
     // Before records start, the first workers fault in the name tables (see
     // `Names::touch`) while the others split regions.csv; one worker alone
     // does both.
@@ -126,64 +129,30 @@ fn grow<'s, F: Fn(usize) + Sync>(s: &'s Scope<'s, '_>, t: usize, n: usize, work:
 }
 
 impl Shared<'_> {
-    /// One worker: claims, reads and parses chunks until none are left.
+    /// One worker: claims and parses chunks until none are left.
     fn work(&self) -> [Agg; GROUPS] {
         let mut aggs = [Agg::EMPTY; GROUPS];
-        let mut buffer = Vec::new();
         loop {
             let c = self.next.fetch_add(1, Relaxed);
-            if c >= self.quotes.len() {
+            let Some(&end) = self.cuts.get(c + 1) else {
                 return aggs;
-            }
-            let (start, end) = self.read(c, &mut buffer);
-            let eof = c * self.piece + end == self.len;
-            match self.chunk(&buffer[start..], end - start, c == 0, eof, &mut aggs) {
+            };
+            match self.chunk(self.cuts[c], end, &mut aggs) {
                 Ok(quotes) => self.quotes[c].store(quotes, Relaxed),
                 Err(f) => _ = self.fail.fetch_max(f as u8, Relaxed),
             }
         }
     }
-
-    /// Reads chunk c into `buffer` with pread, rather than mapping the file:
-    /// on the scoring box the page faults, page-table set-up and tear-down of
-    /// a 200 MB mapping cost more than copying the bytes. Returns where in
-    /// `buffer` the chunk starts and ends, with `PAD` zero bytes after it.
-    ///
-    /// The chunk runs from the first record boundary at or after `c * piece`
-    /// to the first at or after `(c + 1) * piece` (chunk 0 from the start of
-    /// the file, the last one to its end). A boundary is just past an LF that
-    /// is followed by a digit or a BOM byte: a guess, checked as `run` says.
-    /// Both ends are found from the file's bytes alone, so neighbouring
-    /// chunks always agree on the cut between them.
-    fn read(&self, c: usize, buffer: &mut Vec<u8>) -> (usize, usize) {
-        let from = c * self.piece;
-        let nominal_end = (from + self.piece).min(self.len) - from;
-        let mut want = (nominal_end + SLACK).min(self.len - from);
-        loop {
-            buffer.resize(want + PAD, 0);
-            if let Err(e) = self.file.read_exact_at(&mut buffer[..want], from as u64) {
-                die(&format!("records.csv: {e}"));
-            }
-            let whole = from + want == self.len;
-            let start = if c == 0 { Some(0) } else { cut(&buffer[..want], 0) };
-            let end = match nominal_end == self.len - from {
-                true => Some(want),
-                false => cut(&buffer[..want], nominal_end),
-            };
-            if let Some(end) = end.or(whole.then_some(want)) {
-                let start = start.unwrap_or(end).min(end);
-                buffer[end..end + PAD].fill(0);
-                return (start, end);
-            }
-            want = (2 * want).min(self.len - from);
-        }
-    }
 }
 
-/// Just past the first LF at or after `from` that is followed by a digit or
-/// a BOM byte, if `b` holds one. The byte after the LF must be in `b`, so an
-/// LF at its very end is not taken: the caller reads further and asks again.
-fn cut(b: &[u8], from: usize) -> Option<usize> {
-    let boundary = |i: &usize| b[*i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == BOM_FIRST);
-    (from..b.len().saturating_sub(1)).find(boundary).map(|i| i + 1)
+/// `n + 1` ascending cut positions: 0, then each nominal share start moved
+/// to just past the next byte where `boundary` holds, then `len`.
+fn cuts(len: usize, n: usize, boundary: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut cuts = vec![0];
+    for k in 1..n {
+        let nominal = (len * k / n).max(cuts[k - 1]);
+        cuts.push((nominal..len).find(|&i| boundary(i)).map_or(len, |i| i + 1));
+    }
+    cuts.push(len);
+    cuts
 }

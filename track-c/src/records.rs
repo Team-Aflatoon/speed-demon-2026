@@ -67,12 +67,12 @@ struct Separators {
 }
 
 impl Shared<'_> {
-    /// Parses the records in `b[..end]` into `aggs`: one chunk of the file,
-    /// read into a buffer and followed there by `map::PAD` zero bytes. It
-    /// must start at a record start, or with the header if `header`; `eof`
-    /// says whether it ends the file. Returns the number of quote bytes in it.
-    pub fn chunk(&self, b: &[u8], end: usize, header: bool, eof: bool, aggs: &mut [Agg]) -> Result<u64, Fail> {
-        let base = if header { self.header(b)? } else { 0 };
+    /// Parses the records in `b[start..end]` into `aggs`; `start` must be a
+    /// record start, or 0 for the chunk holding the header. Returns the
+    /// number of quote bytes in the range.
+    pub fn chunk(&self, start: usize, end: usize, aggs: &mut [Agg]) -> Result<u64, Fail> {
+        let b = self.b;
+        let base = if start == 0 { self.header()? } else { start };
         let (at, quotes, batch) = ([0; ROOM], [0; ROOM], [Record::default(); BATCH]);
         let mut s = Separators {
             at,
@@ -109,14 +109,14 @@ impl Shared<'_> {
             inside = ((ins as i64) >> 63) as u64; // bit 63, broadcast
             sep_before = sep >> 63;
             if s.n >= FLUSH {
-                self.records(b, &mut s, aggs)?;
+                self.records(&mut s, aggs)?;
             }
         }
-        self.records(b, &mut s, aggs)?;
+        self.records(&mut s, aggs)?;
         // The final record may end at end of file without a terminator.
-        if s.n == 4 && eof && inside == 0 {
-            self.parse(b, &mut s, 0, end, 0).ok_or(Fail::Malformed)?;
-            self.join(b, &mut s.batch[..1], aggs)?;
+        if s.n == 4 && end == self.len && inside == 0 {
+            self.parse(&mut s, 0, end, 0).ok_or(Fail::Malformed)?;
+            self.join(&mut s.batch[..1], aggs)?;
             (s.n, s.record) = (0, end);
         }
         let whole = s.n == 0 && s.record == end;
@@ -124,11 +124,11 @@ impl Shared<'_> {
     }
 
     /// The header line; returns where the first record starts.
-    fn header(&self, b: &[u8]) -> Result<usize, Fail> {
-        let p = 3 * usize::from(bom_at(b, 0));
+    fn header(&self) -> Result<usize, Fail> {
+        let p = 3 * usize::from(bom_at(self.b, 0));
         let q = p + HEADER.len();
-        let crlf = usize::from(b[q] == b'\r');
-        let ok = b[p..q] == *HEADER && b[q + crlf] == b'\n';
+        let crlf = usize::from(self.b[q] == b'\r');
+        let ok = self.b[p..q] == *HEADER && self.b[q + crlf] == b'\n';
         ok.then_some(q + crlf + 1).ok_or(Fail::Malformed)
     }
 
@@ -136,11 +136,11 @@ impl Shared<'_> {
     /// then an LF) have all been seen. Parsing the whole batch before
     /// joining any of it lets the region-map loads, which mostly miss the
     /// cache, overlap.
-    fn records(&self, b: &[u8], s: &mut Separators, aggs: &mut [Agg]) -> Result<(), Fail> {
+    fn records(&self, s: &mut Separators, aggs: &mut [Agg]) -> Result<(), Fail> {
         let done = s.n / 5;
         for r in 0..done {
             let lf = s.base + s.at[5 * r + 4] as usize;
-            let parsed = b[lf] == b'\n' && self.parse(b, s, 5 * r, lf, r).is_some();
+            let parsed = self.b[lf] == b'\n' && self.parse(s, 5 * r, lf, r).is_some();
             if !parsed {
                 return Err(Fail::Malformed);
             }
@@ -150,13 +150,14 @@ impl Shared<'_> {
         s.at.copy_within(5 * done..s.n, 0);
         s.quotes.copy_within(5 * done..s.n, 0);
         s.n -= 5 * done;
-        self.join(b, &mut s.batch[..done], aggs)
+        self.join(&mut s.batch[..done], aggs)
     }
 
     /// Parses into `s.batch[r]` the record starting at `s.record`, whose
     /// commas are separators `k..k + 4` and whose terminator (or the end of
     /// file) is at `end`.
-    fn parse(&self, b: &[u8], s: &mut Separators, k: usize, end: usize, r: usize) -> Option<()> {
+    fn parse(&self, s: &mut Separators, k: usize, end: usize, r: usize) -> Option<()> {
+        let b = self.b;
         let [c0, c1, c2, c3] = [0, 1, 2, 3].map(|j| s.base + s.at[k + j] as usize);
         if [c0, c1, c2, c3].iter().any(|&c| b[c] != b',') {
             return None;
@@ -175,13 +176,13 @@ impl Shared<'_> {
 
     /// Joins parsed records to their groups, adds them into `aggs`, and
     /// counts their names.
-    fn join(&self, b: &[u8], batch: &mut [Record], aggs: &mut [Agg]) -> Result<(), Fail> {
+    fn join(&self, batch: &mut [Record], aggs: &mut [Agg]) -> Result<(), Fail> {
         for r in batch.iter_mut() {
             r.group = self.regions.group(r.region);
             let sums = [1, r.id, r.cents, 0, r.name_len, r.note_len];
             aggs[usize::from(r.group)].add(sums, r.cents, r.cents);
         }
-        self.names.count(b, batch, aggs)
+        self.names.count(self.b, batch, aggs)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Speed Demon 2026, Track D (Traverse): exact point-to-point shortest paths.
 //!
-//! 1. Read graph.txt and parse it in parallel into a CSR of out-edges (`build_csr`).
+//! 1. Map graph.txt and parse it in parallel into a CSR of out-edges (`build_csr`).
 //! 2. Renumber the nodes in BFS order (`bfs_layout`): node ids in the file are random;
 //!    renumbered, road-network neighbours sit at nearby ids, so a search touches a few
 //!    cache lines instead of one per node. The walk lays out the forward graph in the
@@ -9,20 +9,39 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::ops::Range;
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread::available_parallelism;
 
 extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
 
 // The values from the Linux and glibc headers for the calls above.
+const PROT_READ: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
 const M_MMAP_THRESHOLD: i32 = -3;
 const PR_SET_THP_DISABLE: i32 = 41;
+
+/// Maps a whole file read-only. The harness prewarms /data into the page cache, so this
+/// costs neither a copy nor memory charged to us.
+fn map_file(path: &str) -> std::io::Result<&'static [u8]> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    // SAFETY: a private read-only mapping of a file on a read-only mount; it stays valid
+    // after `file` is closed and is never unmapped, hence 'static.
+    let fd = file.as_raw_fd();
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+    if ptr as isize == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: mmap succeeded, so `ptr` points to `len` readable bytes, and the mapping is
+    // never written to or unmapped while the program runs.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
 
 /// Parses the unsigned decimal at `text[*i..]` and steps past the separator after it.
 ///
@@ -56,6 +75,22 @@ fn number(text: &[u8], i: &mut usize) -> u64 {
         }
         x = x * 10 + (c - b'0') as u64;
     }
+}
+
+/// Splits the edge lines into `parts` pieces that start and end on line boundaries.
+fn split_lines(text: &[u8], parts: usize) -> Vec<&[u8]> {
+    let mut cuts = vec![0];
+    for k in 1..parts {
+        // At least 1 so that `text[at - 1]` exists, at most the end (for tiny inputs).
+        let lo = cuts[k - 1].max(1);
+        let mut at = (text.len() * k / parts).max(lo).min(text.len());
+        while at < text.len() && text[at - 1] != b'\n' {
+            at += 1;
+        }
+        cuts.push(at);
+    }
+    cuts.push(text.len());
+    cuts.windows(2).map(|w| &text[w[0]..w[1]]).collect()
 }
 
 /// A fixed team of threads, started once: spawning a fresh set for each of the ten
@@ -133,73 +168,16 @@ trait EdgeSource: Sync {
     fn each(&self, part: usize, parts: usize, f: impl FnMut(usize, usize, u64));
 }
 
-/// graph.txt, read with positional reads (pread) rather than mapped: on the scoring box,
-/// faulting a file mapping in cost more than copying the bytes. `pieces` are the byte
-/// ranges of the edge lines, one per thread, each starting and ending on a line boundary.
-struct Text {
-    file: File,
-    pieces: Vec<Range<u64>>,
-}
+/// The edge lines of graph.txt, split at line boundaries into one piece per part.
+struct Text<'a>(Vec<&'a [u8]>);
 
-/// Bytes read at a time: small enough to stay in L2, large enough to amortise the call.
-const CHUNK: usize = 128 << 10;
-
-impl Text {
-    /// Opens graph.txt, parses its header and cuts the edge lines into `parts` pieces.
-    fn open(path: &str, parts: usize) -> std::io::Result<(Text, usize)> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        let (mut head, mut i) = ([0u8; 64], 0);
-        let got = file.read_at(&mut head, 0)?;
-        let n = number(&head[..got], &mut i) as usize;
-        // Then m, which is not needed: the edge count is implied by the lines themselves.
-        number(&head[..got], &mut i);
-        // A cut is just past the first LF at or after its byte, or the end of the file.
-        let mut cuts = vec![i as u64];
-        for k in 1..parts as u64 {
-            let mut at = (len * k / parts as u64).max(*cuts.last().unwrap());
-            let mut window = [0u8; 64];
-            while at < len {
-                let got = file.read_at(&mut window, at - 1)?;
-                match window[..got].iter().position(|&c| c == b'\n') {
-                    Some(lf) => {
-                        at += lf as u64;
-                        break;
-                    }
-                    None => at += got as u64,
-                }
-            }
-            cuts.push(at.min(len));
-        }
-        cuts.push(len);
-        let pieces = cuts.windows(2).map(|w| w[0]..w[1]).collect();
-        Ok((Text { file, pieces }, n))
-    }
-}
-
-impl EdgeSource for Text {
-    /// Reads piece `part` CHUNK bytes at a time into one buffer, parses the complete lines
-    /// and carries the partial last line over to the front for the next read.
+impl EdgeSource for Text<'_> {
     fn each(&self, part: usize, _: usize, mut f: impl FnMut(usize, usize, u64)) {
-        let (mut at, end) = (self.pieces[part].start, self.pieces[part].end);
-        let (mut buf, mut kept) = (vec![0u8; CHUNK], 0);
-        while at < end {
-            let want = (CHUNK - kept).min((end - at) as usize);
-            let read = self.file.read_exact_at(&mut buf[kept..kept + want], at);
-            read.expect("cannot read graph.txt");
-            (at, kept) = (at + want as u64, kept + want);
-            let lines = match buf[..kept].iter().rposition(|&c| c == b'\n') {
-                Some(lf) => lf + 1,
-                None => panic!("graph.txt has a line longer than {CHUNK} bytes"),
-            };
-            let (text, mut i) = (&buf[..lines], 0);
-            while i < lines {
-                let u = number(text, &mut i) as usize;
-                let v = number(text, &mut i) as usize;
-                f(u, v, number(text, &mut i));
-            }
-            buf.copy_within(lines..kept, 0);
-            kept -= lines;
+        let (piece, mut i) = (self.0[part], 0);
+        while i < piece.len() {
+            let u = number(piece, &mut i) as usize;
+            let v = number(piece, &mut i) as usize;
+            f(u, v, number(piece, &mut i));
         }
     }
 }
@@ -692,7 +670,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let threads = available_parallelism().map_or(1, usize::from).min(12);
     Team::start(threads);
-    let (text, n) = Text::open("/data/graph.txt", threads)?;
+    let text = map_file("/data/graph.txt")?;
+    let mut i = 0;
+    let n = number(text, &mut i) as usize;
+    number(text, &mut i); // m: the edge count is implied by the lines themselves
+    let text = Text(split_lines(&text[i..], threads));
 
     let first = build_csr(&text, threads, n, |u, v| (u, v));
     let (rank, fwd) = bfs_layout(first, threads);

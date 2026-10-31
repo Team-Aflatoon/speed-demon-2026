@@ -10,14 +10,13 @@ mod regions;
 
 use records::Fail;
 use std::fmt::Write as _;
-use std::{env, fs, fs::File, process, thread};
+use std::{env, fs, process, thread};
 
 /// Name-table slots for the first attempt: room for 114,688 distinct names
 /// (the spec's name pool has 100,000). A larger input retries with more.
 const SLOTS: usize = 1 << 17;
-/// Bytes per chunk of records.csv, read into a worker's buffer and parsed
-/// while it is still in that core's L2 cache.
-const PIECE: usize = 128 << 10;
+/// Chunks per worker. More, smaller chunks even out the workers' finish times.
+const CHUNKS_PER_WORKER: usize = 16;
 /// The most worker threads (the scoring machine gives us twelve).
 const MAX_THREADS: usize = 12;
 /// Groups: `_UNMATCHED` (0) and up to 255 countries.
@@ -72,10 +71,8 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
-    let path = format!("{data}/records.csv");
-    let file = File::open(&path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-    let len = file.metadata().map_or(0, |m| m.len()) as usize;
-    if len > u32::MAX as usize {
+    let records = map_or_die(&format!("{data}/records.csv"));
+    if records.len > u32::MAX as usize {
         die("records.csv is over 4 GiB; chunk offsets are 32-bit"); // spec: 202 MB
     }
     let region_file = map_or_die(&format!("{data}/regions.csv"));
@@ -83,13 +80,13 @@ fn main() {
     let threads = thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS);
-    let (mut piece, mut slots) = (PIECE, SLOTS);
+    let (mut chunks, mut slots) = (threads * CHUNKS_PER_WORKER, SLOTS);
     let aggs = loop {
-        match pipeline::run(threads, piece, slots, (&file, len), (&regions, region_file)) {
+        match pipeline::run(threads, chunks, slots, records, (&regions, region_file)) {
             Ok(aggs) => break aggs,
             Err(Fail::Full) => slots *= 8,
             // A single chunk starts at the start of the file: always right.
-            Err(Fail::Malformed) if piece < len => piece = len,
+            Err(Fail::Malformed) if chunks > 1 => chunks = 1,
             Err(Fail::Malformed) => die("records.csv does not follow spec section 2.1"),
         }
     };
