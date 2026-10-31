@@ -52,11 +52,11 @@ pub struct Index {
     state: Vec<u32>,
     dense_terms: Vec<u32>,
     bitmaps: Vec<Bits>,
-    /// The scan's copy of the dense bitmaps, transposed: word `w` of slot `s`
-    /// is `scan_bits[w * dense + s]`. A document's dense terms then all write
-    /// to one small stretch of memory that stays in L1, instead of to one cache
-    /// line per term; `invert` transposes it back once per batch.
-    scan_bits: Vec<u64>,
+    /// The bitmap words of the current 64 documents, one per dense slot. A
+    /// document's dense terms all write to this small array, which stays in
+    /// L1, instead of to one cache line per term; every 64 documents it is
+    /// flushed into `bitmaps`, one write per dense term.
+    stripe: Vec<u64>,
     terms: Vec<u32>,
     /// Sparse (document, term) pairs in document order: `hits[hit_end[d-1]..hit_end[d]]`
     /// are the distinct rare terms of local document `d`.
@@ -77,7 +77,7 @@ impl Index {
             state: vec![NEVER; terms],
             dense_terms: Vec::new(),
             bitmaps: Vec::new(),
-            scan_bits: Vec::new(),
+            stripe: Vec::new(),
             terms: Vec::new(),
             hits: Vec::new(),
             hit_end: Vec::new(),
@@ -98,8 +98,9 @@ impl Index {
         self.docs.clear();
         self.hits.clear();
         self.hit_end.clear();
-        self.scan_bits.clear();
-        self.scan_bits.resize(WORDS * self.bitmaps.len(), 0);
+        self.bitmaps.iter_mut().for_each(|b| *b = [0; WORDS]);
+        self.stripe.clear();
+        self.stripe.resize(self.bitmaps.len(), 0);
         let mut lexer = Lexer::new(data, pos, end);
         let mut line = pos;
         while line < end && self.docs.len() < limit {
@@ -111,6 +112,9 @@ impl Index {
                 _ => return Err(bad_corpus("a line does not start with an id and a TAB")),
             };
             let local = self.docs.len();
+            if local > 0 && local.is_multiple_of(64) {
+                self.flush_stripe(local / 64 - 1);
+            }
             if local == 0 {
                 self.first_doc = id;
             } else if id != self.first_doc + local as u32 {
@@ -121,8 +125,18 @@ impl Index {
             self.hit_end.push(self.hits.len() as u32);
             line = lf + 1;
         }
+        if !self.docs.is_empty() {
+            self.flush_stripe((self.docs.len() - 1) / 64);
+        }
         self.invert();
         Ok(line)
+    }
+
+    /// Moves the stripe into word `w` of the dense bitmaps.
+    fn flush_stripe(&mut self, w: usize) {
+        for (bits, word) in self.bitmaps.iter_mut().zip(&mut self.stripe) {
+            bits[w] = std::mem::take(word);
+        }
     }
 
     /// Records the query terms of one document's text; returns the LF ending it.
@@ -167,8 +181,7 @@ impl Index {
     fn record(&mut self, term: usize, local: usize, id: u32) {
         let state = self.state[term];
         if state & DENSE != 0 {
-            let dense = self.bitmaps.len();
-            self.scan_bits[local / 64 * dense + (state ^ DENSE) as usize] |= 1 << (local % 64);
+            self.stripe[(state ^ DENSE) as usize] |= 1 << (local % 64);
         } else if state != id {
             self.state[term] = id;
             self.hits.push(term as u32);
@@ -178,12 +191,6 @@ impl Index {
     /// Counting sort of the sparse hits into per-term lists, then promotion of
     /// the terms whose list came out long to bitmaps.
     fn invert(&mut self) {
-        let dense = self.bitmaps.len();
-        for (slot, bits) in self.bitmaps.iter_mut().enumerate() {
-            bits.iter_mut()
-                .enumerate()
-                .for_each(|(w, word)| *word = self.scan_bits[w * dense + slot]);
-        }
         self.bounds.fill(0);
         self.present.fill(0);
         let mut heavy = Vec::new();

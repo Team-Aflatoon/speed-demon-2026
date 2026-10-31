@@ -40,9 +40,9 @@ document overlap instead of queueing one after another.
 built by a counting sort of the batch's (document, term) hits. A term that once appears in more
 than 64 documents of a batch becomes "dense" for that worker. From then on the scan sets its bit
 in a 512-byte bitmap directly, with no duplicate check and no list. A worker's first batch
-is a 512-document warm-up, so twelve all-list first batches don't set the memory peak. During the scan the dense
-bitmaps are stored transposed (all dense terms' words for the same 64 documents sit side by
-side), so a document's writes stay in L1. They are transposed back once per batch.
+is a 512-document warm-up, so twelve all-list first batches don't set the memory peak. During the scan, dense bits go into a one-word-per-term stripe for the current 64 documents,
+which stays in L1. It is flushed into the bitmaps every 64 documents, one write per dense term
+instead of one cache line per hit.
 
 **BOOL queries** run strictly left to right as a small state machine. A one-term query, or
 `x AND <absent>`, only borrows the term's set; a combined result lives in a scratch bitmap,
@@ -68,11 +68,9 @@ None. The Rust standard library only. `mmap` is declared by hand with `extern "C
 
 ## With another 24 hours
 
-- The term table lookups are the largest single cost, at about 28 ms per thread. A 16-byte
-  slot (2 MB instead of 3 MB) and a small separate table for the few hundred hottest terms
-  would cut the cache misses.
-- The per-thread term arrays (about 600 KB per thread) are the next memory cost, together with
-  the 1.5 MB of output page cache, which O_DIRECT writes would avoid.
+- The term table lookups are still the largest single cost, at about 28 ms per thread, even
+  with 16-byte slots. A small separate table for the few hundred hottest terms is the next
+  thing to try there.
 - Two ideas measured worse here and are logged in PERF.md: global term classes from a sample,
   and a positional index for phrase anchors. Each would need a cheaper build step to pay off.
 - Fewer lines: the evaluator's match arms grow a lot under rustfmt.

@@ -70,19 +70,21 @@ fn word(data: &[u8], at: usize) -> u64 {
     }
 }
 
+/// A table slot, 16 bytes so four share a cache line: the first 12 bytes of
+/// the term, and its id and length packed as `id << 6 | len`. A term longer
+/// than 12 bytes is confirmed against its full text.
 #[derive(Clone, Copy)]
 struct Slot {
     lo: u64,
-    hi: u64,
-    len: u32,
-    id: u32,
+    hi: u32,
+    meta: u32,
 }
 
+const INLINE: usize = 12;
 const EMPTY_SLOT: Slot = Slot {
     lo: 0,
     hi: 0,
-    len: 0,
-    id: VACANT,
+    meta: VACANT,
 };
 
 pub struct Dict {
@@ -142,14 +144,13 @@ impl Dict {
         let key = Key::new(term, 0, term.len());
         let mask = self.slots.len() - 1;
         let mut i = key.hash() & mask;
-        while self.slots[i].id != VACANT {
+        while self.slots[i].meta != VACANT {
             i = (i + 1) & mask;
         }
         self.slots[i] = Slot {
             lo: key.lo,
-            hi: key.hi,
-            len: key.len,
-            id,
+            hi: key.hi as u32,
+            meta: id << 6 | key.len,
         };
     }
 
@@ -175,15 +176,14 @@ impl Dict {
         let mut i = probe.slot;
         loop {
             let slot = self.slots[i];
-            if slot.id == VACANT {
+            if slot.meta == VACANT {
                 return None;
             }
-            if slot.lo == key.lo && slot.hi == key.hi && slot.len == key.len {
-                // Keys hold 16 bytes; a longer token must also match the rest.
-                let len = key.len as usize;
-                let rest = probe.start + 16..probe.start + len;
-                if len <= 16 || token_eq(&data[rest], &self.text(slot.id)[16..]) {
-                    return Some(slot.id);
+            if slot.lo == key.lo && slot.hi == key.hi as u32 && slot.meta & 63 == key.len {
+                let (id, len) = (slot.meta >> 6, key.len as usize);
+                let rest = probe.start + INLINE..probe.start + len;
+                if len <= INLINE || token_eq(&data[rest], &self.text(id)[INLINE..]) {
+                    return Some(id);
                 }
             }
             i = (i + 1) & mask;

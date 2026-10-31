@@ -2,8 +2,8 @@
 
 use crate::dict::{token_eq, Dict, ALNUM};
 use crate::index::{Bits, Index, Set, WORDS};
-use crate::query::{Op, Step};
 use crate::simd::pair_mask;
+use crate::{Op, Step};
 
 /// count, sum of ids and the ten smallest ids of a set of documents (spec 4).
 #[derive(Clone, Copy, Default)]
@@ -53,19 +53,13 @@ impl Answer {
         if self.len == 10 && other.ten[0] > self.ten[9] {
             return; // the usual case: later batches only hold larger ids
         }
-        let (a, b) = (self.ten(), other.ten());
-        let (mut i, mut j, mut out, mut n) = (0, 0, [0; 10], 0);
-        while n < 10 && (i < a.len() || j < b.len()) {
-            if j == b.len() || (i < a.len() && a[i] < b[j]) {
-                out[n] = a[i];
-                i += 1;
-            } else {
-                out[n] = b[j];
-                j += 1;
-            }
-            n += 1;
-        }
-        (self.ten, self.len) = (out, n as u32);
+        let (n, m) = (self.len as usize, other.len as usize);
+        let mut all = [0; 20];
+        all[..n].copy_from_slice(self.ten());
+        all[n..n + m].copy_from_slice(other.ten());
+        all[..n + m].sort_unstable();
+        self.len = (n + m).min(10) as u32;
+        self.ten.copy_from_slice(&all[..10]);
     }
 }
 
