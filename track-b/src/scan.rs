@@ -55,11 +55,8 @@ pub struct Scanner<'a> {
     doc: Doc,
 }
 
-/// The document being scanned: number `local` in its segment, and the run of
-/// the region's tokens from `first`.
-#[derive(Default)]
+/// The document being scanned, as a run of the region's tokens from `first`.
 struct Doc {
-    local: u32,
     first: usize,
     /// The distinct BOOL terms so far: `fresh[..n_fresh]` (sized like `ids`).
     fresh: Vec<u32>,
@@ -74,8 +71,11 @@ impl<'a> Scanner<'a> {
     pub fn new(table: &'a Table, queries: &'a [u8], phrases: &'a [&'a Parsed]) -> Scanner<'a> {
         let seen = vec![0; table.ids() / 64 + 1]; // one more id: `Table::miss`
         let doc = Doc {
+            first: 0,
+            fresh: Vec::new(),
+            n_fresh: 0,
+            hits: Vec::new(),
             seen,
-            ..Doc::default()
         };
         let (buf, starts, ends, ids, lfs) = Default::default();
         Scanner {
@@ -92,8 +92,15 @@ impl<'a> Scanner<'a> {
     }
 
     /// Scans the lines that start in `docs.txt[from..to]`, numbering
-    /// documents from `first` (the id of the segment's first line).
-    pub fn scan(&mut self, file: &File, (from, to): (u64, u64), first: u32, out: &mut ChunkOut) {
+    /// documents from `segment_first` (the id of the segment's first line).
+    pub fn scan(
+        &mut self,
+        file: &File,
+        from: u64,
+        to: u64,
+        segment_first: u32,
+        out: &mut ChunkOut,
+    ) {
         out.streams.resize_with(PARTS, Vec::new);
         out.streams.iter_mut().for_each(Vec::clear);
         out.matches.clear();
@@ -102,7 +109,7 @@ impl<'a> Scanner<'a> {
         // file reads from `from - 1` and drops everything up to the first LF:
         // that is the end of the previous chunk's last line.
         let (mut off, mut len, mut skip) = (from.saturating_sub(1), 0, from > 0);
-        let mut known = false; // whether `doc.local` is set
+        let mut doc = None;
         loop {
             if self.buf.len() < len + PIECE + PAD {
                 self.buf.resize(len + PIECE + PAD, 0);
@@ -136,14 +143,13 @@ impl<'a> Scanner<'a> {
                 (lf.map_or(start, |i| start + i + 1), n == 0)
             };
             if end > start {
-                if !known {
+                let local = doc.get_or_insert_with(|| {
                     out.first = parse_id(&self.buf[start..end]);
-                    let local = out.first.checked_sub(first);
-                    self.doc.local =
-                        local.unwrap_or_else(|| fail("document ids are not ascending"));
-                    known = true;
-                }
-                self.region(start, end, out);
+                    out.first
+                        .checked_sub(segment_first)
+                        .unwrap_or_else(|| fail("document ids are not ascending"))
+                });
+                self.region(start, end, local, out);
             }
             if done {
                 return;
@@ -165,18 +171,21 @@ impl<'a> Scanner<'a> {
             // `flatten` writes up to 64 positions past the count.
             if self.starts.len() < tokens + 64 {
                 let n = 2 * self.starts.len() + 4096;
-                let doc = &mut self.doc;
                 for v in [
                     &mut self.starts,
                     &mut self.ends,
                     &mut self.ids,
-                    &mut doc.fresh,
+                    &mut self.doc.fresh,
                 ] {
                     v.resize(n, 0);
                 }
             }
             let (alnum, lf, tab) = classify(&self.buf[at..at + 64]);
-            let live = u64::MAX >> (64 - (end - at).min(64));
+            let live = if end - at >= 64 {
+                !0
+            } else {
+                (1u64 << (end - at)) - 1
+            };
             let (lf, tab) = (lf & live, tab & live);
             let id = prefix_xor(lf | tab) ^ in_id;
             in_id = ((id as i64) >> 63) as u64;
@@ -200,15 +209,21 @@ impl<'a> Scanner<'a> {
     }
 
     /// Tokenizes `buf[start..end]` (whole lines) and records each document.
-    fn region(&mut self, start: usize, end: usize, out: &mut ChunkOut) {
+    fn region(&mut self, start: usize, end: usize, local: &mut u32, out: &mut ChunkOut) {
         let (tokens, lines) = self.lex(start, end);
-        let (table, queries, phrases) = (self.table, self.queries, self.phrases);
-        let (buf, doc, lfs) = (&self.buf[..], &mut self.doc, &self.lfs[..lines]);
-        let (starts, ends, ids) = (
+        let (table, queries, phrases, buf, doc) = (
+            self.table,
+            self.queries,
+            self.phrases,
+            &self.buf[..],
+            &mut self.doc,
+        );
+        let (starts, ends, lfs) = (
             &self.starts[..tokens],
             &self.ends[..tokens],
-            &mut self.ids[..tokens],
+            &self.lfs[..lines],
         );
+        let ids = &mut self.ids[..tokens];
         doc.first = 0; // token indexes restart with each region
         let miss = table.miss();
         let mut keys = [(Key { lo: 0, w2: 0 }, 0); BATCH];
@@ -225,7 +240,7 @@ impl<'a> Scanner<'a> {
             for (j, ((&(key, slot), &s), &e)) in keys.iter().zip(b_starts).zip(b_ends).enumerate() {
                 let k = batch * BATCH + j;
                 while s > next_lf {
-                    doc.finish(&ids[..k], out, table, phrases);
+                    doc.finish(&ids[..k], local, out, table, phrases);
                     line += 1;
                     next_lf = lfs.get(line).copied().unwrap_or(u32::MAX);
                 }
@@ -237,7 +252,7 @@ impl<'a> Scanner<'a> {
             }
         }
         for _ in line..lines {
-            doc.finish(ids, out, table, phrases);
+            doc.finish(ids, local, out, table, phrases);
         }
     }
 }
@@ -260,15 +275,22 @@ impl Doc {
         }
     }
 
-    /// Ends the document, whose tokens end where `ids` ends: emits its
+    /// Ends document `local`, whose tokens end where `ids` ends: emits its
     /// BOOL terms and checks the phrases anchored at its tokens against the
     /// token sequence.
-    fn finish(&mut self, ids: &[u32], out: &mut ChunkOut, table: &Table, phrases: &[&Parsed]) {
-        if self.local >= MAX_SEGMENT_DOCS {
+    fn finish(
+        &mut self,
+        ids: &[u32],
+        local: &mut u32,
+        out: &mut ChunkOut,
+        table: &Table,
+        phrases: &[&Parsed],
+    ) {
+        if *local >= MAX_SEGMENT_DOCS {
             fail("a segment of docs.txt holds more than 65,536 documents");
         }
         for &term in &self.fresh[..self.n_fresh] {
-            out.streams[term as usize % PARTS].push((self.local << 16) | (term / PARTS as u32));
+            out.streams[term as usize % PARTS].push((*local << 16) | (term / PARTS as u32));
             self.seen[term as usize / 64] &= !(1 << (term % 64));
         }
         self.n_fresh = 0;
@@ -277,10 +299,13 @@ impl Doc {
         let found = out.matches.len();
         for &at in &self.hits {
             let at = at as usize - self.first;
-            let mut phrase = table.head(doc[at]);
+            let mut phrase =
+                table.heads[doc[at] as usize].load(std::sync::atomic::Ordering::Relaxed);
             while phrase != crate::query::NONE {
-                let p = phrases[(phrase >> RANGE_SHIFT) as usize];
-                let i = (phrase & ((1 << RANGE_SHIFT) - 1)) as usize;
+                let (p, i) = (
+                    phrases[(phrase >> RANGE_SHIFT) as usize],
+                    (phrase & ((1 << RANGE_SHIFT) - 1)) as usize,
+                );
                 let (terms, anchor) = (p.phrase(i), usize::from(p.anchor[i]));
                 let here = at >= anchor
                     && doc.len() - (at - anchor) >= terms.len()
@@ -293,7 +318,7 @@ impl Doc {
         }
         self.hits.clear();
         self.first = ids.len();
-        self.local += 1;
+        *local += 1;
         out.lines += 1;
     }
 }
@@ -358,7 +383,7 @@ fn flatten(mut bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
 }
 
 /// The decimal id at the start of a line, up to its TAB.
-pub fn parse_id(line: &[u8]) -> u32 {
+fn parse_id(line: &[u8]) -> u32 {
     let digits = line.iter().position(|&b| b == b'\t').unwrap_or(0);
     let id = std::str::from_utf8(&line[..digits])
         .ok()
