@@ -125,7 +125,9 @@ impl Names {
             key.iter().zip(slot).for_each(|(&w, s)| s.store(w, Relaxed));
         } else {
             let at = self.next_word.0.fetch_add(n.len.div_ceil(8), Relaxed);
-            words(b, n).zip(&self.arena[at..]).for_each(|(w, a)| a.store(w, Relaxed));
+            words(b, n)
+                .zip(&self.arena[at..])
+                .for_each(|(w, a)| a.store(w, Relaxed));
             slot[0].store(n.len as u64, Relaxed);
             slot[1].store(at as u64, Relaxed);
         }
@@ -161,12 +163,15 @@ fn key(b: &[u8], n: &Record) -> Key {
 
 /// A mask of the low `bytes` bytes of a word (all of it from 8 on).
 fn keep(bytes: usize) -> u64 {
-    u64::MAX.checked_shr(64 - 8 * bytes.min(8) as u32).unwrap_or(0)
+    u64::MAX
+        .checked_shr(64 - 8 * bytes.min(8) as u32)
+        .unwrap_or(0)
 }
 
-/// One multiply-xorshift round.
+/// One multiply-xorshift round; the multiplier is 2^64 / golden ratio.
 fn mix(x: u64) -> u64 {
-    let x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    let x = x.wrapping_mul(GOLDEN);
     x ^ x >> 29
 }
 

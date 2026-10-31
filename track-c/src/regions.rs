@@ -37,7 +37,10 @@ impl Regions {
             return Err("regions.csv: ids over 100,000,000 (the spec's are below 1,000,000)");
         }
         let ids = crate::map::zeroed(max / 8 + 1).map_err(|_| "out of memory")?;
-        let (codes, groups) = ((0..CODES).map(|_| AtomicU8::new(0)).collect(), Mutex::new(0));
+        let (codes, groups) = (
+            (0..CODES).map(|_| AtomicU8::new(0)).collect(),
+            Mutex::new(0),
+        );
         Ok(Regions { ids, codes, groups })
     }
 
