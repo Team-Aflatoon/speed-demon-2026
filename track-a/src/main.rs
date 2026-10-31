@@ -24,6 +24,10 @@ const SPAN_START: i64 = days_from_civil(2026, 10, 30) * 24 + 18;
 const IDS: usize = 1 << 11;
 /// Latencies below this are kept in the record, larger ones in the hour's side list.
 const MARK: u32 = 1 << 20;
+/// A record is `id << ID_SHIFT | 5xx << 20 | latency`: the latency (below MARK) fills
+/// bits 0 to 19, the 5xx flag bit 20 and the id (below IDS) bits 21 to 31.
+const ID_SHIFT: u32 = 21;
+const _: () = assert!(MARK == 1 << 20 && (IDS as u64) << ID_SHIFT == 1 << 32);
 /// Open-addressing slots of the endpoint table: a power of two, under a quarter full.
 const SLOTS: usize = 1 << 13;
 /// Records a worker reserves at a time in an hour's log: 4 KB, one page per worker.
@@ -79,13 +83,16 @@ fn run() -> io::Result<()> {
     let mut out = File::create(format!("{out_dir}/summary.txt"))?;
     if !Job::new(&input, true)?.run(&mut out)? {
         // A line came after its hour was reported: start over, reporting at the end.
-        (out.set_len(0)?, out.rewind()?);
+        out.set_len(0)?;
+        out.rewind()?;
         Job::new(&input, false)?.run(&mut out)?;
     }
     Ok(())
 }
 
 /// Reserves room for `len` atomics `T`, zeroed; pages cost nothing until first touched.
+/// The slice is `'static` only in name: it lives until the last worker unmaps it, at the
+/// end of `work`, and nothing uses it after that.
 fn reserve<T>(len: usize) -> io::Result<&'static [T]> {
     let (bytes, flags) = (len * size_of::<T>(), MAP_PRIVATE_ANONYMOUS_NORESERVE);
     // SAFETY: asks for a fresh mapping at an address of the kernel's choosing, so no
@@ -191,13 +198,17 @@ impl<'a> Job<'a> {
     fn new(input: &'a File, speculate: bool) -> io::Result<Job<'a>> {
         let (len, input) = (input.metadata()?.len() as usize, Some(input));
         // Room for every line of the file in any one hour (a line has at least 40
-        // bytes), plus each worker's last, partly used block.
-        let room = (len / 40 + 1 + WORKERS * BLOCK).next_multiple_of(1024);
+        // bytes), plus each worker's last, partly used block. A whole number of blocks
+        // keeps every hour's log (and side list) page-aligned, as madvise(DONTNEED) in
+        // `report` requires: an unaligned start fails with EINVAL and keeps the pages.
+        let room = (len / 40 + 1 + WORKERS * BLOCK).next_multiple_of(BLOCK);
         Ok(Job {
             input,
             len,
             pieces: len.div_ceil(PIECE),
-            rows: (0..len.div_ceil(PIECE)).map(|_| AtomicUsize::new(0)).collect(),
+            rows: (0..len.div_ceil(PIECE))
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
             speculate,
             room,
             logs: reserve(HOURS * room)?,
@@ -303,10 +314,12 @@ impl<'a> Job<'a> {
             // (shard 0 uploads each hour 5 to 10 minutes after it ends), though nothing
             // promises it.
             let frontier = plan.parsing.iter().fold(plan.next_piece, |a, &i| a.min(i));
-            let due = match frontier == self.pieces {
-                true => HOURS,
-                false if self.speculate => self.rows[frontier].load(Relaxed).saturating_sub(2),
-                false => 0,
+            let due = if frontier == self.pieces {
+                HOURS
+            } else if self.speculate {
+                self.rows[frontier].load(Relaxed).saturating_sub(2)
+            } else {
+                0
             };
             if plan.failure.is_some() || plan.next_hour == HOURS {
                 return Task::Stop;
@@ -329,9 +342,14 @@ impl<'a> Job<'a> {
     /// from the byte before it to the end of its last line, then SLACK zero bytes. Also
     /// notes the hour of its first line for the plan (one outside the span stays unknown).
     fn read(&self, i: usize, buf: &mut Vec<u8>) -> io::Result<Piece> {
-        let (at, end) = ((i * PIECE).saturating_sub(1), self.len.min((i + 1) * PIECE + MAX_LINE));
+        let (at, end) = (
+            (i * PIECE).saturating_sub(1),
+            self.len.min((i + 1) * PIECE + MAX_LINE),
+        );
         buf.resize(end - at + SLACK, 0);
-        self.input.expect("set by `new`").read_exact_at(&mut buf[..end - at], at as u64)?;
+        self.input
+            .expect("set by `new`")
+            .read_exact_at(&mut buf[..end - at], at as u64)?;
         buf[end - at..].fill(0);
         // A line starts after a newline, so the byte before the piece decides where its
         // first line starts, and the first newline from its last byte on where it stops.
@@ -340,9 +358,10 @@ impl<'a> Job<'a> {
             newline.map_or(end - at, |p| from + p + 1)
         };
         let from = if i == 0 { 0 } else { after_newline(0) };
-        let to = match (i + 1) * PIECE < self.len {
-            true => after_newline((i + 1) * PIECE - 1 - at),
-            false => end - at,
+        let to = if (i + 1) * PIECE < self.len {
+            after_newline((i + 1) * PIECE - 1 - at)
+        } else {
+            end - at
         };
         let row = hour_row(&buf[from..from + 13]).map_or(0, |row| row + 1);
         self.rows[i].store(row, Relaxed);
@@ -362,7 +381,7 @@ impl<'a> Job<'a> {
         records().for_each(|(r, _)| tally[(r >> 20) as usize] += 1);
         let counts: [u64; IDS] = std::array::from_fn(|id| {
             let (ok, errors) = (tally[2 * id] as u64, tally[2 * id + 1] as u64);
-            ok + errors | errors << 32
+            (ok + errors) | (errors << 32)
         });
         let seen = counts[1..].iter().map(|&c| c as u32 as usize).sum();
         h.reported.store(seen, Relaxed);
@@ -376,7 +395,7 @@ impl<'a> Job<'a> {
         // Scatter pass: every latency into its endpoint's slice. A record written after
         // the count pass (the hour was not complete) may find no room; the counts catch it.
         records().for_each(|(r, latency)| {
-            let next = &mut next[(r >> 21) as usize];
+            let next = &mut next[(r >> ID_SHIFT) as usize];
             if let Some(slot) = sorted.get_mut(*next as usize) {
                 *slot = latency;
             }
@@ -473,7 +492,8 @@ impl<'a> Job<'a> {
                 // The endpoint starts after the space that ends the method (which follows
                 // the 27-byte timestamp and its space), and ends before the status.
                 let name = start + 29 + spaces(p.add(start + 28)).trailing_zeros() as usize;
-                let record = ENDPOINTS.id(p.add(name), status - 1 - name)? << 21 | error << 20;
+                let id = ENDPOINTS.id(p.add(name), status - 1 - name)?;
+                let record = (id << ID_SHIFT) | (error << 20);
                 // SAFETY (both stores): `used` and `big` never pass the hour's room (see
                 // `Job::new`), and hand each slot to one worker.
                 if latency < MARK {
@@ -526,7 +546,8 @@ fn put_line(text: &mut Vec<u8>, stamp: &[u8; 32], id: u16, v: &mut [u32], counts
 
 /// Nearest-rank p50, p95 and p99 of a non-empty group, reordering it.
 fn percentiles(v: &mut [u32]) -> [u32; 3] {
-    let rank = |p: usize| (p * v.len() + 99) / 100 - 1;
+    // Nearest rank: the 1-indexed rank ceil(p * n / 100), the spec's (p * n + 99) div 100.
+    let rank = |p: usize| (p * v.len()).div_ceil(100) - 1;
     let [r50, r95, r99] = [rank(50), rank(95), rank(99)];
     if v.len() <= 32 {
         v.sort_unstable();
@@ -566,11 +587,11 @@ fn eight_digits(v: u32) -> u64 {
     // SWAR: split into 4-digit halves in two 32-bit lanes, each into 2-digit quarters in
     // 16-bit lanes, each into digits in bytes. Division by 100 and by 10 are multiplies
     // and shifts that are exact for these ranges, and no lane overflows into the next.
-    let x = ((v % 10_000) as u64) << 32 | (v / 10_000) as u64;
-    let hundreds = (x * 10_486 >> 20) & 0x7F_0000_007F;
-    let x = (x - hundreds * 100) << 16 | hundreds;
-    let tens = (x * 103 >> 10) & 0x000F_000F_000F_000F;
-    (x - tens * 10) << 8 | tens
+    let x = (((v % 10_000) as u64) << 32) | (v / 10_000) as u64;
+    let hundreds = ((x * 10_486) >> 20) & 0x7F_0000_007F;
+    let x = ((x - hundreds * 100) << 16) | hundreds;
+    let tens = ((x * 103) >> 10) & 0x000F_000F_000F_000F;
+    ((x - tens * 10) << 8) | tens
 }
 
 /// The newlines of the 64 bytes at `p`, as a bitmask.
@@ -657,7 +678,10 @@ impl Name {
     unsafe fn is(&self, p: *const u8, len: usize) -> bool {
         // `b` is taken from the whole struct: the last block also covers `len`, masked off.
         let eq = |at: usize| {
-            let (a, b) = (p.add(at).cast(), (self as *const Name).cast::<u8>().add(at).cast());
+            let (a, b) = (
+                p.add(at).cast(),
+                (self as *const Name).cast::<u8>().add(at).cast(),
+            );
             let eq = _mm256_cmpeq_epi8(_mm256_loadu_si256(a), _mm256_loadu_si256(b));
             _mm256_movemask_epi8(eq) as u32 as u64
         };
@@ -713,7 +737,8 @@ impl Endpoints {
         let head = p.cast::<u64>().read_unaligned() << cut;
         let tail = p.add(len).sub(8).cast::<u64>().read_unaligned() >> cut;
         let hash = (head ^ tail.rotate_left(31) ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut i = (hash >> 51) as usize;
+        // The top bits of the product index the slots.
+        let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
             match self.slots[i % SLOTS].load(Acquire) {
                 0 => return self.insert(p, len, i),
@@ -723,6 +748,11 @@ impl Endpoints {
         }
     }
 
+    /// Adds the `len`-byte endpoint at `p`, which slot `i` of its probe found empty,
+    /// unless another worker added it meanwhile; returns its id either way.
+    ///
+    /// # Safety
+    /// As for `id`: 128 bytes at `p` must be readable.
     #[cold]
     unsafe fn insert(&self, p: *const u8, len: usize, mut i: usize) -> io::Result<u32> {
         let mut count = lock(&self.count);

@@ -86,10 +86,16 @@ frees its read buffer after one of the last pieces, and the last worker to finis
 the logs, page tables included, before the final hours are written.
 
 **Errors.** An I/O failure, a timestamp outside the 72-hour span, or more than 2,047
-distinct endpoints goes to stderr with exit code 1. `unsafe` is confined to the system
-calls, the reserved logs, the SIMD intrinsics (AVX2, BMI2 and SSE4.1 come from
-`target-cpu=x86-64-v3` in `.cargo/config.toml`) and the output writer; each block says why
-it is sound.
+distinct endpoints (or one over 126 bytes) goes to stderr with exit code 1.
+
+**Unsafe code.** It is used for: the system calls; the reserved logs (handed out as
+slices, written through raw pointers, unmapped at the end); the parser's raw reads of
+the read buffer, which skip bounds checks because every line is followed by at least
+256 readable bytes; the SIMD intrinsics (AVX2, BMI2 and SSE4.1 come from
+`target-cpu=x86-64-v3` in `.cargo/config.toml`); the endpoint table, whose names sit in
+`UnsafeCell`s behind an `unsafe impl Sync` (each is written once, under a lock, before
+its id is published); and the output writer, which formats into reserved capacity. Each
+`unsafe` block or function says why it is sound.
 
 ## Dependencies
 
