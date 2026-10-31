@@ -24,12 +24,12 @@ mod query;
 mod scan;
 
 use index::{Answer, Evaluator, Part, PARTS};
-use query::{distinct, Parsed, Table, MAX_QUERY_BYTES, PHRASE, RANGE_SHIFT, SKETCH_BITS};
+use query::{Parsed, Setup, Table, MAX_QUERY_BYTES, PHRASE, QUERY_PAD, RANGE_SHIFT};
 use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 const MAX_THREADS: usize = 12;
 const SEGMENT_BYTES: u64 = 8 << 20;
@@ -111,18 +111,14 @@ fn run(data: &str, out_dir: &str) {
     if queries.len() >= MAX_QUERY_BYTES {
         fail("queries.txt is larger than 1 GB");
     }
-    queries.extend_from_slice(&[0; 16]); // keys read 12 bytes from a term's start
+    queries.extend_from_slice(&[0; QUERY_PAD]);
     let queries = &queries[..];
-    let text_len = queries.len() - 16;
     let file =
         File::open(format!("{data}/docs.txt")).unwrap_or_else(|e| fail(&format!("docs.txt: {e}")));
     let segments = plan(&file);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS);
-    let ranges: Vec<usize> = (0..=threads)
-        .map(|i| line_start(&queries[..text_len], text_len * i / threads))
-        .collect();
     let (n, max_chunks) = (segments.len(), segments.iter().map(|s| s.chunks).max());
     let shared = Shared {
         file: &file,
@@ -139,57 +135,18 @@ fn run(data: &str, out_dir: &str) {
         evaluated: many(n),
         segments,
     };
-    let words = AtomicUsize::new(0);
-    let sketches: Vec<Mutex<Vec<u64>>> = many(threads);
-    // The table sized from the estimate, and the one sized for every word to
-    // be distinct, used only if an insert into the first ran out of probes.
-    let (table, fallback, overflow) = (OnceLock::new(), OnceLock::new(), AtomicBool::new(false));
-    let parsed: Vec<OnceLock<Parsed>> = (0..threads).map(|_| OnceLock::new()).collect();
-    let barrier = Barrier::new(threads);
+    let setup = Setup::new(queries, threads);
+    let parsed: Vec<OnceLock<Parsed>> = many(threads);
     std::thread::scope(|s| {
         for i in 0..threads {
-            let (shared, words, table, parsed, barrier, ranges) =
-                (&shared, &words, &table, &parsed, &barrier, &ranges);
-            let (sketches, fallback, overflow) = (&sketches, &fallback, &overflow);
+            let (shared, setup, parsed) = (&shared, &setup, &parsed);
             s.spawn(move || {
-                // Parse in parallel, size the table, insert in parallel, then anchor.
-                let mut mine = Parsed::parse(queries, ranges[i], ranges[i + 1]);
-                words.fetch_add(mine.word_count(), Relaxed);
-                *sketches[i].lock().unwrap() = std::mem::take(&mut mine.sketch);
-                if barrier.wait().is_leader() {
-                    let mut sketch = vec![0; SKETCH_BITS / 64];
-                    for part in sketches {
-                        let part = part.lock().unwrap();
-                        sketch
-                            .iter_mut()
-                            .zip(part.iter())
-                            .for_each(|(a, b)| *a |= b);
-                    }
-                    let estimate = Some(distinct(&sketch));
-                    let _ = table.set(Table::new(words.load(Relaxed), estimate, threads));
-                }
-                barrier.wait();
-                let mut table = table.get().unwrap();
-                if !mine.insert(table, queries) {
-                    overflow.store(true, Relaxed);
-                }
-                barrier.wait();
-                if overflow.load(Relaxed) {
-                    if barrier.wait().is_leader() {
-                        let _ = fallback.set(Table::new(words.load(Relaxed), None, threads));
-                    }
-                    barrier.wait();
-                    table = fallback.get().unwrap();
-                    let inserted = mine.insert(table, queries);
-                    assert!(inserted, "a table with free slots takes every word");
-                    barrier.wait();
-                }
-                mine.choose_anchors(table, i);
+                let (mine, table) = setup.run(i);
                 *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
                 *shared.phrase_answers[i].lock().unwrap() =
                     vec![Answer::default(); mine.term_ends.len()];
                 let _ = parsed[i].set(mine);
-                barrier.wait();
+                setup.wait();
                 let parsed: Vec<&Parsed> = parsed.iter().map(|p| p.get().unwrap()).collect();
                 work(shared, table, queries, &parsed);
             });
@@ -294,17 +251,6 @@ fn next_line(file: &File, len: u64, at: u64) -> u64 {
         pos += n as u64;
     }
     len
-}
-
-/// The first line start of `text` at or after `at`.
-fn line_start(text: &[u8], at: usize) -> usize {
-    match at {
-        0 => 0,
-        _ => text[at - 1..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(text.len(), |i| at + i),
-    }
 }
 
 /// The task queue: see the module comment.

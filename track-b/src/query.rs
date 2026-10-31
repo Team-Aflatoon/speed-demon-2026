@@ -3,7 +3,8 @@
 //! each phrase given an anchor term at which the scan will check it.
 
 use crate::fail;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::{Barrier, OnceLock};
 
 pub const NONE: u32 = u32::MAX;
 /// Slot flags: the term is in a BOOL query (the scan records its documents),
@@ -27,6 +28,8 @@ const ID_SHIFT: u32 = 38;
 const ID_MASK: u32 = (1 << 24) - 1;
 /// Term offsets in `queries.txt` are kept as u32.
 pub const MAX_QUERY_BYTES: usize = 1 << 30;
+/// Zero bytes after `queries.txt`, so a key can read 12 bytes from any term.
+pub const QUERY_PAD: usize = 16;
 /// Query frequencies only need to tell rare from common, so they saturate
 /// here; 12 racing increments past the check cannot wrap a u8.
 const FREQ_CAP: u8 = 200;
@@ -67,58 +70,24 @@ impl Key {
 
 /// Open addressing with linear probing; a slot is `[lo, w2]`. Inserts claim a
 /// slot with a CAS on `lo`, so all threads insert at once; after the parse the
-/// table is only read. Term ids are dense: each thread hands them out from its
-/// own block of `ID_BLOCK`, so ids cost no shared counter per term.
+/// table is only read. It has room for every query word to be a distinct term
+/// at a load of at most 3/4, so it can never fill up. Term ids are dense:
+/// each thread hands them out from its own block of `ID_BLOCK`, so ids cost
+/// no shared counter per term.
 pub struct Table {
-    slots: Box<[[AtomicU64; 2]]>,
+    slots: Vec<[AtomicU64; 2]>,
     pub mask: usize,
-    /// Slots an insert may probe before it gives up (see `Table::new`).
-    limit: usize,
     next_block: AtomicU32,
     /// Per term id: where the term starts in `queries.txt` (for long terms).
-    text_at: Box<[AtomicU32]>,
+    text_at: Vec<AtomicU32>,
     /// Per term id: a saturating count of its query words, for choosing anchors.
-    freq: Box<[AtomicU8]>,
-    /// Per term id: 1 + the first phrase anchored at it (0 for none), linked
-    /// on through `Parsed::next`.
-    heads: Box<[AtomicU32]>,
-}
-
-/// Atomics whose all-zero bytes are the value 0.
-///
-/// # Safety
-/// Only for types with that property.
-unsafe trait Zeroable {}
-// SAFETY: atomic integers have the in-memory representation of their integer.
-unsafe impl Zeroable for AtomicU8 {}
-// SAFETY: as above.
-unsafe impl Zeroable for AtomicU32 {}
-// SAFETY: as above, for an array of them.
-unsafe impl Zeroable for [AtomicU64; 2] {}
-
-/// `n` zeros from memory the allocator hands out already zeroed (`calloc`):
-/// nothing is written up front, and each page is first touched (and faulted
-/// in) by whichever thread inserts there, instead of all by one thread.
-fn zeroed<T: Zeroable>(n: usize) -> Box<[T]> {
-    // SAFETY: `T: Zeroable`, so all-zero memory is a valid `[T]`.
-    unsafe { Box::new_zeroed_slice(n).assume_init() }
-}
-
-/// Bits in each thread's sketch of its words, for estimating the number of
-/// distinct terms (linear counting) before the table is sized.
-pub const SKETCH_BITS: usize = 1 << 17;
-
-/// Linear counting: about how many distinct terms set the bits of `sketch`.
-pub fn distinct(sketch: &[u64]) -> usize {
-    let m = (sketch.len() * 64) as f64;
-    let zeros = sketch.iter().map(|w| w.count_zeros()).sum::<u32>().max(1);
-    (m * (m / f64::from(zeros)).ln()) as usize
+    freq: Vec<AtomicU8>,
+    /// Per term id: the first phrase anchored at it, linked on through
+    /// `Parsed::next`.
+    heads: Vec<AtomicU32>,
 }
 
 const ID_BLOCK: u32 = 1024;
-/// Probes an insert into an estimated table may make. At a load of at most
-/// 2/3 linear probing almost never needs a tenth of this.
-const PROBE_LIMIT: usize = 64;
 /// Inserts prefetch the slot of the word this many places ahead.
 const INSERT_AHEAD: usize = 8;
 
@@ -129,37 +98,29 @@ pub struct Ids {
 }
 
 impl Table {
-    /// A table for the terms of `words` query words, and ids for all of them
-    /// from `threads` threads. With an `estimate` of the distinct terms it has
-    /// room for 3 times that many and an insert gives up after
-    /// `PROBE_LIMIT` slots: an estimate that falls short can only make the
-    /// inserts fail, never loop. Without one it has room for every word to be
-    /// distinct at a load of at most 3/4, so it always has free slots, and an
-    /// insert may probe the whole table: it always succeeds.
-    pub fn new(words: usize, estimate: Option<usize>, threads: usize) -> Table {
-        let room = estimate.map_or(words * 4 / 3, |e| e.min(words) * 3);
-        let n = room.next_power_of_two().max(1 << 10);
-        let limit = if estimate.is_some() { PROBE_LIMIT } else { n };
+    /// Room for the terms of `words` query words, and ids for all of them from
+    /// `threads` threads.
+    pub fn new(words: usize, threads: usize) -> Table {
+        let n = (words * 4 / 3).next_power_of_two().max(1 << 10);
         let ids = words + threads * ID_BLOCK as usize;
         // A partition-local term number (id / 64) must fit in 16 bits.
         if ids > 1 << 22 {
             fail("too many query words");
         }
         Table {
-            slots: zeroed(n),
+            slots: (0..n).map(|_| Default::default()).collect(),
             mask: n - 1,
-            limit,
             next_block: AtomicU32::new(0),
-            text_at: zeroed(ids),
-            freq: zeroed(ids),
-            heads: zeroed(ids),
+            text_at: (0..ids).map(|_| AtomicU32::new(0)).collect(),
+            freq: (0..ids).map(|_| AtomicU8::new(0)).collect(),
+            heads: (0..ids).map(|_| AtomicU32::new(NONE)).collect(),
         }
     }
 
     /// The first phrase anchored at term `id`, or `NONE`.
     #[inline]
     pub fn head(&self, id: u32) -> u32 {
-        self.heads[id as usize].load(Relaxed).wrapping_sub(1)
+        self.heads[id as usize].load(Relaxed)
     }
 
     /// One past the largest term id handed out.
@@ -218,12 +179,11 @@ impl Table {
         }
     }
 
-    /// The id and slot of the term `text[at..at + len]`, claiming both if it is
-    /// new; `None` if it found neither within `limit` slots.
-    fn insert(&self, text: &[u8], at: usize, len: usize, ids: &mut Ids) -> Option<(u32, usize)> {
+    /// The id and slot of the term `text[at..at + len]`, claiming both if it is new.
+    fn insert(&self, text: &[u8], at: usize, len: usize, ids: &mut Ids) -> (u32, usize) {
         let key = Key::new(text, at, len);
         let mut i = key.hash() & self.mask;
-        for _ in 0..self.limit {
+        for _ in 0..self.slots.len() {
             let slot = &self.slots[i];
             let mut lo = slot[0].load(Acquire);
             if lo == 0 {
@@ -237,7 +197,7 @@ impl Table {
                         ids.next += 1;
                         self.text_at[id as usize].store(at as u32, Relaxed);
                         slot[1].store(key.w2 | u64::from(id) << ID_SHIFT, Release);
-                        return Some((id, i));
+                        return (id, i);
                     }
                     Err(now) => lo = now,
                 }
@@ -254,12 +214,12 @@ impl Table {
                 if w2 & KEY_BITS == key.w2
                     && (len <= INLINE || self.tail_eq(&text[at..at + len], id, text))
                 {
-                    return Some((id, i));
+                    return (id, i);
                 }
             }
             i = (i + 1) & self.mask;
         }
-        None
+        unreachable!("a table with room for every word has a free slot")
     }
 
     fn flag(&self, i: usize, flag: u64) {
@@ -305,8 +265,6 @@ pub struct Parsed {
     phrase_words: Vec<(u32, u8)>,
     /// Table slots of the phrase terms, until anchors are chosen.
     slots: Vec<u32>,
-    /// A bit per word hash, for `distinct`.
-    pub sketch: Vec<u64>,
 }
 
 /// A phrase is named across ranges by `range << 28 | index`.
@@ -330,10 +288,7 @@ impl Parsed {
     /// Parses the lines of `text[from..to]` (a whole number of lines). Term
     /// ids are filled in by `insert`.
     pub fn parse(text: &[u8], from: usize, to: usize) -> Parsed {
-        let mut p = Parsed {
-            sketch: vec![0; SKETCH_BITS / 64],
-            ..Parsed::default()
-        };
+        let mut p = Parsed::default();
         for line in text[from..to]
             .split(|&b| b == b'\n')
             .filter(|l| !l.is_empty())
@@ -348,14 +303,11 @@ impl Parsed {
 
     fn line(&mut self, line: &[u8], text: &[u8]) -> Option<()> {
         // Words are recorded by their offset in `text`, which they are slices of.
-        let sketch = &mut self.sketch;
-        let mut word = |w: &[u8]| {
+        let word = |w: &[u8]| {
             let ok = (1..=32).contains(&w.len())
                 && w.iter()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
             let at = w.as_ptr() as usize - text.as_ptr() as usize;
-            let bit = Key::new(text, at, w.len()).hash() >> 40 & (SKETCH_BITS - 1);
-            sketch[bit / 64] |= 1 << (bit % 64);
             ok.then_some((at as u32, w.len() as u8))
         };
         if let Some(rest) = line.strip_prefix(b"BOOL ") {
@@ -395,40 +347,32 @@ impl Parsed {
 
     /// Puts every word into the table, turning steps and phrase terms into
     /// term ids, counts how often each term occurs and flags BOOL terms.
-    /// Returns false, having stopped, if an insert ran out of probes; it can
-    /// then be run again into another table.
-    pub fn insert(&mut self, table: &Table, text: &[u8]) -> bool {
+    pub fn insert(&mut self, table: &Table, text: &[u8]) {
         let mut ids = Ids { next: 0, end: 0 };
         let mut insert = |(at, len): (u32, u8)| {
-            let (id, slot) = table.insert(text, at as usize, len as usize, &mut ids)?;
+            let (id, slot) = table.insert(text, at as usize, len as usize, &mut ids);
             if table.freq[id as usize].load(Relaxed) < FREQ_CAP {
                 table.freq[id as usize].fetch_add(1, Relaxed);
             }
-            Some((id, slot))
+            (id, slot)
         };
         let ahead = |words: &[(u32, u8)], k: usize| {
             if let Some(&(at, len)) = words.get(k + INSERT_AHEAD) {
                 table.prefetch(table.slot(Key::new(text, at as usize, len as usize)));
             }
         };
-        self.slots.clear();
         for (k, (step, &word)) in self.steps.iter_mut().zip(&self.bool_words).enumerate() {
             ahead(&self.bool_words, k);
-            let Some((id, slot)) = insert(word) else {
-                return false;
-            };
+            let (id, slot) = insert(word);
             table.flag(slot, BOOL_TERM);
-            *step = (*step >> SLOT_BITS << SLOT_BITS) | id;
+            *step |= id;
         }
         for (k, (term, &word)) in self.terms.iter_mut().zip(&self.phrase_words).enumerate() {
             ahead(&self.phrase_words, k);
-            let Some((id, slot)) = insert(word) else {
-                return false;
-            };
+            let (id, slot) = insert(word);
             *term = id;
             self.slots.push(slot as u32);
         }
-        true
     }
 
     /// Anchors each phrase at its term with the fewest occurrences in the
@@ -450,9 +394,70 @@ impl Parsed {
             table.flag(slot as usize, ANCHOR);
             self.anchor.push(a as u8);
             let phrase = (range as u32) << RANGE_SHIFT | i as u32;
-            let previous = table.heads[term as usize].swap(phrase + 1, AcqRel);
-            self.next.push(previous.wrapping_sub(1)); // 0, no phrase, becomes NONE
+            self.next
+                .push(table.heads[term as usize].swap(phrase, AcqRel));
         }
         (self.slots, self.bool_words, self.phrase_words) = Default::default();
+    }
+}
+
+/// The query side's start-up, run by every thread at once: parse a range of
+/// `queries.txt`, fill the shared term table, choose the phrase anchors.
+pub struct Setup<'a> {
+    /// `queries.txt` and `QUERY_PAD` zero bytes.
+    text: &'a [u8],
+    /// Thread `i` parses the lines in `text[ranges[i]..ranges[i + 1]]`.
+    ranges: Vec<usize>,
+    barrier: Barrier,
+    words: AtomicUsize,
+    table: OnceLock<Table>,
+}
+
+impl<'a> Setup<'a> {
+    pub fn new(text: &'a [u8], threads: usize) -> Setup<'a> {
+        let len = text.len() - QUERY_PAD;
+        let ranges = (0..=threads).map(|i| line_start(&text[..len], len * i / threads));
+        Setup {
+            text,
+            ranges: ranges.collect(),
+            barrier: Barrier::new(threads),
+            words: AtomicUsize::new(0),
+            table: OnceLock::new(),
+        }
+    }
+
+    /// Waits for every thread.
+    pub fn wait(&self) {
+        self.barrier.wait();
+    }
+
+    /// Thread `i`'s share of the start-up: its queries, and the finished
+    /// table. The table is sized once every thread has counted its words.
+    pub fn run(&self, i: usize) -> (Parsed, &Table) {
+        let mut mine = Parsed::parse(self.text, self.ranges[i], self.ranges[i + 1]);
+        self.words.fetch_add(mine.word_count(), Relaxed);
+        if self.barrier.wait().is_leader() {
+            let threads = self.ranges.len() - 1;
+            let _ = self
+                .table
+                .set(Table::new(self.words.load(Relaxed), threads));
+        }
+        self.wait();
+        let table = self.table.get().unwrap();
+        mine.insert(table, self.text);
+        self.wait(); // anchors read every thread's counts
+        mine.choose_anchors(table, i);
+        (mine, table)
+    }
+}
+
+/// The first line start of `text` at or after `at`.
+fn line_start(text: &[u8], at: usize) -> usize {
+    match at {
+        0 => 0,
+        _ => text[at - 1..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |i| at + i),
     }
 }

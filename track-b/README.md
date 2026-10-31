@@ -12,7 +12,8 @@ into one open-addressing hash table at the same time: a thread claims an empty s
 compare-and-swap on its first word, so no locks are needed. A slot is 16 bytes: the first
 12 bytes of the term inline, its length, a dense term id and two flags (the term appears in a
 BOOL query; the term anchors a phrase). Ids come from per-thread blocks of 1,024, so handing
-them out costs no shared counter per term.
+them out costs no shared counter per term. The table has room for every query word to be a
+distinct term at a load of at most 3/4, so it can never fill up, whatever the input.
 
 **Phrases need no index.** Every phrase gets one anchor term: the one that occurs least often
 in `queries.txt`, the longest on a tie. Common words appear in many queries and rare words in
@@ -65,11 +66,13 @@ build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`) and refuses to compile 
 
 ## With another 24 hours
 
-- The query parse runs before the scan can start and takes about 6 ms of wall time, most of
-  it in table inserts that miss the cache one after another. Prefetching a few words ahead and
-  allocating the table lazily should halve it.
-- About 40% of the scan's CPU time is the table lookup itself. A smaller table, or a
-  separate small table for the few hundred hottest words, would keep more lookups in L2 on the
-  scoring box, whose L2 is smaller than our laptops'.
-- Writing the BOOL postings costs about 4 ns per (term, document) pair; fewer, larger writes
-  per document should make that cheaper.
+- The query parse runs before the scan can start and takes about 6 ms of wall time. Its
+  inserts already prefetch ahead and its memory is allocated lazily; what is left are four
+  barriers and twelve threads faulting in fresh pages. Letting the first scan tasks start on the
+  corpus bytes (which need no table) while the table is filled would hide most of it.
+- About 40% of the scan's CPU time is the table lookup itself. Halving the table changed nothing
+  on the board, so the lookups are bound by their own work (hashing, compares, branches), not
+  by where the table lives.
+- Writing the BOOL postings costs about 4 ns per (term, document) pair. The commonest terms make
+  up about a third of the pairs and end up as bitmaps anyway, so the scan could set their bits
+  directly and skip their postings and their counting sort.

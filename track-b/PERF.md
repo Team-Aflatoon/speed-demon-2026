@@ -24,6 +24,8 @@ per step. Compare a step's A/B with its parent, not its local T with another row
 | 9 | Dense bits written into a one-word-per-term stripe for the current 64 documents and flushed into the bitmaps every 64 documents, instead of into a full transposed copy of every bitmap. It stays as L1-friendly as step 4, drops a ~770 KB buffer per thread and the per-batch transpose. A/B: M 38.7 vs 50.9 MiB, 194 vs 202 ms median, CPU 1,956 vs 1,897 ms (within noise). M is now under the 44 MB cap of the memory axis. | | 0.19 (local) | 40 (local) | |
 | 10 | Line count, no behaviour change: `query.rs` folded into `main.rs`, `Answer::merge` reduced to a sort of at most 20 ids. S 1,013 to 1,006. **This is v3.** | run-d53081aa4120 (reruns run-4f979d5ac144: 0.3021 s, 39.7 MB; run-a5f9c82b0e45: 0.3070 s) | 0.3035 | 39.1 | ≈ 65.9 (computed) |
 | 11 | Clean-room redesign, built separately and adopted whole (see "v4" below): phrases checked during the scan against each document's token ids, so they need no index; postings built once per 8 MB segment by partition instead of a throwaway index per 4,096 documents; BOOL queries answered once per segment instead of once per batch; corpus read with `pread`; parallel query parse into a lock-free table. Head-to-head on the board: T 184.3 vs ~302 ms, K 25.45 vs 20.87. S rose from 993 to 1,364. **This is v4.** | run-64a666bd15fb | 0.1843 | 35.8 | |
+| 12 | Provable safety for any valid input (see "v4.1" below): the term table is sized from a distinct-term estimate but falls back to a table with room for every word when an insert runs out of probes, so it can no longer fill up; segments are bisected so that none holds more than 65,536 documents. Also: inserts prefetch 8 words ahead, the table comes from `calloc`ed memory, and S fell from 1,364 to 1,347. Board: K 25.26, within noise of v4. A/B on the board with a table half the size (run-0778bc8cbf5f: 0.1932 s, 35.3 MB, K 25.09): also within noise. **This is v4.1.** | run-1ca61642aede | 0.1906 | 37.0 | |
+| 13 | Clarity: v4.1's distinct-term estimate, probe limit and fallback table are dropped. The board showed table size is not a lever, and on seed 1 the estimate produced the same 262,144-slot table as sizing for every query word to be distinct, which needs no fallback because it can never fill up. Query start-up moved into `query::Setup`. S 1,347 → 1,317 | | | | |
 
 **What the board says.** Board T stayed at 302-316 ms from v1 to v3: the local gains of
 steps 5-10 (a few percent each in A/B) are within the board's run-to-run spread. The board win
@@ -161,6 +163,37 @@ table lookups 766, + per-document recording 870, + writing the postings 960.
 - `_MM_HINT_T1` instead of `_MM_HINT_T0`: worse.
 - Union-to-bitmap thresholds of 1/32, 1/64 and 1/128 of the documents instead of 1/16: the
   same.
+- **Term table size, on the board.** Two v4.1 builds that differ only in the table: room for 1.5
+  times the estimated distinct terms (2 MB, load 0.58; run-0778bc8cbf5f, 193.2 ms, 35.3 MB) and
+  3 times (4 MB, load 0.29; run-1ca61642aede, 190.6 ms, 37.0 MB). Both are within the board's
+  noise of v4 (184.3 ms). The halved table did not help even on the box's 1.25 MB L2, so the
+  lookups are not limited by where the table lives; v4.1 keeps the 4 MB table.
+- A lookup that settles its first slot with one branch (match or empty) and probes further only
+  on a collision: no change in pinned single-thread runs (1,125-1,198 vs 1,080-1,262 ms).
+  Reverted.
+
+### v4.1: provable safety
+
+A fixed capacity that only real data cannot exceed is still a failure the holdout could trip,
+and a failed run scores zero. Two of v4's could, in principle, end the run on a valid input:
+
+1. **The term table.** The table must not fill up. Sizing it for every query word to be distinct
+   always works (that is v4), but a table sized from an estimate of the distinct terms (linear
+   counting over a 2^17-bit sketch per thread, accurate to well under 1% at this size) is only
+   *almost* always big enough. v4.1 does both: the first table comes from the estimate, every
+   insert into it gives up after 64 probes, and if any insert gives up all threads redo the
+   inserts into a table with room for every word at a load of at most 3/4. That table always has
+   free slots, so its inserts may sweep it whole and always succeed. On the generated data the
+   fallback never runs; tests force it.
+2. **Documents per segment.** Documents are numbered from 0 in each segment as `u16`, and v4's
+   segments were plain 8 MB byte ranges: one would overflow if its documents averaged under
+   128 bytes (the generator's average about 1 KB). v4.1 reads the last line's id to get the
+   document count, and bisects any segment holding more than 65,536 documents.
+
+Every other fixed capacity was checked against the input format: a phrase has at most 8 terms
+(an anchor position is a byte), 50,000 queries hold at most 400,000 words (ids have 22 bits),
+term offsets in `queries.txt` are 32-bit, and tokens longer than 63 bytes are clamped to a
+length that no term has. Everything else grows as needed.
 
 ### Correctness checks
 
@@ -171,6 +204,10 @@ bytes, a line longer than a read buffer, op words as terms and NOT emptying a se
 also pass with a stress build whose read buffer, chunk and segment are 1 KB, 4 KB and 64 KB,
 which exercises every boundary path. Fuzzing found one bug before submission: two threads
 failing on malformed queries could both call `exit` and hang; only the first now reports.
+For v4.1, two more builds force the safety paths: one pins the distinct-term estimate to 1 (a
+1,024-slot first table, so the fallback always runs) and is byte-identical on seeds 1 and 7 and
+passes all 23 cases; one caps segments at 100 documents (so every segment is bisected) and passes
+all 23 cases.
 
 ### Lessons (v4)
 
