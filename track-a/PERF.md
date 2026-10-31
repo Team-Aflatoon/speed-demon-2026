@@ -131,12 +131,96 @@ and each row gives the evidence. The box is about 2x slower than this laptop per
   about 7 ms with 12 threads here (memory bandwidth), so a second pass costs more than
   any layout could save.
 
-## What the counters say now
+## What the counters said at v5
 
 cachegrind on v5: 1,099M instructions (355 a line) and 2.9M mispredicted branches, about
 two thirds in the ingest loop and one third in the report. The single-core profile puts
 about half of the ingest loop's samples on the newline scan's loads, i.e. waiting for
 the input to stream in; a bare scan of the 239 MB takes about 7 ms on 12 threads here.
 On the box, v3 to v5 have all landed at about 32 ms whatever their local CPU gains,
-within its �30% run-to-run noise: the next real step has to cut the work per line by
+within its ±30% run-to-run noise: the next real step has to cut the work per line by
 something like half, not by percents.
+
+## v7: a clean-room redesign
+
+Steps 1 to 31 had plateaued: v3 to v6 all landed at about 32 ms on the box whatever their
+local gains. Two box probes (builds that deliberately fail the hash, so the board records
+T and M but scores nothing) showed where those 32 ms went:
+
+| Probe | What it runs | Run ID | T (s) |
+|---|---|---|---|
+| Read floor | mmap the input, 12 threads count newlines with AVX2, nothing else | run-8ea2db5074de | 0.0146 |
+| v6 ingest only | v6 with its report phase cut out | run-d570a81674c0 | 0.0213 |
+| v6 | the whole program | (steps 18-28) | ≈0.032 |
+
+So about 11 ms of v6's box time was the report phase that runs after the ingest barrier,
+and about 7 ms the ingest's work above the bare read. v7 was written from scratch in a
+separate folder to attack both: report while parsing instead of after it, and do a third
+fewer instructions. Steps 32 to 41 are its development. Their local T values are medians
+of interleaved runs of saved binaries with the output on a tmpfs, as on the box
+(`/srv/speeddemon/work` is a tmpfs there), and M is `memory.peak` minus the container's
+own baseline (about 5 MB of shell), so both read lower than `bench/bench.sh`, which
+writes to an ext4 volume; instruction counts are from cachegrind.
+
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 32 | Rewrite: per-(worker, hour) logs in one `MAP_NORESERVE` reservation, a barrier, then per-hour reports (739M instructions against v6's 1,077M; wall equal to v6) | | 0.0195 | 20 | |
+| 33 | The main thread parses during ingest and writes afterwards, with 11 reporters, so the writer has a CPU of its own (its tail after the last report: 3 ms to 0.2 ms) | | 0.0145 | 20 | |
+| 34 | One log per hour shared by all workers, which reserve 1 KB blocks of it with one `fetch_add`; pieces in file order; one endpoint table shared by all workers | | 0.0145 | 20 | |
+| 35 | Speculative reporting: an hour is reported as soon as the parsed prefix is two hours past it, while parsing goes on; an exact count check, and a rerun without speculation if it fails (median 13.0 vs 14.5 ms, CPU -8%) | | 0.013 | 19.5 | |
+| 36 | Count and scatter as plain loops; the endpoint start found by one 16-byte compare (767M to 701M instructions) | | 0.013 | 19.5 | |
+| 37 | Endpoint table as a `static`, structs built from `Default`, logs as slices (S 559 to 484; 688M instructions) | | 0.013 | 19.5 | |
+| 38 | A cap on the line-end index count, so the compiler drops its bounds checks (691M to 682M) | | 0.013 | 19.5 | |
+| 39 | Verification by the total line count instead of per-hour counts (one less variable in the hot loop) | | 0.013 | 19.5 | |
+| 40 | `mallopt(M_MMAP_THRESHOLD)` fixed at 128 KB, text pool capped at four, report scratch pooled (M median 19.5 to 17.9 MB) | | 0.013 | 17.9 | |
+| 41 | **v7 as submitted** (commit a46b7ae): steps 32-40. Local: 686M instructions, 2.14M mispredicts, wall min/median 12.1/13.1 ms against v6's 17.7/19.6 in one interleaved set, CPU median 111 vs 140 ms; S 501 | run-d96b1571240a | 0.0245 | 19.5 | 81.5 |
+
+### How v7 works, and why it is exact
+
+The design is described in README.md; in short, each line becomes a 4-byte record in its
+hour's log, an hour is reported (counting sort by endpoint, three selections, format) as
+soon as parsing is two hours past it, and the hour's log is freed at once, so only a few
+hours of records ever exist. The input promises no bound on lateness, so the speculation
+is checked rather than trusted: every line is exactly one record in its hour, so the
+reports saw every line exactly when their counts add up to the number of lines parsed. If
+they do not, the output is truncated and the job runs again with all reports at the end.
+On the generator's data the margin is about 50 minutes (shard 0 uploads an hour 5 to 10
+minutes after it ends; the other shards are at most 2.5 minutes late); full seeds 1, 3, 7
+and 11 and sample seeds 1 and 5 never rerun, while a shuffled file, a reversed file and a
+sorted file with one early line moved to the end do, and all give the reference's bytes.
+
+### v7 against v6, locally
+
+| | v6 | v7 |
+|---|---|---|
+| Instructions (cachegrind) | 1,077M | 686M |
+| Branch mispredicts | 2.77M | 2.14M |
+| Wall, 12 interleaved runs, min / median | 17.7 / 19.6 ms | 12.1 / 13.1 ms |
+| CPU (`perf stat` task-clock), median | 140 ms | 111 ms |
+| `memory.peak` minus the container's own baseline, median | 24.1 MB | 17.9 MB |
+| S | 590 | 501 |
+
+On the box the gain was smaller than locally (32 to 24.5 ms against 19.6 to 13.1): the box
+is about twice as slow per core with turbo off, so work that overlaps with the memory
+stream here is on the critical path there.
+
+### v7 experiments that did not make it
+
+- **8-byte records with no side list** (21 fewer lines): page faults 7.0k to 10.6k, CPU
+  +5%, M unchanged.
+- **12 workers plus the writer** (13 threads on 12 CPUs): median 15.0 vs 13.0 ms. **The
+  main thread parsing between writes** (12 parsers, none idle): median 15.1 vs 15.0 ms,
+  minimum 13.5 vs 12.9 ms.
+- **`MADV_POPULATE_READ` per piece:** faults 7.2k to 7.0k, no change in wall time.
+- **Dropping the input's page-table entries after the last piece**, beside the final
+  reports: done-to-exit gap 1.0-1.3 ms either way.
+- **Release/Acquire instead of Relaxed for the records:** the same instruction count. The
+  records stay Relaxed; a report that sees an endpoint id newer than its name order waits
+  on the Acquire load of the published-name count before it reads the names.
+- **Radix-sorting each hour by latency** (two stable 10-bit passes before the stable
+  scatter, so every group comes out sorted and percentiles are lookups): mispredicts 2.14M
+  to 0.69M, but 686M to 700M instructions and median 15.8 vs 14.3 ms (the 1,024-way
+  scatters miss L1). Leaving selection out entirely (wrong output, as a bound) gives 572M
+  instructions and 10% less wall time, so selection is the largest single cost left.
+- **Pieces of 512 KB or 2 MB** instead of 1 MB, **sorting groups of up to 64 or 128**
+  instead of 32: within noise.

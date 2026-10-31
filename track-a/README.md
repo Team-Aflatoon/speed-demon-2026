@@ -1,101 +1,96 @@
 # Track A: Ingest
 
-Team Aflatoon: Dhruv Sharma (@spiritsfuse), Anushika Chauhan (@Anushika06), Pratyush Mishra (@PratyushMishra-2nd).
+Team Aflatoon: Dhruv Sharma (@Spiritsfuse), Anushika Chauhan (@Anushika06), Pratyush Mishra (@PratyushMishra-2nd).
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
 
 ## Approach
 
-One Rust binary, `src/main.rs`, no crates. Two parallel phases over a memory-mapped input.
+One Rust binary, `src/main.rs`, no crates. Eleven worker threads parse the memory-mapped
+log and report its hours while they parse; the main thread writes the output. PERF.md has
+the history and the measurements behind each choice (v7 is this design).
 
-**1. Ingest (one pass over the bytes).** The file is `mmap`ed read-only. The harness has
-already pulled it into the page cache, so the mapping costs only page-table entries and
-none of its pages are charged to our memory peak. The file is cut into pieces of whole
-lines (~1 MB each). Each of up to 12 workers (one per CPU of the cpuset) owns a
-contiguous run of pieces and works through it front to back; a worker that runs out
-steals pieces from the back of another's run. So a worker that started late or shares a
-core just does less, all finish within a piece of each other, and each still sees only a
-few hours of the file. Each worker finds its pieces' line-aligned edges itself (a piece
-holds the lines that start in its nominal range). Within a piece, every field of a line
-is read from one fixed 320-byte window of it at offsets that are `u8`s, so the compiler
-can prove each read in bounds and drops the checks (they were about 100 instructions a
-line); only the file's last few lines need a zero-padded copy of the window.
+**Parsing into one log per hour.** The file is mapped read-only (the harness has it in the
+page cache, so the mapping costs page-table entries and is not charged to our memory) and
+cut into 1 MB pieces of whole lines, which workers take in file order. Every line becomes
+one 4-byte record, `endpoint id << 21 | 5xx << 20 | latency`, appended to its hour's log.
+Each hour's log is one region of a single `MAP_NORESERVE` reservation sized for the worst
+case (every line of the file in that hour), so untouched pages cost nothing. Workers
+reserve 256-record blocks of a log with one atomic `fetch_add` and fill their own block
+with plain stores. Latencies of 2^20 and up, about 1.5% of them, go to the hour's side list
+as 8-byte entries. Slots are atomics, which on x86 are ordinary moves; that matters only
+for the early reports below.
 
-- *Line ends:* 64 bytes at a time, two AVX2 compares and `movemask` give a bitmask of
-  newlines. A line has at least 40 bytes, so a block holds at most two: both candidates
-  (lowest and highest set bit) are stored unconditionally and the count advances by the
-  popcount. A 4 KB stretch is indexed this way first, so the per-line loop that follows
-  has no hard-to-predict exit at every block boundary.
-- *Hour:* lines arrive in roughly time order, so the hour is cached on the 13 bytes
-  `YYYY-MM-DDTHH`; only when they change is it recomputed (days-from-civil, so any
-  calendar date works) and turned into a row relative to the first line's hour. Nothing
-  assumes the spec's span start: any 72-hour window around the first line fits.
-- *Latency and status:* parsed right to left from the newline with no loop. One 16-byte
-  compare finds the space before the latency (at most 10 digits), the digits after it are
-  masked in and summed as a 16-digit number by three multiply-add steps
-  (`maddubs`/`madd`), and the status is the 3 bytes before that space (`5xx` = error).
-- *Endpoint:* its leading `/` is one of the 8 bytes at offset 32 (27-byte timestamp, a
-  space, a 3 to 7 byte method, a space); a SWAR zero-byte test finds it. Its end is 4 bytes
-  before the latency's space. It is hashed from its first and last 8 bytes and its length
-  and looked up in a per-worker open-addressing table whose names live in one compact
-  arena of records (hash, id, length, name): a hit reads its slot and then one record.
-  (Comparing against each name's first occurrence in the input instead scattered the
-  compares over ~1,842 pages and cost a TLB miss on most lines.) The compare is two
-  32-byte vector compares with the bits past the name's length masked off. The hash is only
-  a shortcut: equality is always decided on the bytes.
-- *Storing the line:* one 4-byte record, `endpoint id << 20 | 5xx << 19 | latency`, is
-  appended to this worker's log for that hour. 97% of latencies fit in 19 bits; a larger
-  one is stored as an all-ones marker plus an (id, latency) pair on the side, so the result
-  stays exact. The log grows in chunks of 16 KB doubling to 256 KB, carved by a bump
-  pointer from one anonymous `MAP_NORESERVE` mapping reserved for the worst case:
-  untouched pages cost nothing, and there is no mmap or munmap per chunk (both take the
-  address-space lock for writing and stall the other threads' page faults).
-  Appending is a sequential write: no per-group counters or chains to update per line.
+**Reporting while parsing.** The parsed part of the file ends at the first piece still
+being parsed. Once that piece's first line is two hours past hour h, hour h is reported:
+the generator's shard 0 uploads each hour 5 to 10 minutes after it ends and the streaming
+shards are at most 2.5 minutes late, so this leaves about 50 minutes of margin. The
+scheduler (one lock and a condition variable) gives due hours priority over pieces, so
+reports are spread over the run instead of waiting behind a barrier, and the writer starts
+within about 2 ms. When parsing ends, only the last two hours are left to report.
 
-**2. Report and write, overlapped.** The workers' endpoint tables are merged through one
-more hash table (12 x 1,842 lookups) and the ~1,842 distinct names are sorted once; byte
-order is exactly `&[u8]`'s `Ord`. Then the workers take the hours in order. For an hour, the
-logs of the workers that saw it are counting-sorted by endpoint rank: one pass counts lines
-and errors per endpoint, a prefix sum gives each endpoint a slice of one array, a second
-pass drops every latency into its slice. Every group is then contiguous, and
-`select_nth_unstable` finds p50, then p95 in the half above it, then p99 in the twentieth
-above that: about 1.55n steps, no sort (groups of 32 or fewer, most of them, just get one
-`sort_unstable`, an insertion sort at that size). The counting pass also rewrites each record's worker-local id as the
-endpoint's rank, so the second pass needs no lookup. Digits are written ten places at a
-time from a two-digit table, with no loop whose length depends on the value; text
-buffers are reserved once and reused through a pool. As soon as an hour is reported its log chunks are released with `madvise(MADV_DONTNEED)`,
-so the logs shrink while the output grows. The main thread writes each hour's text as soon
-as all earlier hours are out, so writing overlaps the work.
+**Exact whatever the input.** The spec promises no bound on how late a line can be, so the
+speculation is checked, not trusted. A report counts the records it saw; a slot reserved
+but not yet written reads as zero, endpoint id 0, which is never printed. Each line is
+exactly one record in its hour, so the reports saw every line exactly when their counts
+add up to the number of lines parsed. If they do not, the output is truncated and the
+whole job runs again with every report at the end. On the generator's data that never
+happens; a shuffled file, a reversed file or a late line make it happen, and still give
+the right bytes, in about twice the time.
 
-**Memory.** The peak is near the end of ingest: the 3.1M records (12.4 MB), the endpoint
-tables and the first hours in flight. `prctl(PR_SET_THP_DISABLE)` keeps transparent huge
-pages, `always` on stock Debian, from backing malloc's per-thread arenas with mostly empty
-2 MB pages (the board confirmed it: v2's M fell from 47.5 to 25.8 MB). Releasing each
-hour's log as soon as it is reported matters: the output's page cache is charged to the
-run, and without the releases the peak was 37-40 MB instead of 25-29.
+**One report.** A count pass over the hour's records gives requests and 5xx per endpoint
+(one 64-bit add per record); a prefix sum in endpoint byte order gives every endpoint a
+slice of a scratch array; a scatter pass drops each latency into its slice. Groups of up to
+32 are sorted; larger ones get three `select_nth_unstable` calls, each searching only above
+the previous rank. Then the hour's log pages are given back with `madvise(MADV_DONTNEED)`,
+so the logs shrink while the output grows. Byte order of the names is a sorted list of
+endpoint ids, rebuilt only when a report meets an id it does not cover. Numbers are
+formatted eight digits at a time by SWAR arithmetic, with the leading zeros shifted out,
+so there is no loop whose length depends on the value.
 
-**Errors.** Every I/O failure, a timestamp outside a 72-hour window, more than 3,072
-distinct endpoints in one worker or 4,096 in all (a record has 12 bits for them; a
-compile-time assert ties the limits to that layout) is reported on stderr with a
-non-zero exit. `unsafe` is used only for
-the `mmap`, `madvise` and `prctl` calls, handing out the arena and the SIMD intrinsics (each with why it stays
-in bounds; AVX2 and SSE4.1 are enabled crate-wide by `target-cpu=x86-64-v3`).
+**The per-line path.** Line ends are indexed 4 KB at a time: each 64-byte block (two AVX2
+compares and `movemask`) holds at most two line ends, so both candidates are stored and the
+count advances by the popcount, with no branch per block. The hour is cached on two
+overlapping words of the timestamp and recomputed (days from the civil date) only when
+they change. The latency is parsed right to left from the newline with no loop: one SSE
+compare finds the space before it, its digits are masked in and summed by three
+multiply-add steps, and the status digit before that space gives the 5xx flag. One more
+16-byte compare finds the space after the method, where the endpoint starts.
+
+**Endpoints.** One table, shared by all workers and kept in a `static` so the hot loop
+addresses it directly: open addressing over 8,192 slots on a hash of the name's first and
+last 8 bytes and its length, each name stored once, zero-padded, in a 128-byte record. A
+lookup compares 64 bytes at a time with AVX2 and masks off the bytes past the length with
+BMI2 `bzhi`; the hash is only a shortcut and equality is always decided on the bytes.
+Lookups take no lock. An insert takes one, looks again, writes the name and then publishes
+its id with a Release store.
+
+**Memory.** At the peak the process holds the output's tmpfs pages (10.1 MB), the records
+of the few hours in flight, report scratch and texts. `prctl(PR_SET_THP_DISABLE)` keeps
+transparent huge pages (`always` on Debian) off the sparse reservation; a fixed
+`M_MMAP_THRESHOLD` stops glibc from raising its threshold after the first large free, so
+freed text buffers really go back to the kernel; the writer keeps at most four text buffers
+and the report scratch is pooled, so there are only as many of them as reports in flight.
+
+**Errors.** An I/O failure, a timestamp outside the 72-hour span, or more than 2,047
+distinct endpoints goes to stderr with exit code 1. `unsafe` is confined to the system
+calls, the reserved logs, the SIMD intrinsics (AVX2, BMI2 and SSE4.1 come from
+`target-cpu=x86-64-v3` in `.cargo/config.toml`) and the output writer; each block says why
+it is sound.
 
 ## Dependencies
 
-None. `mmap`, `madvise` and `prctl` are declared by hand with `extern "C"`; SIMD comes from
-`std::arch`.
+None. `mmap`, `madvise`, `prctl` and `mallopt` are declared by hand with `extern "C"`;
+SIMD comes from `std::arch`.
 
 ## With another 24 hours
 
-- The ingest loop is now the bulk of the time (about 11 ms locally against a ~7 ms floor
-  for merely streaming the input); the endpoint lookup is ~20% of all samples. Next: a
-  cheaper first-level check for the lookup (most lines hit a handful of hot endpoints)
-  and fewer bounds checks in that loop.
-- The report phase still idles about 30% (rows finish out of order and the writer must
-  go in order); finishing the formatting of a big hour in two halves would shorten the
-  tail.
-- Fewer lines (S): the report pipeline and the endpoint table can be written more
-  compactly.
-- Memory: two-byte latencies with a wider escape would bring the logs to ~8 MB, at the
-  cost of more side pairs; worth measuring against the counting sort's cost.
+- Selection is the largest single cost left: running without it (wrong output, as a bound)
+  takes 10% less time and a sixth fewer instructions. A one-pass selection that brackets
+  the three ranks from a small sorted sample would get much of that back; our radix-sort
+  attempt removed the mispredicts but cost more than it saved.
+- On the box the bare read of the mapped input is 14.6 ms of our 24.5 ms. Reading with
+  `pread` into per-thread buffers would avoid the input's page faults and the teardown of
+  its mapping at exit; whether that is cheaper on the box is the next thing to measure.
+- The ingest loop is about 150 instructions a line, and the compiler spills several of its
+  loop variables; a leaner line path is worth another 10-15%.
