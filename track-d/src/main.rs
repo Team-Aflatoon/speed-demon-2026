@@ -677,20 +677,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = Text(split_lines(&text[i..], threads));
 
     let first = build_csr(&text, threads, n, |u, v| (u, v));
-    let (rank, fwd) = bfs_layout(first, threads);
-    let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
-    let queries = std::fs::read_to_string("/data/queries.txt")?
-        .lines()
-        .map(|line| {
-            let (s, t) = line.split_once(' ').ok_or("bad line in queries.txt")?;
-            Ok((node(s)?, node(t)?))
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-    drop(rank);
-    let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
-
-    // PROBE: build everything, answer nothing. One "0" per query line.
-    std::hint::black_box((&fwd, &bwd));
-    std::fs::write("/out/distances.txt", "0\n".repeat(queries.len()))?;
+    // PROBE: parse and build the first CSR only. One "0" per query line.
+    std::hint::black_box(&first);
+    let lines = std::fs::read_to_string("/data/queries.txt")?.lines().count();
+    std::fs::write("/out/distances.txt", "0\n".repeat(lines))?;
     Ok(())
 }
