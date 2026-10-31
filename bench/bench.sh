@@ -4,6 +4,7 @@
 # output sha256 for each run.
 #
 #   bench/bench.sh <a|b|c|d> [runs] [dataset-volume-subdir]
+#   (TRACK_DIR=<folder> TAG=<image> bench alternative builds of a track)
 #
 # Inputs live in the docker volume `sd-data` (subdir a..d for seed 1, s7-a.. for
 # seed 7); they are pre-read before timing so, as on the box, the page cache is warm
@@ -13,7 +14,8 @@ track=$1
 runs=${2:-5}
 sub=${3:-$track}
 here=$(cd "$(dirname "$0")/.." && pwd)
-tag="sd-bench/track-$track"
+dir=${TRACK_DIR:-$here/track-$track}
+tag=${TAG:-sd-bench/track-$track}
 declare -A OUT=([a]=summary.txt [b]=results.txt [c]=aggregates.txt [d]=distances.txt)
 declare -A EXPECT=(
   [a]=495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3
@@ -24,7 +26,7 @@ declare -A EXPECT=(
 expect=${EXPECT_SHA:-${EXPECT[$track]}}
 DEB=debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 
-docker build -q --network=none -t "$tag" "$here/track-$track" >/dev/null
+docker build -q --network=none -t "$tag" "$dir" >/dev/null
 cmd=$(docker image inspect -f '{{range .Config.Entrypoint}}{{.}} {{end}}{{range .Config.Cmd}}{{.}} {{end}}' "$tag")
 size=$(docker image inspect -f '{{.Size}}' "$tag")
 echo "image $tag $((size / 1000000)) MB, cmd: $cmd"
