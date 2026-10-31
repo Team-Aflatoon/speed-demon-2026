@@ -16,7 +16,10 @@ contiguous run of pieces and works through it front to back; a worker that runs 
 steals pieces from the back of another's run. So a worker that started late or shares a
 core just does less, all finish within a piece of each other, and each still sees only a
 few hours of the file. Each worker finds its pieces' line-aligned edges itself (a piece
-holds the lines that start in its nominal range). Within a piece:
+holds the lines that start in its nominal range). Within a piece, every field of a line
+is read from one fixed 320-byte window of it at offsets that are `u8`s, so the compiler
+can prove each read in bounds and drops the checks (they were about 100 instructions a
+line); only the file's last few lines need a zero-padded copy of the window.
 
 - *Line ends:* 64 bytes at a time, two AVX2 compares and `movemask` give a bitmask of
   newlines. A line has at least 40 bytes, so a block holds at most two: both candidates
@@ -53,7 +56,11 @@ logs of the workers that saw it are counting-sorted by endpoint rank: one pass c
 and errors per endpoint, a prefix sum gives each endpoint a slice of one array, a second
 pass drops every latency into its slice. Every group is then contiguous, and
 `select_nth_unstable` finds p50, then p95 in the half above it, then p99 in the twentieth
-above that: about 1.55n steps, no sort. As soon as an hour is reported its log chunks are unmapped,
+above that: about 1.55n steps, no sort (groups of 32 or fewer, most of them, are simply
+insertion-sorted). The counting pass also rewrites each record's worker-local id as the
+endpoint's rank, so the second pass needs no lookup. Digits are written ten places at a
+time from a two-digit table, with no loop whose length depends on the value; text
+buffers are reserved once and reused through a pool. As soon as an hour is reported its log chunks are unmapped,
 so the logs shrink while the output grows. The main thread writes each hour's text as soon
 as all earlier hours are out, so writing overlaps the work.
 

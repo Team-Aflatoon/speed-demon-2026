@@ -20,8 +20,8 @@ use std::thread;
 /// Distinct endpoints one worker can hold (a record has 12 bits for the id); the spec
 /// promises 1,842 per seed.
 const MAX_ENDPOINTS: usize = 3072;
-/// Slots of the open-addressing endpoint table: a power of two, at most 3/4 full.
-const SLOTS: usize = 4096;
+/// Slots of the open-addressing endpoint table: a power of two, at most 3/8 full.
+const SLOTS: usize = 8192;
 /// Hour rows: 71 either side of the first line's hour, so any 72-hour span that
 /// contains the first line fits without knowing where the span starts.
 const ROWS: usize = 143;
@@ -31,6 +31,9 @@ const MARK: u32 = (1 << 19) - 1;
 /// Records per log chunk: 256 KB, so the allocator maps each chunk on its own and
 /// unmaps it when the hour is freed.
 const CHUNK: usize = 1 << 16;
+/// Bytes of the line window: room for the longest line (177 bytes) and for reads of up
+/// to 64 bytes at any u8 offset.
+const WINDOW: usize = 320;
 /// Bytes of input a worker claims at a time.
 const PIECE: usize = 1 << 20;
 /// Bytes of input whose line ends are found in one go (a multiple of 64).
@@ -105,11 +108,13 @@ fn run() -> io::Result<()> {
     // Workers report the hours in order while this thread writes each one as soon as
     // all earlier ones are out, so the write overlaps the work. The bounded channel
     // stops workers running far ahead of the writer, which bounds the texts held.
-    let next = AtomicUsize::new(0);
+    // Written texts go back to a pool: reusing their buffers saves growing fresh ones
+    // (page faults, copies) and freeing them on another thread (allocator locks).
+    let (next, pool) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
     let (sender, receiver) = mpsc::sync_channel(2 * workers);
     thread::scope(|s| {
         for _ in 0..workers {
-            let (sender, next) = (sender.clone(), &next);
+            let (sender, next, pool) = (sender.clone(), &next, &pool);
             let (hours, rank_of, names) = (&hours, &rank_of, &names);
             s.spawn(move || {
                 let mut latencies = Vec::new();
@@ -118,7 +123,11 @@ fn run() -> io::Result<()> {
                     if row >= ROWS {
                         return;
                     }
-                    let mut text = Vec::new();
+                    let mut text = pool
+                        .lock()
+                        .expect("no worker panics")
+                        .pop()
+                        .unwrap_or_default();
                     report(row, hours, rank_of, names, &mut latencies, &mut text);
                     // The text holds all that is left of the hour: free its logs now
                     // (each chunk is its own mapping, so the memory goes back at once).
@@ -138,8 +147,10 @@ fn run() -> io::Result<()> {
         let mut written = 0;
         for (t, text) in receiver {
             pending[t] = Some(text);
-            while let Some(text) = pending.get_mut(written).and_then(Option::take) {
+            while let Some(mut text) = pending.get_mut(written).and_then(Option::take) {
                 out.write_all(&text)?;
+                text.clear();
+                pool.lock().expect("no worker panics").push(text);
                 written += 1;
             }
         }
@@ -252,27 +263,40 @@ impl<'a> Shard<'a> {
         base: i64,
     ) -> io::Result<()> {
         // Lines arrive in roughly time order, so the hour is cached on its 13-byte text.
-        let (mut seen, mut row) = ((0, 0), 0);
-        let (mut line, mut ends) = (start, [0; 2 * SCAN / 64]);
+        let (mut seen, mut row) = (([0; 8], [0; 8]), 0);
+        let (mut line, mut ends, mut padded) = (start, [0; 2 * SCAN / 64], [0; WINDOW]);
         for scan in (start..end).step_by(SCAN) {
             for &nl in newlines(data, scan, end.min(scan + SCAN), &mut ends) {
-                let key = (load(data, line), load(data, line + 5));
+                // Every field is read from one fixed-size window of the line at an offset
+                // that is a u8: the compiler can prove each read in bounds and drops the
+                // checks (they were ~100 instructions a line). Only the last lines of
+                // the file need a zero-padded copy.
+                let w: &[u8; WINDOW] = match data.get(line..line + WINDOW) {
+                    Some(w) => w.try_into().expect("a slice of WINDOW bytes"),
+                    None => {
+                        padded.fill(0);
+                        padded[..data.len() - line].copy_from_slice(&data[line..]);
+                        &padded
+                    }
+                };
+                let nl = u8::try_from(nl - line).map_err(|_| io::Error::other("line too long"))?;
+                let key = (word::<8>(w, 0), word::<8>(w, 5));
                 if key != seen {
                     seen = key;
                     row = self.hour_row(data, line, base)?;
                 }
-                let (latency, sp) = parse_latency(data, nl);
+                let (latency, sp) = parse_latency(w, nl);
                 // The method is 3 to 7 bytes after the 27-byte timestamp and a space,
-                // so the endpoint's leading '/' is one of the 8 bytes at line + 32. XOR
+                // so the endpoint's leading '/' is one of the 8 bytes at offset 32. XOR
                 // turns '/' into a zero byte; the SWAR zero-byte test flags the first.
-                let x = load(data, line + 32) ^ 0x2f2f_2f2f_2f2f_2f2f;
+                let x = u64::from_le_bytes(word(w, 32)) ^ 0x2f2f_2f2f_2f2f_2f2f;
                 let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-                let (start, end) = (line + 32 + zero.trailing_zeros() as usize / 8, sp - 4);
-                let hash = endpoint_hash(data, start, end);
-                let id = self.endpoints.id(data, start, end, hash);
+                let (start, end) = (32 + zero.trailing_zeros() as u8 / 8, sp - 4);
+                let hash = endpoint_hash(w, start, end);
+                let id = self.endpoints.id(w, start.into(), end.into(), hash);
                 let id = id.ok_or_else(too_many_endpoints)?;
-                self.hours[row].push(id, latency, data[sp - 3] == b'5');
-                line = nl + 1;
+                self.hours[row].push(id, latency, w[usize::from(sp - 3)] == b'5');
+                line += usize::from(nl) + 1;
             }
         }
         Ok(())
@@ -301,20 +325,22 @@ impl<'a> Shard<'a> {
 struct Hour<'a> {
     /// The `YYYY-MM-DDTHH` of one of its lines, to print the hour; empty if none.
     prefix: &'a [u8],
-    chunks: Vec<Box<[u32]>>,
+    chunks: Vec<Box<[u32; CHUNK]>>,
     len: usize,
     /// (endpoint id, latency) of every latency of `MARK` or more.
     large: Vec<(u32, u32)>,
 }
 
 impl Hour<'_> {
+    #[inline(always)]
     fn push(&mut self, id: usize, latency: u32, error: bool) {
         if latency >= MARK {
             self.large.push((id as u32, latency));
         }
         if self.len % CHUNK == 0 {
             // Allocated zeroed: fresh pages from the kernel, faulted in as used.
-            self.chunks.push(vec![0; CHUNK].into_boxed_slice());
+            let chunk = vec![0; CHUNK].into_boxed_slice().try_into();
+            self.chunks.push(chunk.expect("a slice of CHUNK records"));
         }
         let record = (id as u32) << 20 | u32::from(error) << 19 | latency.min(MARK);
         self.chunks[self.len / CHUNK][self.len % CHUNK] = record;
@@ -331,13 +357,18 @@ impl Hour<'_> {
     }
 }
 
-/// Hash of endpoint `data[start..end]` from its first and last 8 bytes and its length.
+/// Hash of endpoint `w[start..end]` from its first and last 8 bytes and its length.
 /// Both loads stay inside the line (28 bytes precede an endpoint, at least 7 follow
 /// it); bytes outside the name are masked off, as they differ between its lines.
-fn endpoint_hash(data: &[u8], start: usize, end: usize) -> u64 {
+#[inline(always)]
+fn endpoint_hash(w: &[u8; WINDOW], start: u8, end: u8) -> u64 {
     let len = end - start;
-    let head = load(data, start) & (u64::MAX >> (8 * 8usize.saturating_sub(len)));
-    let tail = if len >= 8 { load(data, end - 8) } else { 0 };
+    let head = u64::from_le_bytes(word(w, start)) & (u64::MAX >> (8 * 8u8.saturating_sub(len)));
+    let tail = if len >= 8 {
+        u64::from_le_bytes(word(w, end - 8))
+    } else {
+        0
+    };
     (head ^ tail.rotate_left(32) ^ len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
@@ -385,13 +416,15 @@ impl Endpoints {
 
     /// The id of the name `text[start..end]`, which hashes to `hash`, adding it if
     /// new; None when the table is full.
+    #[inline(always)]
     fn id(&mut self, text: &[u8], start: usize, end: usize, hash: u64) -> Option<usize> {
         let len = end - start;
         let mut slot = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         while self.slots[slot] != 0 {
             let at = self.slots[slot] as usize - 1;
-            let id_len = load(&self.arena, at + 8);
-            if load(&self.arena, at) == hash
+            let header = &self.arena[at..at + 16];
+            let id_len = load(header, 8);
+            if load(header, 0) == hash
                 && (id_len >> 32) as usize == len
                 && same(&self.arena, at + 16, text, start, len)
             {
@@ -419,6 +452,7 @@ impl Endpoints {
 /// Whether `a[i..i + n]` equals `b[j..j + n]`. Names of up to 64 bytes, nearly all of
 /// them, are compared as two 32-byte vector compares whose result bits past `n` are
 /// masked off: no length-dependent branch to mispredict and no memcmp call.
+#[inline(always)]
 fn same(a: &[u8], i: usize, b: &[u8], j: usize, n: usize) -> bool {
     match (a.get(i..i + 64), b.get(j..j + 64)) {
         (Some(x), Some(y)) if n <= 64 => {
@@ -451,24 +485,28 @@ fn report(
     text: &mut Vec<u8>,
 ) {
     // Each worker read a few hours' worth of the file, so most miss most hours.
-    let locked: Vec<_> = hours
+    let mut locked: Vec<_> = hours
         .iter()
-        .map(|h| h[row].read().expect("no worker panics"))
+        .map(|h| h[row].write().expect("no worker panics"))
         .collect();
-    let seen: Vec<_> = locked
-        .iter()
+    let mut seen: Vec<_> = locked
+        .iter_mut()
         .zip(rank_of)
         .filter(|(h, _)| !h.prefix.is_empty())
         .collect();
     let Some(prefix) = seen.first().map(|(h, _)| h.prefix) else {
         return;
     };
+    // Count lines and errors per endpoint, and rewrite each record's worker-local
+    // id as the endpoint's global rank, so the second pass needs no lookup.
     let mut counts = vec![[0u32; 2]; names.len()]; // per endpoint: lines, errors
-    for (hour, rank_of) in &seen {
-        for &record in hour.records().flatten() {
-            let count = &mut counts[rank_of[(record >> 20) as usize] as usize];
-            count[0] += 1;
-            count[1] += record >> 19 & 1;
+    for (hour, rank_of) in &mut seen {
+        let len = hour.len;
+        for record in hour.chunks.iter_mut().flat_map(|c| c.iter_mut()).take(len) {
+            let rank = rank_of[(*record >> 20) as usize];
+            counts[rank as usize][0] += 1;
+            counts[rank as usize][1] += *record >> 19 & 1;
+            *record = rank << 20 | *record & MARK;
         }
     }
     let mut ends: Vec<usize> = counts
@@ -481,25 +519,29 @@ fn report(
     latencies.clear();
     latencies.resize(ends.last().map_or(0, |&e| e), 0);
     // Fill each group from its end backwards, leaving `ends` at the group starts.
+    let mut put = |rank: u32, latency| {
+        let end = &mut ends[rank as usize];
+        *end -= 1;
+        latencies[*end] = latency;
+    };
     for (hour, rank_of) in &seen {
-        let records = hour.records().flatten();
-        let small = records
-            .filter(|&&r| r & MARK != MARK)
-            .map(|&r| (r >> 20, r & MARK));
-        for (id, latency) in small.chain(hour.large.iter().copied()) {
-            let end = &mut ends[rank_of[id as usize] as usize];
-            *end -= 1;
-            latencies[*end] = latency;
+        for &record in hour.records().flatten().filter(|&&r| r & MARK != MARK) {
+            put(record >> 20, record & MARK);
+        }
+        for &(id, latency) in &hour.large {
+            put(rank_of[id as usize], latency);
         }
     }
+    // At most 20 + 1 + 125 + 6 * 11 + 1 bytes a line: reserve once, never regrow.
+    text.reserve(counts.iter().filter(|c| c[0] > 0).count() * 213);
     for (rank, &[count, errors]) in counts.iter().enumerate().filter(|(_, c)| c[0] > 0) {
         let group = &mut latencies[ends[rank]..ends[rank] + count as usize];
-        let (count, errors) = (u64::from(count), u64::from(errors));
-        let [p50, p95, p99] = percentiles(group).map(u64::from);
+        let [p50, p95, p99] = percentiles(group);
+        let ppm = (u64::from(errors) * 1_000_000 / u64::from(count)) as u32;
         text.extend_from_slice(prefix);
         text.extend_from_slice(b":00:00Z ");
         text.extend_from_slice(&names[rank]);
-        for n in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
+        for n in [count, p50, p95, p99, errors, ppm] {
             text.push(b' ');
             push_decimal(text, n);
         }
@@ -512,6 +554,11 @@ fn report(
 /// to search that suffix: n + n/2 + n/20 steps in all.
 fn percentiles(values: &mut [u32]) -> [u32; 3] {
     let n = values.len();
+    if n <= 32 {
+        // Most groups are this small: one insertion sort beats three selections.
+        values.sort_unstable();
+        return [50, 95, 99].map(|p| values[(p * n + 99) / 100 - 1]);
+    }
     let (mut from, mut value) = (0, 0); // values[from..] hold the ranks not yet fixed
     [50, 95, 99].map(|p| {
         let rank = (p * n + 99) / 100 - 1;
@@ -565,8 +612,9 @@ fn newline_mask(data: &[u8], at: usize, end: usize) -> u64 {
 /// without a loop: the 16 bytes before `nl` always hold that space (a latency has at
 /// most 10 digits), so one compare finds it, and the digits after it are summed as a
 /// 16-digit number with leading zeros by multiply-add steps (pairs, quads, octets).
-fn parse_latency(data: &[u8], nl: usize) -> (u32, usize) {
-    let tail = &data[nl - 16..nl];
+#[inline(always)]
+fn parse_latency(w: &[u8; WINDOW], nl: u8) -> (u32, u8) {
+    let tail: [u8; 16] = word(w, nl - 16);
     // SAFETY: the load reads the 16 bytes of `tail`.
     unsafe {
         let v = _mm_loadu_si128(tail.as_ptr().cast());
@@ -584,7 +632,7 @@ fn parse_latency(data: &[u8], nl: usize) -> (u32, usize) {
         let octets = _mm_madd_epi16(quads, _mm_set1_epi32(0x0001_2710));
         let high = _mm_cvtsi128_si32(octets) as u32 as u64;
         let low = _mm_extract_epi32::<1>(octets) as u32 as u64;
-        ((high * 100_000_000 + low) as u32, nl - 16 + space as usize)
+        ((high * 100_000_000 + low) as u32, nl - 16 + space as u8)
     }
 }
 
@@ -602,22 +650,40 @@ fn hour_number(text: &[u8]) -> i64 {
     (era * 146_097 + day_of_era - 719_468) * 24 + num(11, 13)
 }
 
+/// The N bytes of the line window at offset `at`. Since `at` is a u8 and the window
+/// has room for 64 more bytes past offset 255, the compiler sees this never fails.
+#[inline(always)]
+fn word<const N: usize>(w: &[u8; WINDOW], at: u8) -> [u8; N] {
+    let mut bytes = [0; N];
+    bytes.copy_from_slice(&w[usize::from(at)..usize::from(at) + N]);
+    bytes
+}
+
 fn load(data: &[u8], at: usize) -> u64 {
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&data[at..at + 8]);
     u64::from_le_bytes(bytes)
 }
 
-fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
-    let mut digits = [0; 20];
-    let mut i = digits.len();
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
+/// Appends `value` in decimal. All ten digit places are filled two at a time from a
+/// table, with no loop whose length depends on the value (its exit was the report
+/// phase's most mispredicted branch), and then only the significant ones are kept.
+fn push_decimal(out: &mut Vec<u8>, value: u32) {
+    let (mut digits, mut rest) = ([0; 10], value as usize);
+    for pair in digits.rchunks_exact_mut(2) {
+        pair.copy_from_slice(&DIGIT_PAIRS[2 * (rest % 100)..][..2]);
+        rest /= 100;
     }
-    out.extend_from_slice(&digits[i..]);
+    out.extend_from_slice(&digits[9 - value.checked_ilog10().unwrap_or(0) as usize..]);
 }
+
+/// "00" to "99", back to back.
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut table = [0; 200];
+    let mut i = 0;
+    while i < 200 {
+        table[i] = b'0' + (i / 2 / [10, 1][i % 2] % 10) as u8;
+        i += 1;
+    }
+    table
+};
