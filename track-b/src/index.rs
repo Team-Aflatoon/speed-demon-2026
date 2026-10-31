@@ -35,10 +35,9 @@ impl Part {
     ) {
         self.offsets.clear();
         self.offsets.resize(terms + 1, 0);
-        streams
-            .clone()
-            .flatten()
-            .for_each(|&x| self.offsets[(x & 0xFFFF) as usize + 1] += 1);
+        for &x in streams.clone().flatten() {
+            self.offsets[(x & 0xFFFF) as usize + 1] += 1;
+        }
         for l in 0..terms {
             self.offsets[l + 1] += self.offsets[l];
         }
@@ -172,10 +171,9 @@ impl Evaluator {
             // Two dense sets: one pass over the words.
             (AND | NOT, Set::Dense(_, b), Set::Dense(_, a)) => {
                 let not = if op == NOT { !0 } else { 0 };
-                self.bits
-                    .iter_mut()
-                    .zip(a.iter().zip(b))
-                    .for_each(|(o, (&a, &b))| *o = a & (b ^ not));
+                for (o, (&a, &b)) in self.bits.iter_mut().zip(a.iter().zip(b)) {
+                    *o = a & (b ^ not);
+                }
                 Acc::Bits
             }
             (AND | NOT, Set::Dense(_, b), _) => filter(list, b, op == NOT, &mut self.out),
@@ -186,8 +184,9 @@ impl Evaluator {
                 self.list = mine;
                 return self.bits_op(NOT, set);
             }
-            (AND, Set::List(b), _) => intersect(list, b, &mut self.mask, &mut self.out),
-            (NOT, Set::List(b), _) => difference(list, b, &mut self.mask, &mut self.out),
+            (AND | NOT, Set::List(b), _) => {
+                combine(list, b, op == NOT, &mut self.mask, &mut self.out)
+            }
             _ if (list.len() + set.list().len()) * DENSE <= docs => {
                 union(list, set.list(), &mut self.out)
             }
@@ -226,11 +225,7 @@ impl Evaluator {
             }),
             (AND, _) => {
                 filter(set.list(), &self.bits, false, &mut self.list);
-                return if self.list.is_empty() {
-                    Acc::Empty
-                } else {
-                    Acc::List
-                };
+                return [Acc::List, Acc::Empty][usize::from(self.list.is_empty())];
             }
             (OR, _) => set_bits(&mut self.bits, set.list()),
             _ => set
@@ -243,8 +238,9 @@ impl Evaluator {
 }
 
 fn set_bits(bits: &mut [u64], list: &[u16]) {
-    list.iter()
-        .for_each(|&d| bits[usize::from(d) / 64] |= 1 << (d % 64));
+    for &d in list {
+        bits[usize::from(d) / 64] |= 1 << (d % 64);
+    }
 }
 
 /// The documents of `list` whose bit is set (clear, if `not`). Written
@@ -284,35 +280,28 @@ fn sift<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16
     Acc::List
 }
 
-fn intersect<'a>(a: &[u16], b: &[u16], mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
-    let (a, b) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+/// `a` with only (or, if `not`, without) the documents of `b`. When one list
+/// is `GALLOP` times longer the shorter one gallops through it; otherwise the
+/// one that decides is spread into `mask` and the other tested against it.
+fn combine<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
+    // AND is symmetric, so `a` is made the shorter list.
+    let (a, b) = if !not && a.len() > b.len() {
+        (b, a)
+    } else {
+        (a, b)
+    };
     if a.len() * GALLOP >= b.len() {
-        return sift(b, a, false, mask, out);
+        return if not {
+            sift(a, b, true, mask, out)
+        } else {
+            sift(b, a, false, mask, out)
+        };
     }
     out.clear();
     let mut at = 0;
     for &x in a {
         at = seek(b, at, x);
-        if at == b.len() {
-            break;
-        }
-        if b[at] == x {
-            out.push(x);
-        }
-    }
-    Acc::List
-}
-
-/// `a` without the documents of `b`.
-fn difference<'a>(a: &[u16], b: &[u16], mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
-    if a.len() * GALLOP >= b.len() {
-        return sift(a, b, true, mask, out);
-    }
-    out.clear();
-    let mut at = 0;
-    for &x in a {
-        at = seek(b, at, x);
-        if at == b.len() || b[at] != x {
+        if (at < b.len() && b[at] == x) != not {
             out.push(x);
         }
     }

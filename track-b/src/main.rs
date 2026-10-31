@@ -24,11 +24,11 @@ mod query;
 mod scan;
 
 use index::{Answer, Evaluator, Part, PARTS};
-use query::{Parsed, Table, MAX_QUERY_BYTES, PHRASE, RANGE_SHIFT};
-use scan::{read_full, ChunkOut, Scanner};
+use query::{distinct, Parsed, Table, MAX_QUERY_BYTES, PHRASE, RANGE_SHIFT, SKETCH_BITS};
+use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock, RwLock};
 
 const MAX_THREADS: usize = 12;
@@ -109,7 +109,7 @@ fn run(data: &str, out_dir: &str) {
     let mut queries = std::fs::read(format!("{data}/queries.txt"))
         .unwrap_or_else(|e| fail(&format!("queries.txt: {e}")));
     if queries.len() >= MAX_QUERY_BYTES {
-        fail("queries.txt is larger than 16 MB");
+        fail("queries.txt is larger than 1 GB");
     }
     queries.extend_from_slice(&[0; 16]); // keys read 12 bytes from a term's start
     let queries = &queries[..];
@@ -123,41 +123,67 @@ fn run(data: &str, out_dir: &str) {
     let ranges: Vec<usize> = (0..=threads)
         .map(|i| line_start(&queries[..text_len], text_len * i / threads))
         .collect();
-    let max_chunks = segments.iter().map(|s| s.chunks).max().unwrap_or(0);
+    let (n, max_chunks) = (segments.len(), segments.iter().map(|s| s.chunks).max());
     let shared = Shared {
         file: &file,
         tasks: schedule(&segments, threads),
         next: AtomicUsize::new(0),
-        chunks: [0, 1].map(|_| (0..max_chunks).map(|_| RwLock::default()).collect()),
-        docs: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        parts: (0..PARTS).map(|_| RwLock::default()).collect(),
-        bool_answers: (0..threads).map(|_| Mutex::default()).collect(),
-        phrase_answers: (0..threads).map(|_| Mutex::default()).collect(),
-        lines: (0..threads).map(|_| Mutex::default()).collect(),
-        scanned: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        built: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        evaluated: segments.iter().map(|_| AtomicU32::new(0)).collect(),
+        chunks: [0, 1].map(|_| many(max_chunks.unwrap_or(0))),
+        docs: many(n),
+        parts: many(PARTS),
+        bool_answers: many(threads),
+        phrase_answers: many(threads),
+        lines: many(threads),
+        scanned: many(n),
+        built: many(n),
+        evaluated: many(n),
         segments,
     };
     let words = AtomicUsize::new(0);
-    let table = OnceLock::new();
+    let sketches: Vec<Mutex<Vec<u64>>> = many(threads);
+    // The table sized from the estimate, and the one sized for every word to
+    // be distinct, used only if an insert into the first ran out of probes.
+    let (table, fallback, overflow) = (OnceLock::new(), OnceLock::new(), AtomicBool::new(false));
     let parsed: Vec<OnceLock<Parsed>> = (0..threads).map(|_| OnceLock::new()).collect();
     let barrier = Barrier::new(threads);
     std::thread::scope(|s| {
         for i in 0..threads {
             let (shared, words, table, parsed, barrier, ranges) =
                 (&shared, &words, &table, &parsed, &barrier, &ranges);
+            let (sketches, fallback, overflow) = (&sketches, &fallback, &overflow);
             s.spawn(move || {
                 // Parse in parallel, size the table, insert in parallel, then anchor.
                 let mut mine = Parsed::parse(queries, ranges[i], ranges[i + 1]);
                 words.fetch_add(mine.word_count(), Relaxed);
+                *sketches[i].lock().unwrap() = std::mem::take(&mut mine.sketch);
                 if barrier.wait().is_leader() {
-                    let _ = table.set(Table::new(words.load(Relaxed), threads));
+                    let mut sketch = vec![0; SKETCH_BITS / 64];
+                    for part in sketches {
+                        let part = part.lock().unwrap();
+                        sketch
+                            .iter_mut()
+                            .zip(part.iter())
+                            .for_each(|(a, b)| *a |= b);
+                    }
+                    let estimate = Some(distinct(&sketch));
+                    let _ = table.set(Table::new(words.load(Relaxed), estimate, threads));
                 }
                 barrier.wait();
-                let table = table.get().unwrap();
-                mine.insert(table, queries);
+                let mut table = table.get().unwrap();
+                if !mine.insert(table, queries) {
+                    overflow.store(true, Relaxed);
+                }
                 barrier.wait();
+                if overflow.load(Relaxed) {
+                    if barrier.wait().is_leader() {
+                        let _ = fallback.set(Table::new(words.load(Relaxed), None, threads));
+                    }
+                    barrier.wait();
+                    table = fallback.get().unwrap();
+                    let inserted = mine.insert(table, queries);
+                    assert!(inserted, "a table with free slots takes every word");
+                    barrier.wait();
+                }
                 mine.choose_anchors(table, i);
                 *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
                 *shared.phrase_answers[i].lock().unwrap() =
@@ -177,12 +203,16 @@ fn run(data: &str, out_dir: &str) {
     }
 }
 
-/// Cuts `docs.txt` into segments at line starts.
+/// `n` default values (locks, counters).
+fn many<T: Default>(n: usize) -> Vec<T> {
+    (0..n).map(|_| T::default()).collect()
+}
+
+/// Cuts `docs.txt` into segments at line starts, of about `SEGMENT_BYTES`
+/// and at most `MAX_SEGMENT_DOCS` documents.
 fn plan(file: &File) -> Vec<Segment> {
-    let len = file
-        .metadata()
-        .unwrap_or_else(|e| fail(&format!("docs.txt: {e}")))
-        .len();
+    let meta = file.metadata();
+    let len = meta.map_or_else(|e| fail(&format!("docs.txt: {e}")), |m| m.len());
     let mut last = [0u8; 1];
     if len > 0 && (read_full(file, &mut last, len - 1) != 1 || last[0] != b'\n') {
         fail("docs.txt must end with an LF");
@@ -190,13 +220,34 @@ fn plan(file: &File) -> Vec<Segment> {
     if len >= 1 << 32 {
         fail("docs.txt is larger than 4 GB");
     }
+    if len == 0 {
+        return Vec::new();
+    }
+    // The first line start at or after `at`, with its id (the end of the file
+    // counts as the line after the last).
+    let docs = last_id(file, len) + 1;
+    let line = |at: u64| match next_line(file, len, at) {
+        end if end == len => (len, docs),
+        start => (start, id_at(file, start)),
+    };
     let mut segments: Vec<Segment> = Vec::new();
-    let mut start = 0;
+    let (mut start, mut first) = (0, id_at(file, 0));
     while start < len {
-        let (end, first) = (
-            next_line(file, len, start + SEGMENT_BYTES),
-            id_at(file, start),
-        );
+        let (mut end, mut next) = line(start + SEGMENT_BYTES);
+        if next - first > MAX_SEGMENT_DOCS {
+            // Many short documents: bisect for the last line start that keeps
+            // the segment within u16 document numbers (`start + 1` does).
+            let (mut lo, mut hi) = (start + 1, end);
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if line(mid).1 - first <= MAX_SEGMENT_DOCS {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            (end, next) = line(lo);
+        }
         let chunks = (end - start).div_ceil(CHUNK_BYTES) as usize;
         segments.push(Segment {
             start,
@@ -204,9 +255,31 @@ fn plan(file: &File) -> Vec<Segment> {
             first,
             chunks,
         });
-        start = end;
+        (start, first) = (end, next);
     }
     segments
+}
+
+/// The id of the line starting at `at`.
+fn id_at(file: &File, at: u64) -> u32 {
+    let mut id = [0u8; 16];
+    let n = read_full(file, &mut id, at);
+    parse_id(&id[..n])
+}
+
+/// The id of the last line of the file (`len` bytes, ending with an LF).
+fn last_id(file: &File, len: u64) -> u32 {
+    let mut end = len - 1; // the final LF
+    loop {
+        let from = end.saturating_sub(4096);
+        let mut buf = [0u8; 4096];
+        let n = read_full(file, &mut buf[..(end - from) as usize], from);
+        match buf[..n].iter().rposition(|&b| b == b'\n') {
+            Some(i) => return id_at(file, from + i as u64 + 1),
+            None if from == 0 => return id_at(file, 0),
+            None => end = from,
+        }
+    }
 }
 
 /// The first line start at or after `at` (or the end of the file).
@@ -221,17 +294,6 @@ fn next_line(file: &File, len: u64, at: u64) -> u64 {
         pos += n as u64;
     }
     len
-}
-
-/// The id of the line starting at `at`.
-fn id_at(file: &File, at: u64) -> u32 {
-    let mut buf = [0u8; 16];
-    let n = read_full(file, &mut buf, at);
-    let digits = buf[..n].iter().position(|&b| b == b'\t').unwrap_or(0);
-    std::str::from_utf8(&buf[..digits])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| fail("a line of docs.txt does not start with a document id"))
 }
 
 /// The first line start of `text` at or after `at`.
@@ -291,13 +353,8 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 }
                 let seg = &sh.segments[s];
                 let at = |c: usize| (seg.start + c as u64 * CHUNK_BYTES).min(seg.end);
-                scanner.scan(
-                    sh.file,
-                    at(c),
-                    at(c + 1),
-                    seg.first,
-                    &mut sh.chunks[s % 2][c].write().unwrap(),
-                );
+                let out = &mut *sh.chunks[s % 2][c].write().unwrap();
+                scanner.scan(sh.file, (at(c), at(c + 1)), seg.first, out);
                 &sh.scanned[s]
             }
             Task::Build(s, p) => {
@@ -322,10 +379,8 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 if let Some(last) = sh.evaluated.last() {
                     wait(last, parsed.len());
                 }
-                let (bools, phrases) = (
-                    sh.bool_answers[r].lock().unwrap(),
-                    sh.phrase_answers[r].lock().unwrap(),
-                );
+                let bools = sh.bool_answers[r].lock().unwrap();
+                let phrases = sh.phrase_answers[r].lock().unwrap();
                 let out = &mut sh.lines[r].lock().unwrap();
                 for &entry in &parsed[r].order {
                     match entry & PHRASE {
@@ -343,19 +398,14 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
 /// Build task `p` of segment `s`: partition `p`'s postings, or (`p == PARTS`)
 /// the segment's phrase matches folded into the phrase answers, in document order.
 fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
-    let chunks: Vec<_> = sh.chunks[s % 2][..sh.segments[s].chunks]
-        .iter()
-        .map(|c| c.read().unwrap())
-        .collect();
+    let chunks = &sh.chunks[s % 2][..sh.segments[s].chunks];
+    let chunks: Vec<_> = chunks.iter().map(|c| c.read().unwrap()).collect();
     let docs = check_ids(&sh.segments, s, &chunks);
     sh.docs[s].store(docs, Relaxed);
     if p < PARTS {
         let streams = chunks.iter().map(|c| c.streams[p].as_slice());
-        sh.parts[p]
-            .write()
-            .unwrap()
-            .build(streams, terms, docs as usize, cursor);
-        return;
+        let mut part = sh.parts[p].write().unwrap();
+        return part.build(streams, terms, docs as usize, cursor);
     }
     let mut answers: Vec<_> = sh
         .phrase_answers
@@ -363,8 +413,8 @@ fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
         .map(|a| a.lock().unwrap())
         .collect();
     for &(phrase, doc) in chunks.iter().flat_map(|c| &c.matches) {
-        answers[(phrase >> RANGE_SHIFT) as usize][(phrase & ((1 << RANGE_SHIFT) - 1)) as usize]
-            .push(doc);
+        let (range, i) = (phrase >> RANGE_SHIFT, phrase & ((1 << RANGE_SHIFT) - 1));
+        answers[range as usize][i as usize].push(doc);
     }
 }
 
