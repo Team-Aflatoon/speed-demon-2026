@@ -94,8 +94,8 @@ By difference on the box: one parse about 9.6 ms, the second parse plus scatter 
 counting sort plus offsets 18.3 ms, BFS + layout + in-edges about 30 ms, and the queries
 about 75 ms. The first CSR costs 1.7x its local time, about the clock ratio, but the sort
 step costs 4-5x, which the local profile does not explain (its working set per bucket,
-about 165 KB, fits in L2). Probes with 1,024- and 2,048-node buckets are queued to test
-that.
+about 165 KB, fits in L2). Smaller buckets did not help (see below), so that cost is not
+the per-bucket working set.
 
 ## Experiments that did not make it
 
@@ -148,6 +148,10 @@ that.
 - **Reusing the first CSR's tail side array for the in-edge build** (it has the same
   size, so no fresh page faults): median CPU 1051 against 1069 ms, within noise, and M
   unchanged. Not worth the extra parameter.
+- **Smaller buckets for both bucketed builds** (box, full correct runs). With 1,024-node
+  buckets (run-60ca41139fe7) the box measured 151.2 ms, 70.3 MB, K 24.86. With 2,048
+  (run-b927b67c49d7) it measured 141.4 ms, 70.5 MB, K 25.70. Both are v4-level or worse
+  against 4,096 (141-148 ms), and the same locally. Kept 4,096.
 - **One parse for the first CSR** (box probe d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
   Each thread scatters into its own per-bucket runs, sized from its share of the text
   with a spill list for overflow, and a counting sort per bucket writes the final CSR

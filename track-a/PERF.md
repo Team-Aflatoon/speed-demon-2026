@@ -265,10 +265,15 @@ and interleaved runs:
 | 48 | a13 on the board: the same with `pread` in 128 KB pieces; each worker frees its buffer after one of the last pieces | run-cbad326faf08 | 0.0207 | 18.5 | 83.4 |
 | 49 | Count pass tallied by the record's top 12 bits (endpoint id and 5xx flag together), one increment per record instead of a packed 64-bit add: 654M to 628M instructions | | 0.013 | 16.5 | |
 | 50 | Log blocks of 4 KB (one page per worker) instead of 1 KB: page faults 9.1k to 6.3k, since four workers no longer race to fault in the same fresh page | | 0.013 | 17.0 | |
-| 51 | Each hour's text reserves room for all its lines at once (untouched pages cost nothing), so it never grows by copying: M median 17.1 to 15.9 MB, 300 fewer page faults | | 0.013 | 15.9 | |
-| 52 | **v8 as submitted**: steps 42-51 (a13's reading with steps 49 to 51); 628M instructions, 6.2k page faults; S 530 | | | | |
+| 51 | a19 on the board (commit 78c891f): a13 with steps 49 and 50. A single box run is noisy: this one came in 2 ms above a13's, with fewer instructions and faults | run-7090294e66d1 | 0.0227 | 18.4 | 82.4 |
+| 52 | Each hour's text reserves room for all its lines at once (untouched pages cost nothing), so it never grows by copying: M median 17.1 to 15.9 MB, 300 fewer page faults | | 0.013 | 15.9 | |
+| 53 | **a20 as submitted** (commit c8e36fb): steps 42-52, a19 plus step 52; 628M instructions, 6.2k page faults; S 530. Nearest board evidence: a19 (row 51) and a13 (row 48) | | | | |
 
-On the box, instruction counts matter less than kernel work: a12 does 5% fewer
+The box's single runs vary by about 10% (a13 and a19, nearly the same program, ran 20.7
+and 22.7 ms), so the reading decision rests on all five runs, not one pair: every build
+that maps the input took 24.5 ms or more (v7 24.5, a12 24.5, a14 26.0), every build that
+preads it 22.7 ms or less (a13 20.7, a19 22.7). On the box, instruction counts matter less
+than kernel work: a12 does 5% fewer
 instructions than v7 and ran in the same 24.5 ms, while removing the input's faults saved
 3.8 ms. So the last step went after faults too.
 
