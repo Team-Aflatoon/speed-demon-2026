@@ -26,6 +26,23 @@ added once a step has a board run.
 | 10 | One persistent team of 12 threads woken by a barrier, instead of spawning threads for each of the 11 parallel phases (11 empty spawn rounds measured 5 ms) | | 0.110 to 0.107 (local, A/B medians) | 77 (local) | |
 | 11 | The BFS walk copies each row as it dequeues it, so the forward graph is laid out in new-id order with one sequential renaming copy; `permute` and its random-access passes are gone (BFS + layout 24 to 21-24 ms, in-process minima) | | 0.105 (local) | 77 (local) | |
 | 12 | The layout reuses the first graph's arrays (27 MB fewer page faults); S trims (shorter if/else and answer conversion, fewer attributes): S 553 to 525 | | 0.122 vs v1 0.135 (local, interleaved medians under heavy machine load) | 78 (local) | |
+| 13 | Leaner BFS phase: `rank` is the claim flag (0 until claimed, then a provisional thread-and-index id fixed up once counts are known), the queue holds only the frontier, degrees take a byte each. Drops the order list, claim flags and end offsets (BFS + layout phase 75.6 to 58 MiB) | | same CPU (local) | 76 (local) | |
+| 14 | 32-bit tentative distances; a query whose distances pass 2^32 - 2 is answered again with 64 bits, so results stay exact (query phase 76 to 71 MiB) | | same CPU: 1000 vs 1020 ms total (local) | 71 (local) | |
+| 15 | The radix heap keys in the search's width too: a 32-bit search only queues keys that fit, so entries take 8 bytes, not 16 (query phase 71 to 68 MiB) | | CPU 1075 to 1035 ms total (local, A/B medians) | 68 (local) | |
+| 16 | S trims: one blanket `Width` trait for the bounds, `distance` takes the pair of searches, in-edges back to `build_csr`, unused helpers removed: S 600 to 538 | | same (local) | 68 (local) | |
+
+Peak memory by phase (local, cgroup `memory.current` sampled every 0.1 ms, maximum per
+phase, MiB). The board's M is the largest of these, and every v3 step aimed at whichever
+phase was on top.
+
+| Phase | v2 (step 12) | v3 (step 16) | What is live |
+|---|---|---|---|
+| Parse into the first CSR | 40 | 40 | edges 20 + tail side array 10 + offsets 7 |
+| BFS walk and layout | **75.6** | 58 | first CSR 27 + copied rows 20 + rank 7 (v2: also the order list, end offsets, claim flags) |
+| Read queries.txt | 39 | 38.5 | forward CSR 27 + rank 7 |
+| In-edge transpose | 68 | **66.5** | forward 27 + in-edges being built 37 |
+| Queries | **77** | **68** | both CSRs 54 + per-search state (v2 18, v3 10) |
+| Write output | 60 | 60 | both CSRs + answers |
 
 ## Experiments that did not make it
 
@@ -67,6 +84,19 @@ added once a step has a board run.
   for each of the 24 searches at their largest).
 - **A 32-bit tail side array** (which drops the atomic-type trait): 9 fewer lines, but the
   transpose was about 2 ms slower. Reverted.
+
+- **In-edges by a direct atomic transpose** (count, then place each edge at its row's
+  next slot; cheap after the BFS renumbering because the counters a thread bumps are its
+  own): correct and as fast, and its phase drops from 67 to 57 MiB. But the query phase
+  stays on top, so M does not move. Removed to save 35 lines.
+- **Releasing a big search's distance blocks after the query** (`munmap`, so the peak
+  follows the searches running now rather than each thread's largest): -6 MiB, but +25%
+  total CPU. Every unmap in a 12-thread process shoots down the TLBs of all its CPUs, and
+  the pages fault back in on the next big search.
+- **Interleaving out- and in-edge rows behind one offset array** (the lead's idea, -5 MiB):
+  not tried in the end. Building it within the current peak needs an in-place serial
+  expansion of the edge array, and compressed offsets had already shown that the extra
+  row arithmetic costs more in T than the saved memory earns in M.
 
 ## Lessons
 

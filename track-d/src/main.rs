@@ -9,8 +9,10 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::collections::VecDeque;
 use std::sync::{Barrier, Mutex, OnceLock};
+use std::thread::available_parallelism;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -187,13 +189,6 @@ struct Csr {
 }
 
 impl Csr {
-    /// Bits left for the weight once a head id below n is stored.
-    fn weight_bits(n: usize) -> u32 {
-        let head_bits = usize::BITS - (n.max(2) - 1).leading_zeros();
-        assert!(head_bits <= 26, "too many nodes");
-        32 - head_bits
-    }
-
     fn rows(&self) -> usize {
         self.off.len() - 1
     }
@@ -236,7 +231,9 @@ fn build_csr(
     n: usize,
     map: impl Fn(usize, usize) -> (usize, usize) + Sync,
 ) -> Csr {
-    let weight_bits = Csr::weight_bits(n);
+    // Bits left for the weight once a head id below n is stored.
+    let weight_bits = 32 - (usize::BITS - (n.max(2) - 1).leading_zeros());
+    assert!(weight_bits >= 6, "too many nodes for 32-bit edges");
     let escape = (1u64 << weight_bits) - 1;
     const BUCKET_BITS: u32 = 12; // a bucket's histogram stays in L1
     let buckets = (n >> BUCKET_BITS) + 1;
@@ -327,62 +324,77 @@ fn prefetch<T>(data: &[T]) {
 
 /// Renumbers the nodes in BFS order and returns `rank` (old id -> new id) with the
 /// graph laid out in that order. Each thread walks its own share of the old ids and
-/// grows a BFS region from every one not yet claimed (nodes are claimed with an atomic
-/// flag), so the first regions spread until they meet and later roots mop up what is
-/// left; no thread idles while another still has work. Inside a region the BFS rings
-/// put road-network neighbours at nearby ids. A thread copies each row as it dequeues
-/// it, so its rows come out already in new-id order: placing them is a sequential copy
-/// that renames the heads, with no reordering pass over the whole graph.
+/// grows a BFS region from every one not yet claimed, so the first regions spread until
+/// they meet and later roots mop up what is left; no thread idles while another still
+/// has work. Inside a region the BFS rings put road-network neighbours at nearby ids.
+///
+/// A thread copies each row as it dequeues it, so its rows come out already in new-id
+/// order and placing them is one sequential, renaming copy. To keep this phase's memory
+/// down, `rank` itself is the claim flag: 0 while unclaimed, then `(k << 27 | i) + 1` for
+/// thread k's i-th node until the threads' counts are known. Degrees are kept in a byte
+/// each (255 means "see `wide`"), and the BFS queue holds only the frontier.
 fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let n = g.rows();
-    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let mut rank = vec![0u32; n];
+    let ids = as_atomic(&mut rank);
     // The plain load first: most neighbours are already claimed, and skipping the
-    // locked swap for them keeps the walk free of fences.
-    let claim = |v: usize| !claimed[v].load(Relaxed) && !claimed[v].swap(true, Relaxed);
+    // locked exchange for them keeps the walk free of fences.
+    let claim = |v: usize, id: u32| ids[v].load(Relaxed) == 0 && ids[v].compare_exchange(0, id, Relaxed, Relaxed).is_ok();
     let walks = parallel(vec![(); threads], |k, ()| {
-        let (mut order, mut ends, mut rows, mut head) = (Vec::new(), Vec::new(), Vec::new(), 0);
+        let (mut queue, mut degrees, mut wide, mut rows) = (VecDeque::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut next = (k << 27) as u32 + 1;
         for root in k * n / threads..(k + 1) * n / threads {
-            if !claim(root) {
-                continue;
+            if claim(root, next) {
+                queue.push_back(root as u32);
+                next += 1;
             }
-            order.push(root as u32);
-            while let Some(&u) = order.get(head) {
-                head += 1;
+            while let Some(u) = queue.pop_front() {
                 // The queue says which rows come next: fetch them ahead of time.
-                if let Some(&ahead) = order.get(head + 8) {
+                if let Some(&ahead) = queue.get(8) {
                     prefetch(&g.edges[g.off[ahead as usize] as usize..]);
                 }
-                if let Some(&ahead) = order.get(head + 16) {
+                if let Some(&ahead) = queue.get(16) {
                     prefetch(&g.off[ahead as usize..]);
                 }
                 let row = &g.edges[g.off[u as usize] as usize..g.off[u as usize + 1] as usize];
                 rows.extend_from_slice(row);
-                ends.push(rows.len() as u32);
+                degrees.push(row.len().min(255) as u8);
+                if row.len() >= 255 {
+                    wide.push(row.len() as u32);
+                }
                 for &e in row {
-                    if claim((e >> g.weight_bits) as usize) {
-                        order.push(e >> g.weight_bits);
+                    if claim((e >> g.weight_bits) as usize, next) {
+                        queue.push_back(e >> g.weight_bits);
+                        next += 1;
                     }
                 }
             }
         }
-        (order, ends, rows)
+        (degrees, wide, rows)
+    });
+    // Thread k's nodes take the next run of new ids and its rows the next run of edges.
+    let starts: Vec<_> = walks.iter().scan((0, 0), |at, w| Some(std::mem::replace(at, (at.0 + w.0.len(), at.1 + w.2.len())))).collect();
+    let ranges = (0..threads).map(|k| k * n / threads..(k + 1) * n / threads).collect();
+    parallel(ranges, |_, nodes| {
+        for v in nodes {
+            let id = ids[v].load(Relaxed) - 1;
+            let first = starts[id as usize >> 27].0 as u32;
+            ids[v].store(first + (id & ((1 << 27) - 1)), Relaxed);
+        }
     });
     // Every row has been copied out, so the old arrays (same sizes) take the new graph:
     // overwriting them costs no fresh page faults.
     let (mut off, mut edges, weight_bits) = (g.off, g.edges, g.weight_bits);
-    // Thread k's nodes take the next run of new ids and its rows the next run of edges.
-    let starts: Vec<_> = walks.iter().scan((0, 0), |at, w| Some(std::mem::replace(at, (at.0 + w.0.len(), at.1 + w.2.len())))).collect();
-    let mut rank = vec![0u32; n];
-    let ranks = as_atomic(&mut rank);
-    parallel(walks.iter().zip(&starts).collect(), |_, ((order, _, _), &(first, _))| {
-        order.iter().enumerate().for_each(|(i, &v)| ranks[v as usize].store((first + i) as u32, Relaxed))
-    });
     let (off_cells, edge_cells) = (as_atomic(&mut off[1..]), as_atomic(&mut edges));
     let mask = (1 << weight_bits) - 1;
-    parallel(walks.into_iter().zip(starts).collect(), |_, ((_, ends, rows), (first, at))| {
-        ends.iter().enumerate().for_each(|(i, &end)| off_cells[first + i].store(at as u32 + end, Relaxed));
+    parallel(walks.into_iter().zip(starts).collect(), |_, ((degrees, wide, rows), (first, at))| {
+        let (mut w, mut end) = (wide.into_iter(), at as u32);
+        for (i, &d) in degrees.iter().enumerate() {
+            end += if d < 255 { d as u32 } else { w.next().unwrap() };
+            off_cells[first + i].store(end, Relaxed);
+        }
         for (i, &e) in rows.iter().enumerate() {
-            edge_cells[at + i].store(rank[(e >> weight_bits) as usize] << weight_bits | e & mask, Relaxed);
+            edge_cells[at + i].store(ids[(e >> weight_bits) as usize].load(Relaxed) << weight_bits | e & mask, Relaxed);
         }
     });
     let rename = |&(t, h, w): &(u32, u32, u32)| (rank[t as usize], rank[h as usize], w);
@@ -394,18 +406,21 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
 /// A monotone priority queue for Dijkstra: a key lives in the bucket of the highest bit
 /// where it differs from the last key popped, so pushes are O(1) and each key moves
 /// down at most 64 times. Valid because Dijkstra never pushes below the last pop.
-struct RadixHeap {
+/// Keys are kept in the search's width `T`: a 32-bit search queues only keys that fit
+/// (it checks every distance before storing it), so its entries take 8 bytes, not 16.
+struct RadixHeap<T> {
     last: u64,
-    buckets: Vec<Vec<(u64, u32)>>,
+    buckets: Vec<Vec<(T, u32)>>,
 }
 
-impl RadixHeap {
+impl<T: Width> RadixHeap<T> {
     fn new() -> Self {
         RadixHeap { last: 0, buckets: (0..65).map(|_| Vec::new()).collect() }
     }
 
     fn push(&mut self, key: u64, v: u32) {
-        self.buckets[(64 - (key ^ self.last).leading_zeros()) as usize].push((key, v));
+        let entry = (T::try_from(key).ok().expect("the search checks every key fits"), v);
+        self.buckets[(64 - (key ^ self.last).leading_zeros()) as usize].push(entry);
     }
 
     /// The smallest key, or u64::MAX when empty. Refills bucket 0 from the first
@@ -414,9 +429,9 @@ impl RadixHeap {
         if self.buckets[0].is_empty() {
             let Some(b) = self.buckets.iter().position(|b| !b.is_empty()) else { return u64::MAX };
             let moved = std::mem::take(&mut self.buckets[b]);
-            self.last = moved.iter().map(|e| e.0).min().unwrap();
+            self.last = moved.iter().map(|e| e.0.into()).min().unwrap();
             for &(key, v) in &moved {
-                self.push(key, v);
+                self.push(key.into(), v);
             }
             self.buckets[b] = moved;
             self.buckets[b].clear();
@@ -426,32 +441,33 @@ impl RadixHeap {
 
     /// Removes an entry with the smallest key; call `min` first.
     fn pop(&mut self) -> (u64, u32) {
-        self.buckets[0].pop().unwrap()
+        let (key, v) = self.buckets[0].pop().unwrap();
+        (key.into(), v)
     }
 
-    /// Empties the queue. A bucket that grew large hands its buffer back, so that the
-    /// buckets of later searches share that memory instead of each keeping its peak.
     fn clear(&mut self) {
-        for bucket in &mut self.buckets {
-            bucket.clear();
-            bucket.shrink_to(256);
-        }
+        self.buckets.iter_mut().for_each(Vec::clear);
         self.last = 0;
     }
 }
 
-/// Per-thread tentative distances, stored as `d + 1` so that 0 means "not reached".
-/// Nodes are grouped into blocks of `BLOCK`; a block is allocated the first time a
-/// search touches it, so memory follows the size of the search, not of the graph.
-struct Distances {
+/// Per-thread tentative distances, stored as `d + 1` so that 0 means "not reached", in
+/// a `T` of 32 or 64 bits. Nodes are grouped into blocks of `BLOCK`; a block is allocated
+/// the first time a search touches it, so memory follows the size of the search, not
+/// of the graph.
+struct Distances<T> {
     dir: Vec<u32>,
     owners: Vec<u32>,
-    blocks: Vec<[u64; BLOCK]>,
+    blocks: Vec<[T; BLOCK]>,
 }
 
 const BLOCK: usize = 128;
 
-impl Distances {
+/// What a search can store a distance in: u32 or u64.
+trait Width: Copy + Default + Into<u64> + TryFrom<u64> {}
+impl<T: Copy + Default + Into<u64> + TryFrom<u64>> Width for T {}
+
+impl<T: Width> Distances<T> {
     fn new(n: usize) -> Self {
         // Reserved for the whole graph, which only costs address space: a block's
         // memory is faulted in when first used, and the Vec never has to grow.
@@ -459,10 +475,10 @@ impl Distances {
         Distances { dir: vec![0; n / BLOCK + 1], owners: Vec::new(), blocks }
     }
 
-    fn slot(&mut self, v: usize) -> &mut u64 {
+    fn slot(&mut self, v: usize) -> &mut T {
         let entry = &mut self.dir[v / BLOCK];
         if *entry == 0 {
-            self.blocks.push([0; BLOCK]);
+            self.blocks.push([T::default(); BLOCK]);
             self.owners.push((v / BLOCK) as u32);
             *entry = self.blocks.len() as u32;
         }
@@ -473,7 +489,7 @@ impl Distances {
     fn get(&self, v: usize) -> Option<u64> {
         match self.dir[v / BLOCK] {
             0 => None,
-            b => self.blocks[b as usize - 1][v % BLOCK].checked_sub(1),
+            b => Into::<u64>::into(self.blocks[b as usize - 1][v % BLOCK]).checked_sub(1),
         }
     }
 
@@ -484,36 +500,38 @@ impl Distances {
 }
 
 /// One direction of a bidirectional search: tentative distances plus its queue.
-struct Search {
-    dist: Distances,
-    heap: RadixHeap,
+struct Side<T> {
+    dist: Distances<T>,
+    heap: RadixHeap<T>,
 }
 
-impl Search {
+impl<T: Width> Side<T> {
     fn new(n: usize) -> Self {
-        Search { dist: Distances::new(n), heap: RadixHeap::new() }
+        Side { dist: Distances::new(n), heap: RadixHeap::new() }
     }
 
     fn start(&mut self, v: usize) {
         self.heap.clear();
         self.dist.clear();
-        *self.dist.slot(v) = 1;
+        *self.dist.slot(v) = T::try_from(1).ok().expect("1 fits any width");
         self.heap.push(0, v as u32);
     }
 
     /// Settles the closest queued node of `g` (a stale entry is just dropped) and returns
-    /// the best s-t length found through a node the `other` search has reached.
+    /// the best s-t length found through a node the `other` search has reached, or None
+    /// if a distance outgrew `T`.
     #[inline(always)]
-    fn step(&mut self, g: &Csr, other: &Distances, mut best: u64) -> u64 {
+    fn step(&mut self, g: &Csr, other: &Distances<T>, mut best: u64) -> Option<u64> {
         let (d, u) = self.heap.pop();
-        if d + 1 > *self.dist.slot(u as usize) {
-            return best; // stale: u was settled at a smaller distance
+        if d + 1 > (*self.dist.slot(u as usize)).into() {
+            return Some(best); // stale: u was settled at a smaller distance
         }
         for (v, w) in g.out(u as usize) {
             let nd = d + w;
             let slot = self.dist.slot(v);
-            if *slot == 0 || nd < *slot - 1 {
-                *slot = nd + 1;
+            let known: u64 = (*slot).into();
+            if known == 0 || nd < known - 1 {
+                *slot = T::try_from(nd + 1).ok()?;
                 self.heap.push(nd, v as u32);
                 prefetch(&g.edges[g.off[v] as usize..]); // v's row is needed once v settles
                 if let Some(rest) = other.get(v) {
@@ -521,21 +539,22 @@ impl Search {
                 }
             }
         }
-        best
+        Some(best)
     }
 }
 
-/// Bidirectional Dijkstra: forward from `s` over `fwd`, backward from `t` over the
-/// in-edges `bwd`. The sides take turns, so both settle about as many nodes
+/// Bidirectional Dijkstra: forward from `s` over the out-edges `g[0]`, backward from `t`
+/// over the in-edges `g[1]`. The sides take turns, so both settle about as many nodes
 /// (balancing on keys instead lets one side sweep the whole graph when the other starts
 /// behind a 2^32 weight). Once the two smallest keys sum to at least the best meeting
 /// length found, no shorter path can remain. An exhausted side (key u64::MAX) also
 /// stops it: it has settled every node on its side of any s-t path, so `best` is
 /// exact, or u64::MAX if there is no path. This covers every unreachable case cheaply
 /// as long as one side is small: a source without out-edges, a target without in-edges.
-fn distance(fwd: &Csr, bwd: &Csr, f: &mut Search, b: &mut Search, s: usize, t: usize) -> i64 {
+/// Returns None if a distance does not fit the searches' `T`.
+fn distance<T: Width>(g: [&Csr; 2], [f, b]: &mut [Side<T>; 2], s: usize, t: usize) -> Option<i64> {
     if s == t {
-        return 0;
+        return Some(0);
     }
     f.start(s);
     b.start(t);
@@ -545,9 +564,9 @@ fn distance(fwd: &Csr, bwd: &Csr, f: &mut Search, b: &mut Search, s: usize, t: u
         if kf.saturating_add(kb) >= best {
             break;
         }
-        best = if round % 2 == 0 { f.step(fwd, &b.dist, best) } else { b.step(bwd, &f.dist, best) };
+        best = if round % 2 == 0 { f.step(g[0], &b.dist, best)? } else { b.step(g[1], &f.dist, best)? };
     }
-    best.try_into().unwrap_or(-1) // u64::MAX (no path) is the one value i64 cannot hold
+    Some(best.try_into().unwrap_or(-1)) // u64::MAX (no path) is the one value i64 cannot hold
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -561,7 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mallopt(-3, 1 << 20);
         prctl(41, 1u64, 0u64, 0u64, 0u64);
     }
-    let threads = std::thread::available_parallelism().map_or(1, usize::from).min(12);
+    let threads = available_parallelism().map_or(1, usize::from).min(12);
     Team::start(threads);
     let text = map_file("/data/graph.txt")?;
     let mut i = 0;
@@ -585,11 +604,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let answers: Vec<AtomicI64> = (0..queries.len()).map(|_| AtomicI64::new(0)).collect();
     let next = AtomicUsize::new(0);
     parallel(vec![(); threads], |_, ()| {
-        let (mut f, mut b) = (Search::new(n), Search::new(n));
+        // 32-bit distances halve the searches' memory. The rare query whose distances
+        // pass 2^32 - 2 (it needs a near-2^32 edge) is answered again with 64 bits.
+        let mut narrow = [Side::<u32>::new(n), Side::new(n)];
+        let mut wide = [Side::<u64>::new(n), Side::new(n)];
         loop {
             let q = next.fetch_add(1, Relaxed);
             let Some(&(s, t)) = queries.get(q) else { break };
-            answers[q].store(distance(&fwd, &bwd, &mut f, &mut b, s, t), Relaxed);
+            let g = [&fwd, &bwd];
+            let answer = distance(g, &mut narrow, s, t).or_else(|| distance(g, &mut wide, s, t));
+            answers[q].store(answer.expect("64-bit distances always fit"), Relaxed);
         }
     });
     let out: String = answers.iter().map(|a| format!("{}\n", a.load(Relaxed))).collect();

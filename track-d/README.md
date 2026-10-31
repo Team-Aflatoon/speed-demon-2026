@@ -37,7 +37,9 @@ are renumbered in BFS order. Every thread grows BFS regions from roots in its ow
 the ids, claiming nodes with an atomic flag, until the regions meet. Inside a region, BFS
 rings put neighbouring streets at nearby ids. This alone made the searches about 4x faster.
 Each thread copies every row as it dequeues it, so its rows come out already in new-id
-order. Laying out the forward graph is then one sequential copy that renames the heads,
+order. During the walk `rank` itself is the claim flag (a provisional thread-and-index id,
+fixed up afterwards), and the queue holds only the frontier, so the walk adds little
+memory beyond the copied rows. Laying out the forward graph is then one sequential copy that renames the heads,
 written into the first graph's own arrays (same sizes), which saves 27 MB of fresh page
 faults. The in-edge graph is a transpose of that, built in memory with the same bucketed
 build.
@@ -54,6 +56,9 @@ in-edges, stopping once the two queue minima sum to at least the best meeting le
 - An exhausted side ends the search immediately, which answers the unreachable cases
   (no out-edges, no in-edges, islands) almost for free.
 - The priority queue is a radix heap, which suits Dijkstra's monotone integer keys.
+- Distances and heap keys are 32-bit. A query whose distances pass 2^32 - 2 (only
+  possible through near-2^32 weights) is detected and answered again with 64-bit
+  searches, so every answer is exact. That halves the searches' memory.
 - Tentative distances live in per-thread blocks of 128 nodes that are allocated only where
   a search actually goes, so memory follows the size of the search rather than the graph.
 - When a node is first queued, its edge row is prefetched, since it is needed as soon as
@@ -85,9 +90,10 @@ radius. What is left to try:
 - Fuse the first count pass into the scatter: parse each piece once into per-thread
   buckets sized from the piece length, with a spill list for overflow. That saves one pass
   over the text (about 5 ms) if the memory can be kept under the query-phase peak.
-- Lower both memory peaks together: the transpose (16-bit tail side array) and the
-  query-phase distances (32-bit storage with a 64-bit fallback for the rare search that
-  crosses 2^32). Each alone does not move the peak.
+- Lower the two memory peaks together. The in-edge transpose and the queries now both
+  sit at about 67 MiB. A direct atomic transpose already takes the first down to 57 MiB,
+  and compressing the row offsets would take about 6 MiB off both. Each pays only if the
+  other moves too.
 - Goal-directed search (ALT landmarks) would cut the searches, the largest phase, but one
   full Dijkstra per landmark costs more than it saves at 2,000 short queries. Worth
   revisiting only with a much cheaper way to get the landmark distances.
