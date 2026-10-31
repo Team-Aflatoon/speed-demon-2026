@@ -1,20 +1,20 @@
 //! Track A (Ingest): for every (UTC hour, endpoint) group of an HTTP request log, the
 //! request count, nearest-rank p50/p95/p99 latency and the 5xx count and rate.
 //!
-//! Workers read the log in pieces, in file order, and parse each into one 4-byte record
-//! per line appended to that hour's log. An hour is reported as soon as the parsed
-//! prefix of the file has moved two hours past it, while parsing goes on: its log is
-//! counting-sorted by endpoint, so every group is one slice, three selections give the
-//! percentiles, the log is freed, and the main thread writes the text once all earlier
-//! hours are out. Nothing bounds how late a line may come, so exact counts show at the
-//! end whether every hour was complete when reported; if one was not, the run is redone
-//! without reporting early. README.md explains the design; PERF.md has the measurements.
+//! Workers parse the memory-mapped log, in file order, into one 4-byte record per line
+//! appended to that hour's log. An hour is reported as soon as the parsed prefix of the
+//! file has moved two hours past it, while parsing goes on: its log is counting-sorted
+//! by endpoint, so every group is one slice, three selections give the percentiles, the
+//! log is freed, and the main thread writes the text once all earlier hours are out.
+//! Nothing bounds how late a line may come, so exact counts show at the end whether
+//! every hour was complete when reported; if one was not, the run is redone without
+//! reporting early. README.md explains the design; PERF.md has the measurements.
 
 use std::arch::x86_64::*;
 use std::io::{self, Seek, Write};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
-use std::{cell::UnsafeCell, fs::File, ops::Range, os::unix::fs::FileExt, ptr, slice, thread};
+use std::{cell::UnsafeCell, fs::File, ops::Range, os::fd::AsRawFd, ptr, slice, thread};
 
 /// Hours in the log: the spec fixes the span at 2026-10-30T18:00Z to 2026-11-02T18:00Z.
 const HOURS: usize = 72;
@@ -28,23 +28,22 @@ const MARK: u32 = 1 << 20;
 const SLOTS: usize = 1 << 13;
 /// Records a worker reserves at a time in an hour's log (1 KB, 16 cache lines).
 const BLOCK: usize = 256;
-/// Bytes of input a worker claims and reads at a time: a buffer that, with its
-/// hyperthread sibling's, stays in a P-core's 1.25 MB L2.
-const PIECE: usize = 128 << 10;
-/// The longest line the grammar allows: timestamp, 7-byte method, 125-byte endpoint,
-/// status and 10-digit latency, with their separators and the newline.
-const MAX_LINE: usize = 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1;
+/// Bytes of input a worker claims at a time.
+const PIECE: usize = 1 << 20;
 /// Bytes whose line ends are indexed in one go (a multiple of 64).
 const SCAN: usize = 4096;
-/// Readable bytes the parser may touch past a line's start (more than MAX_LINE).
+/// Readable bytes the parser may touch past a line's start (the longest line is 177).
 const SLACK: usize = 256;
 /// Parsing and reporting threads; the main thread writes. The box has 12 CPUs.
 const WORKERS: usize = 11;
 
 // From <sys/mman.h>, <sys/prctl.h> and <malloc.h>.
+const PROT_READ: i32 = 1;
 const PROT_READ_WRITE: i32 = 1 | 2;
+const MAP_PRIVATE: i32 = 0x02;
 const MAP_PRIVATE_ANONYMOUS_NORESERVE: i32 = 0x02 | 0x20 | 0x4000;
 const MADV_DONTNEED: i32 = 4;
+const MADV_POPULATE_READ: i32 = 22;
 const PR_SET_THP_DISABLE: i32 = 41;
 const M_MMAP_THRESHOLD: i32 = -3;
 extern "C" {
@@ -77,25 +76,52 @@ fn run() -> io::Result<()> {
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let input = File::open(format!("{data_dir}/requests.log"))?;
     let mut out = File::create(format!("{out_dir}/summary.txt"))?;
-    if !Job::new(&input, true)?.run(&mut out)? {
+    let len = input.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: a private read-only mapping of the whole file, never unmapped, of a file
+    // nobody writes while we run. It is in the page cache already, so it costs page-table
+    // entries only and its pages are not charged to us.
+    let data = unsafe { slice::from_raw_parts(map(len, PROT_READ, MAP_PRIVATE, input.as_raw_fd())?, len) };
+    // Lines that start in the last SLACK bytes are parsed from a zero-padded copy.
+    let body = line_start(data, (len + 1).saturating_sub(SLACK));
+    let tail = [&data[body..], &[0; SLACK]].concat();
+    let tail = &tail[..len - body];
+    if !Job::new(data, tail, true)?.run(&mut out)? {
         // A line came after its hour was reported: start over, reporting at the end.
         (out.set_len(0)?, out.rewind()?);
-        Job::new(&input, false)?.run(&mut out)?;
+        Job::new(data, tail, false)?.run(&mut out)?;
     }
     Ok(())
 }
 
-/// Reserves room for `len` atomics `T`, zeroed; pages cost nothing until first touched.
-fn reserve<T>(len: usize) -> io::Result<&'static [T]> {
-    let (bytes, flags) = (len * size_of::<T>(), MAP_PRIVATE_ANONYMOUS_NORESERVE);
+/// Maps `len` bytes with protection `prot` and flags `flags`: of file `fd`, or anonymous
+/// memory if `fd` is -1.
+fn map(len: usize, prot: i32, flags: i32, fd: i32) -> io::Result<*mut u8> {
     // SAFETY: asks for a fresh mapping at an address of the kernel's choosing, so no
     // existing memory is affected; failure is reported as MAP_FAILED (-1).
-    let p = unsafe { mmap(ptr::null_mut(), bytes, PROT_READ_WRITE, flags, -1, 0) };
-    if p as isize == -1 {
-        return Err(io::Error::last_os_error());
+    let p = unsafe { mmap(ptr::null_mut(), len, prot, flags, fd, 0) };
+    match p as isize {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(p),
     }
+}
+
+/// Reserves room for `len` atomics `T`, zeroed; pages cost nothing until first touched.
+fn reserve<T>(len: usize) -> io::Result<&'static [T]> {
+    let p = map(len * size_of::<T>(), PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS_NORESERVE, -1)?;
     // SAFETY: fresh memory, never unmapped; zero bytes are a valid atomic integer.
     Ok(unsafe { slice::from_raw_parts(p.cast(), len) })
+}
+
+/// Where the first line that starts at or after byte `at` starts.
+fn line_start(data: &[u8], at: usize) -> usize {
+    let newline = data[at.max(1) - 1..].iter().position(|&b| b == b'\n');
+    match at {
+        0 => 0,
+        _ => newline.map_or(data.len(), |p| at + p),
+    }
 }
 
 /// A log record as (endpoint id and 5xx bits, latency).
@@ -157,12 +183,10 @@ type Piece = (*const u8, usize, usize);
 /// Everything the workers share.
 #[derive(Default)]
 struct Job<'a> {
-    /// The log and its length (an `Option` only so that `Job` can derive `Default`).
-    input: Option<&'a File>,
-    len: usize,
+    data: &'a [u8],
+    /// The padded copy of the lines that start in the last SLACK bytes: the last piece.
+    tail: &'a [u8],
     pieces: usize,
-    /// Per piece, the hour row of its first line plus one, once a worker has read it.
-    rows: Vec<AtomicUsize>,
     speculate: bool,
     /// The logs and side lists, `room` entries per hour: records with the endpoint id
     /// in bits 21 and up, the 5xx flag in bit 20 and a latency below MARK; side entries
@@ -187,16 +211,14 @@ struct Job<'a> {
 }
 
 impl<'a> Job<'a> {
-    fn new(input: &'a File, speculate: bool) -> io::Result<Job<'a>> {
-        let (len, input) = (input.metadata()?.len() as usize, Some(input));
+    fn new(data: &'a [u8], tail: &'a [u8], speculate: bool) -> io::Result<Job<'a>> {
         // Room for every line of the file in any one hour (a line has at least 40
         // bytes), plus each worker's last, partly used block.
-        let room = (len / 40 + 1 + WORKERS * BLOCK).next_multiple_of(1024);
+        let room = (data.len() / 40 + 1 + WORKERS * BLOCK).next_multiple_of(1024);
         Ok(Job {
-            input,
-            len,
-            pieces: len.div_ceil(PIECE),
-            rows: (0..len.div_ceil(PIECE)).map(|_| AtomicUsize::new(0)).collect(),
+            data,
+            tail,
+            pieces: (data.len() - tail.len()).div_ceil(PIECE) + 1,
             speculate,
             room,
             logs: reserve(HOURS * room)?,
@@ -243,22 +265,23 @@ impl<'a> Job<'a> {
 
     /// One worker: parses pieces and reports hours, whichever is due, until all is done.
     fn work(&self, sender: mpsc::Sender<(usize, Vec<u8>)>) {
-        let (mut open, mut parsed, mut lines, mut buf) = ([(0, 0); HOURS], None, 0, vec![]);
+        let (mut open, mut parsed, mut lines) = ([(0, 0); HOURS], None, 0);
         loop {
             match self.next_task(parsed.take()) {
                 Task::Piece(i) => {
-                    // SAFETY: `read` leaves SLACK zero bytes after the piece's lines.
-                    let piece = self.read(i, &mut buf);
-                    match piece.and_then(|piece| unsafe { self.parse(&mut open, piece) }) {
+                    // Fill the piece's page-table entries in one call rather than by a fault
+                    // per 64 KB. A hint: if it is refused, the faults do the same.
+                    // SAFETY: madvise on our own read-only mapping.
+                    let (p, from, to) = self.piece(i);
+                    let page = p.wrapping_add(from).map_addr(|a| a & !4095);
+                    let bytes = p.wrapping_add(to) as usize - page as usize;
+                    unsafe { madvise(page as _, bytes, MADV_POPULATE_READ) };
+                    // SAFETY: see `piece`.
+                    match unsafe { self.parse(&mut open, (p, from, to)) } {
                         Ok(n) => lines += n,
                         Err(e) => _ = lock(&self.plan).failure.get_or_insert(e),
                     }
                     parsed = Some(i);
-                    // Among the last pieces, this was most likely this worker's last one:
-                    // free its buffer now, not at the memory peak at the end.
-                    if i + WORKERS >= self.pieces {
-                        buf = Vec::new();
-                    }
                 }
                 Task::Hour(h) => {
                     let text = lock(&self.texts).pop().unwrap_or_default();
@@ -303,7 +326,7 @@ impl<'a> Job<'a> {
             let frontier = plan.parsing.iter().fold(plan.next_piece, |a, &i| a.min(i));
             let due = match frontier == self.pieces {
                 true => HOURS,
-                false if self.speculate => self.rows[frontier].load(Relaxed).saturating_sub(2),
+                false if self.speculate => self.first_row(frontier).saturating_sub(1),
                 false => 0,
             };
             if plan.failure.is_some() || plan.next_hour == HOURS {
@@ -323,28 +346,23 @@ impl<'a> Job<'a> {
         }
     }
 
-    /// Reads piece `i`, the lines that start in [i * PIECE, (i + 1) * PIECE), into `buf`:
-    /// from the byte before it to the end of its last line, then SLACK zero bytes. Also
-    /// notes the hour of its first line for the plan (one outside the span stays unknown).
-    fn read(&self, i: usize, buf: &mut Vec<u8>) -> io::Result<Piece> {
-        let (at, end) = ((i * PIECE).saturating_sub(1), self.len.min((i + 1) * PIECE + MAX_LINE));
-        buf.resize(end - at + SLACK, 0);
-        self.input.expect("set by `new`").read_exact_at(&mut buf[..end - at], at as u64)?;
-        buf[end - at..].fill(0);
-        // A line starts after a newline, so the byte before the piece decides where its
-        // first line starts, and the first newline from its last byte on where it stops.
-        let after_newline = |from: usize| {
-            let newline = buf[from..end - at].iter().position(|&b| b == b'\n');
-            newline.map_or(end - at, |p| from + p + 1)
-        };
-        let from = if i == 0 { 0 } else { after_newline(0) };
-        let to = match (i + 1) * PIECE < self.len {
-            true => after_newline((i + 1) * PIECE - 1 - at),
-            false => end - at,
-        };
-        let row = hour_row(&buf[from..from + 13]).map_or(0, |row| row + 1);
-        self.rows[i].store(row, Relaxed);
-        Ok((buf.as_ptr(), from, to))
+    /// Piece `i` as (bytes, first line start, end). Piece i < pieces - 1 holds the lines
+    /// that start in [i * PIECE, (i + 1) * PIECE) of the file; the last is the tail. The
+    /// SLACK bytes after any line start in a piece are readable.
+    fn piece(&self, i: usize) -> Piece {
+        let body = self.data.len() - self.tail.len();
+        let at = |i: usize| line_start(self.data, (i * PIECE).min(body));
+        match i + 1 < self.pieces {
+            true => (self.data.as_ptr(), at(i), at(i + 1)),
+            false => (self.tail.as_ptr(), 0, self.tail.len()),
+        }
+    }
+
+    /// The hour row of piece `i`'s first line (0 if it is outside the span).
+    fn first_row(&self, i: usize) -> usize {
+        let (p, from, _) = self.piece(i);
+        // SAFETY: a line start, so SLACK bytes are readable (zeros if the tail is empty).
+        hour_row(unsafe { slice::from_raw_parts(p.add(from), 13) }).unwrap_or(0)
     }
 
     /// The output lines of one hour, appended to `text`; `sorted` is scratch space.
