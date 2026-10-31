@@ -18,6 +18,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 // The values from the Linux and glibc headers for the calls above.
@@ -25,6 +26,8 @@ const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const M_MMAP_THRESHOLD: i32 = -3;
 const PR_SET_THP_DISABLE: i32 = 41;
+const PR_THP_DISABLE_EXCEPT_ADVISED: u64 = 1 << 1;
+const MADV_HUGEPAGE: i32 = 14;
 
 /// Maps a whole file read-only. The harness prewarms /data into the page cache, so this
 /// costs neither a copy nor memory charged to us.
@@ -248,6 +251,19 @@ impl EdgeSource for Csr {
     }
 }
 
+/// Asks for 2 MiB pages on a fresh build buffer that is about to be filled in full: one
+/// page fault per 2 MiB instead of 512. Only such buffers get them (see the prctl in
+/// `main`), so sparsely touched memory, like the searches' blocks, is not rounded up.
+fn huge<T>(mut v: Vec<T>) -> Vec<T> {
+    let (at, len) = (v.as_mut_ptr() as usize, std::mem::size_of_val(&v[..]));
+    let (start, end) = ((at + 4095) & !4095, (at + len) & !4095);
+    if end > start {
+        // SAFETY: only advice, on whole pages inside the vector's own allocation.
+        unsafe { madvise(start as *mut u8, end - start, MADV_HUGEPAGE) };
+    }
+    v
+}
+
 /// Big buffers handed on by a finished phase. The next phase overwrites pages that are
 /// already mapped instead of faulting in fresh zeroed ones: a run takes about 32,000 page
 /// faults, and on the scoring box each costs several times what it does locally.
@@ -262,7 +278,7 @@ struct Spare {
 /// later reads), or a fresh zeroed buffer if `v` is too small.
 fn reuse<T: Copy + Default>(mut v: Vec<T>, len: usize) -> Vec<T> {
     if v.capacity() < len {
-        return vec![T::default(); len];
+        return huge(vec![T::default(); len]);
     }
     v.resize(len, T::default()); // shrinks, or writes only the few missing elements
     v
@@ -399,7 +415,7 @@ fn prefetch<T>(data: &[T]) {
 fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr, Vec<u32>) {
     let n = g.rows();
     // One spare slot, so that `rank` can later become the n + 1 in-edge offsets.
-    let mut rank = vec![0u32; n + 1];
+    let mut rank = huge(vec![0u32; n + 1]);
     rank.truncate(n);
     let ids = as_atomic(&mut rank);
     // The rows a thread copies go to its own stretch of one buffer, sized from its share
@@ -710,7 +726,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: plain libc calls with constant arguments, made before any other thread exists.
     unsafe {
         mallopt(M_MMAP_THRESHOLD, 1 << 20);
-        prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64);
+        // Huge pages only where `huge` asks for them; kernels before 6.18 refuse the flag,
+        // and then they are off everywhere.
+        if prctl(
+            PR_SET_THP_DISABLE,
+            1u64,
+            PR_THP_DISABLE_EXCEPT_ADVISED,
+            0u64,
+            0u64,
+        ) != 0
+        {
+            prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64);
+        }
     }
     let threads = available_parallelism().map_or(1, usize::from).min(12);
     Team::start(threads);
