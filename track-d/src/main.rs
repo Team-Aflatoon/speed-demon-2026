@@ -689,25 +689,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(rank);
     let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
 
-    let answers: Vec<AtomicI64> = (0..queries.len()).map(|_| AtomicI64::new(0)).collect();
-    let next = AtomicUsize::new(0);
-    parallel(vec![(); threads], |_, ()| {
-        // 32-bit distances halve the searches' memory. The rare query whose distances
-        // pass 2^32 - 2 (it needs a near-2^32 edge) is answered again with 64 bits.
-        let mut narrow = [Side::<u32>::new(n), Side::new(n)];
-        let mut wide = [Side::<u64>::new(n), Side::new(n)];
-        loop {
-            let q = next.fetch_add(1, Relaxed);
-            let Some(&(s, t)) = queries.get(q) else { break };
-            let g = [&fwd, &bwd];
-            let answer = distance(g, &mut narrow, s, t).or_else(|| distance(g, &mut wide, s, t));
-            answers[q].store(answer.expect("64-bit distances always fit"), Relaxed);
-        }
-    });
-    let out: String = answers
-        .iter()
-        .map(|a| format!("{}\n", a.load(Relaxed)))
-        .collect();
-    std::fs::write("/out/distances.txt", out)?;
+    // PROBE: build everything, answer nothing. One "0" per query line.
+    std::hint::black_box((&fwd, &bwd));
+    std::fs::write("/out/distances.txt", "0\n".repeat(queries.len()))?;
     Ok(())
 }
