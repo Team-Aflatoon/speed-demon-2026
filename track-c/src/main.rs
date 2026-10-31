@@ -17,6 +17,10 @@ use std::{env, fs, process, thread};
 const SLOTS: usize = 1 << 17;
 /// Chunks per worker. More, smaller chunks even out the workers' finish times.
 const CHUNKS_PER_WORKER: usize = 16;
+/// The most worker threads (the scoring machine gives us twelve).
+const MAX_THREADS: usize = 12;
+/// Groups: `_UNMATCHED` (0) and up to 255 countries.
+pub const GROUPS: usize = 256;
 
 /// Running aggregates for one group, which is one output line. `sums` are
 /// count, id sum, amount sum (cents), distinct names, name bytes and note
@@ -31,7 +35,11 @@ pub struct Agg {
 pub const NAMES: usize = 3;
 
 impl Agg {
-    pub const EMPTY: Agg = Agg { sums: [0; 6], min: i64::MAX, max: i64::MIN };
+    pub const EMPTY: Agg = Agg {
+        sums: [0; 6],
+        min: i64::MAX,
+        max: i64::MIN,
+    };
 
     /// Adds `sums`, and widens the amount range to cover `min..=max`.
     pub fn add(&mut self, sums: [i64; 6], min: i64, max: i64) {
@@ -52,9 +60,10 @@ pub struct Padded<T>(pub T);
 /// Asks the CPU to start loading `value`'s cache line, so that a later read
 /// finds it there. Used to overlap the cache misses of a batch of lookups.
 pub fn prefetch<T>(value: &T) {
-    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_ET0 as _MM_HINT_T0};
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
     // SAFETY: a prefetch is only a hint. It never faults and has no effect
-    // on memory, and the pointer comes from a live reference anyway.
+    // on memory, and the pointer comes from a live reference anyway. Its
+    // instruction (SSE) is part of every x86-64 CPU.
     unsafe { _mm_prefetch::<_MM_HINT_T0>((value as *const T).cast()) }
 }
 
@@ -68,7 +77,9 @@ fn main() {
     }
     let region_file = map_or_die(&format!("{data}/regions.csv"));
     let regions = regions::Regions::new(region_file).unwrap_or_else(|e| die(e));
-    let threads = thread::available_parallelism().map_or(1, |n| n.get()).min(12);
+    let threads = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS);
     let (mut chunks, mut slots) = (threads * CHUNKS_PER_WORKER, SLOTS);
     let aggs = loop {
         match pipeline::run(threads, chunks, slots, records, (&regions, region_file)) {
@@ -106,6 +117,11 @@ fn map_or_die(path: &str) -> map::Mapped {
     map::map(path).unwrap_or_else(|e| die(&format!("{path}: {e}")))
 }
 
+/// The error path for anything the input or the system can cause. Cargo.toml
+/// sets `panic = "abort"`, so the few `unwrap`s left (on locks, which abort
+/// instead of being poisoned, on writes to a `String`, and on lengths just
+/// checked) cannot fire on any input; if one ever did, the process would
+/// still stop with a message and a non-zero status.
 pub fn die(msg: &str) -> ! {
     eprintln!("track-c: {msg}");
     process::exit(1)

@@ -263,7 +263,7 @@ fn build_csr(
     let weight_bits = 32 - (usize::BITS - (n.max(2) - 1).leading_zeros());
     assert!(weight_bits >= 6, "too many nodes for 32-bit edges");
     let escape = (1u64 << weight_bits) - 1;
-    const BUCKET_BITS: u32 = 11; // a bucket's histogram stays in L1
+    const BUCKET_BITS: u32 = 12; // a bucket's histogram stays in L1
     let buckets = (n >> BUCKET_BITS) + 1;
     let counts = parallel(vec![(); parts], |k, ()| {
         let mut count = vec![0u32; buckets];

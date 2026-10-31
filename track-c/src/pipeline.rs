@@ -8,12 +8,18 @@
 
 use crate::map::Mapped;
 use crate::names::Names;
-use crate::records::Fail;
+use crate::records::{Fail, BOM_FIRST};
 use crate::regions::Regions;
-use crate::{die, Agg};
+use crate::{die, Agg, GROUPS};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::thread::{self, Scope};
+
+/// The most workers that fault in the name tables: one per 2 MiB stretch of
+/// them (see `map::touch`).
+const TOUCHERS: usize = 4;
+/// Stack size for workers, which need about 40 KiB.
+const STACK: usize = 256 << 10;
 
 /// Everything the workers share: records.csv, the tables records are joined
 /// and counted into, and the chunks. Chunk c is `cuts[c]..cuts[c + 1]`;
@@ -42,21 +48,36 @@ pub struct Shared<'a> {
 /// it, each one did start outside quotes, right after a terminator, and was
 /// parsed exactly as one sequential pass would have parsed it. If not, this
 /// returns `Fail::Malformed`, and the caller retries with a single chunk.
-pub fn run(threads: usize, chunks: usize, slots: usize, records: Mapped, regions: (&Regions, Mapped)) -> Result<Vec<Agg>, Fail> {
+pub fn run(
+    threads: usize,
+    chunks: usize,
+    slots: usize,
+    records: Mapped,
+    regions: (&Regions, Mapped),
+) -> Result<Vec<Agg>, Fail> {
     let (b, len) = (records.b, records.len);
     let names = Names::new(slots, len).unwrap_or_else(|e| die(&format!("memory: {e}")));
-    let boundary = |i: usize| b[i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == 0xEF);
+    let boundary = |i: usize| b[i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == BOM_FIRST);
     let (cuts, next) = (cuts(len, chunks, boundary), AtomicUsize::new(0));
     let quotes = (0..chunks).map(|_| AtomicU64::new(0)).collect();
     let fail = AtomicU8::new(0);
-    let shared = Shared { b, len, regions: regions.0, names, cuts, next, quotes, fail };
+    let shared = Shared {
+        b,
+        len,
+        regions: regions.0,
+        names,
+        cuts,
+        next,
+        quotes,
+        fail,
+    };
     // Before records start, the first workers fault in the name tables (see
     // `Names::touch`) while the others split regions.csv; one worker alone
     // does both.
-    let touchers = (threads / 3).clamp(1, 4);
+    let touchers = (threads / 3).clamp(1, TOUCHERS);
     let parsers = (threads - touchers).max(1);
     let waiting = AtomicUsize::new(touchers + parsers);
-    let total = Mutex::new(vec![Agg::EMPTY; 256]);
+    let total = Mutex::new(vec![Agg::EMPTY; GROUPS]);
     let work = |t: usize| {
         if t < touchers {
             shared.names.touch(t, touchers);
@@ -98,9 +119,9 @@ pub fn run(threads: usize, chunks: usize, slots: usize, records: Mapped, regions
 /// takes about log2(n) thread starts before the last worker runs, not n.
 fn grow<'s, F: Fn(usize) + Sync>(s: &'s Scope<'s, '_>, t: usize, n: usize, work: &'s F) {
     for child in [2 * t + 1, 2 * t + 2].into_iter().filter(|&c| c < n) {
-        // Small stacks: a worker needs about 40 KiB, and a 2 MiB stack could
-        // be given a huge page on a kernel that uses them everywhere.
-        let builder = thread::Builder::new().stack_size(256 << 10);
+        // Small stacks: a 2 MiB one could be given a huge page on a kernel
+        // that uses them everywhere.
+        let builder = thread::Builder::new().stack_size(STACK);
         let spawned = builder.spawn_scoped(s, move || grow(s, child, n, work));
         spawned.unwrap_or_else(|e| die(&format!("starting a thread: {e}")));
     }
@@ -109,8 +130,8 @@ fn grow<'s, F: Fn(usize) + Sync>(s: &'s Scope<'s, '_>, t: usize, n: usize, work:
 
 impl Shared<'_> {
     /// One worker: claims and parses chunks until none are left.
-    fn work(&self) -> [Agg; 256] {
-        let mut aggs = [Agg::EMPTY; 256];
+    fn work(&self) -> [Agg; GROUPS] {
+        let mut aggs = [Agg::EMPTY; GROUPS];
         loop {
             let c = self.next.fetch_add(1, Relaxed);
             let Some(&end) = self.cuts.get(c + 1) else {
