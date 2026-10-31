@@ -25,6 +25,7 @@ const INLINE: usize = 12;
 const KEY_BITS: u64 = (1 << 38) - 1;
 const ID_SHIFT: u32 = 38;
 const ID_MASK: u32 = (1 << 24) - 1;
+/// Term offsets in `queries.txt` are kept as u32.
 pub const MAX_QUERY_BYTES: usize = 1 << 30;
 /// Query frequencies only need to tell rare from common, so they saturate
 /// here; 12 racing increments past the check cannot wrap a u8.
@@ -62,10 +63,6 @@ impl Key {
             * u128::from(self.w2 ^ 0x1319_8a2e_0370_7344);
         (m as u64 ^ (m >> 64) as u64) as usize
     }
-
-    fn len(self) -> usize {
-        (self.w2 >> 32 & 63) as usize
-    }
 }
 
 /// Open addressing with linear probing; a slot is `[lo, w2]`. Inserts claim a
@@ -73,18 +70,52 @@ impl Key {
 /// table is only read. Term ids are dense: each thread hands them out from its
 /// own block of `ID_BLOCK`, so ids cost no shared counter per term.
 pub struct Table {
-    slots: Vec<[AtomicU64; 2]>,
+    slots: Box<[[AtomicU64; 2]]>,
     pub mask: usize,
     next_block: AtomicU32,
     /// Per term id: where the term starts in `queries.txt` (for long terms).
-    text_at: Vec<AtomicU32>,
+    text_at: Box<[AtomicU32]>,
     /// Per term id: a saturating count of its query words, for choosing anchors.
-    freq: Vec<AtomicU8>,
-    /// Per term id: the first phrase anchored at it, linked on through `Parsed::next`.
-    pub heads: Vec<AtomicU32>,
+    freq: Box<[AtomicU8]>,
+    /// Per term id: 1 + the first phrase anchored at it (0 for none), linked
+    /// on through `Parsed::next`.
+    heads: Box<[AtomicU32]>,
+}
+
+/// Atomics whose all-zero bytes are the value 0.
+///
+/// # Safety
+/// Only for types with that property.
+unsafe trait Zeroable {}
+// SAFETY: atomic integers have the in-memory representation of their integer.
+unsafe impl Zeroable for AtomicU8 {}
+// SAFETY: as above.
+unsafe impl Zeroable for AtomicU32 {}
+// SAFETY: as above, for an array of them.
+unsafe impl Zeroable for [AtomicU64; 2] {}
+
+/// `n` zeros from memory the allocator hands out already zeroed (`calloc`):
+/// nothing is written up front, and each page is first touched (and faulted
+/// in) by whichever thread inserts there, instead of all by one thread.
+fn zeroed<T: Zeroable>(n: usize) -> Box<[T]> {
+    // SAFETY: `T: Zeroable`, so all-zero memory is a valid `[T]`.
+    unsafe { Box::new_zeroed_slice(n).assume_init() }
+}
+
+/// Bits in each thread's sketch of its words, for estimating the number of
+/// distinct terms (linear counting) before the table is sized.
+pub const SKETCH_BITS: usize = 1 << 17;
+
+/// Linear counting: about how many distinct terms set the bits of `sketch`.
+pub fn distinct(sketch: &[u64]) -> usize {
+    let m = (sketch.len() * 64) as f64;
+    let zeros = sketch.iter().map(|w| w.count_zeros()).sum::<u32>().max(1);
+    (m * (m / f64::from(zeros)).ln()) as usize
 }
 
 const ID_BLOCK: u32 = 1024;
+/// Inserts prefetch the slot of the word this many places ahead.
+const INSERT_AHEAD: usize = 8;
 
 /// A thread's unused term ids: `next..end`.
 pub struct Ids {
@@ -93,25 +124,31 @@ pub struct Ids {
 }
 
 impl Table {
-    /// Room for `words` query words, all distinct at worst, inserted by
-    /// `threads` threads, at a load factor of at most 3/4.
-    pub fn new(words: usize, threads: usize) -> Table {
-        let n = (words * 4 / 3).next_power_of_two().max(1 << 10);
+    /// Room for about `distinct` terms (estimated; at most `words`) at a load
+    /// factor of at most 2/3, and ids for `words` terms from `threads` threads.
+    pub fn new(words: usize, distinct: usize, threads: usize) -> Table {
+        let n = (distinct.min(words) * 3 / 2)
+            .next_power_of_two()
+            .max(1 << 10);
         let ids = words + threads * ID_BLOCK as usize;
         // A partition-local term number (id / 64) must fit in 16 bits.
         if ids > 1 << 22 {
             fail("too many query words");
         }
         Table {
-            slots: (0..n)
-                .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
-                .collect(),
+            slots: zeroed(n),
             mask: n - 1,
             next_block: AtomicU32::new(0),
-            text_at: (0..ids).map(|_| AtomicU32::new(0)).collect(),
-            freq: (0..ids).map(|_| AtomicU8::new(0)).collect(),
-            heads: (0..ids).map(|_| AtomicU32::new(NONE)).collect(),
+            text_at: zeroed(ids),
+            freq: zeroed(ids),
+            heads: zeroed(ids),
         }
+    }
+
+    /// The first phrase anchored at term `id`, or `NONE`.
+    #[inline]
+    pub fn head(&self, id: u32) -> u32 {
+        self.heads[id as usize].load(Relaxed).wrapping_sub(1)
     }
 
     /// One past the largest term id handed out.
@@ -201,7 +238,7 @@ impl Table {
                         w2 => break w2,
                     }
                 };
-                let id = (w2 >> ID_SHIFT) as u32 & ID_MASK;
+                let id = Table::id(w2);
                 if w2 & KEY_BITS == key.w2
                     && (len <= INLINE || self.tail_eq(&text[at..at + len], id, text))
                 {
@@ -220,11 +257,7 @@ impl Table {
     }
 
     fn term_len(&self, i: usize) -> usize {
-        Key {
-            lo: 0,
-            w2: self.slots[i][1].load(Relaxed),
-        }
-        .len()
+        (self.slots[i][1].load(Relaxed) >> 32 & 63) as usize
     }
 
     /// Whether the token's bytes after the inline 12 match term `id`.
@@ -243,91 +276,87 @@ impl Table {
 pub struct Parsed {
     /// Per line: the index of its BOOL query, or `PHRASE |` its phrase index.
     pub order: Vec<u32>,
-    /// BOOL query `i` is `steps[ends[i - 1]..ends[i]]`, each `op << 30 | slot`;
+    /// BOOL query `i` is `span(steps, ends, i)`, each step `op << 30 | term`;
     /// the first step is `OR t1` applied to an empty set.
     pub steps: Vec<u32>,
     pub ends: Vec<u32>,
-    /// Phrase `i` is the slots `terms[term_ends[i - 1]..term_ends[i]]`.
+    /// Phrase `i` is the terms `span(terms, term_ends, i)`.
     pub terms: Vec<u32>,
     pub term_ends: Vec<u32>,
     /// Position of each phrase's anchor among its terms.
     pub anchor: Vec<u8>,
     /// The next phrase with the same anchor (`NONE` ends the list).
     pub next: Vec<u32>,
-    /// `(offset, length)` in `queries.txt` of every term, in step order.
-    words: Vec<(u32, u8)>,
+    /// `(offset in queries.txt, length)` of each step's and each phrase
+    /// term's word, until `insert` turns them into term ids.
+    bool_words: Vec<(u32, u8)>,
+    phrase_words: Vec<(u32, u8)>,
     /// Table slots of the phrase terms, until anchors are chosen.
     slots: Vec<u32>,
+    /// A bit per word hash, for `distinct`.
+    pub sketch: Vec<u64>,
 }
 
 /// A phrase is named across ranges by `range << 28 | index`.
 pub const RANGE_SHIFT: u32 = 28;
 
+/// Record `i` of a list of variable-length records that end at `ends`.
+fn span<'a>(items: &'a [u32], ends: &[u32], i: usize) -> &'a [u32] {
+    let start = if i == 0 { 0 } else { ends[i - 1] as usize };
+    &items[start..ends[i] as usize]
+}
+
 impl Parsed {
     pub fn bool_steps(&self, i: usize) -> &[u32] {
-        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
-        &self.steps[start..self.ends[i] as usize]
+        span(&self.steps, &self.ends, i)
     }
 
     pub fn phrase(&self, i: usize) -> &[u32] {
-        let start = if i == 0 {
-            0
-        } else {
-            self.term_ends[i - 1] as usize
-        };
-        &self.terms[start..self.term_ends[i] as usize]
+        span(&self.terms, &self.term_ends, i)
     }
 
     /// Parses the lines of `text[from..to]` (a whole number of lines). Term
-    /// slots are filled in by `insert`.
+    /// ids are filled in by `insert`.
     pub fn parse(text: &[u8], from: usize, to: usize) -> Parsed {
-        let mut p = Parsed::default();
-        let mut at = from;
-        while at < to {
-            let end = at
-                + text[at..to]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .unwrap_or(to - at);
-            if end > at && p.line(text, at, end).is_none() {
-                fail(&format!(
-                    "malformed query: {}",
-                    String::from_utf8_lossy(&text[at..end])
-                ));
+        let mut p = Parsed {
+            sketch: vec![0; SKETCH_BITS / 64],
+            ..Parsed::default()
+        };
+        for line in text[from..to]
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+        {
+            if p.line(line, text).is_none() {
+                let line = String::from_utf8_lossy(line);
+                fail(&format!("malformed query: {line}"));
             }
-            at = end + 1;
         }
         p
     }
 
-    fn line(&mut self, text: &[u8], at: usize, end: usize) -> Option<()> {
-        let line = &text[at..end];
-        let word = |p: &mut Parsed, start: usize, len: usize| {
-            let ok = (1..=32).contains(&len)
-                && text[start..start + len]
-                    .iter()
+    fn line(&mut self, line: &[u8], text: &[u8]) -> Option<()> {
+        // Words are recorded by their offset in `text`, which they are slices of.
+        let sketch = &mut self.sketch;
+        let mut word = |w: &[u8]| {
+            let ok = (1..=32).contains(&w.len())
+                && w.iter()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-            p.words.push((start as u32, len as u8));
-            ok.then_some(())
+            let at = w.as_ptr() as usize - text.as_ptr() as usize;
+            let bit = Key::new(text, at, w.len()).hash() >> 40 & (SKETCH_BITS - 1);
+            sketch[bit / 64] |= 1 << (bit % 64);
+            ok.then_some((at as u32, w.len() as u8))
         };
-        let mut words = Words {
-            line,
-            pos: 0,
-            base: at,
-        };
-        if line.starts_with(b"BOOL ") {
-            words.pos = 5;
+        if let Some(rest) = line.strip_prefix(b"BOOL ") {
             self.order.push(self.ends.len() as u32);
-            let mut op = OR;
+            let (mut words, mut op) = (rest.split(|&b| b == b' '), OR);
             loop {
-                let (start, len) = words.next()?;
-                word(self, start, len)?;
+                self.bool_words.push(word(words.next()?)?);
                 self.steps.push(op << SLOT_BITS);
                 op = match words.next() {
                     None => break,
-                    Some((s, 3)) if &text[s..s + 3] == b"AND" => AND,
-                    Some((s, 2)) if &text[s..s + 2] == b"OR" => OR,
-                    Some((s, 3)) if &text[s..s + 3] == b"NOT" => NOT,
+                    Some(b"AND") => AND,
+                    Some(b"OR") => OR,
+                    Some(b"NOT") => NOT,
                     Some(_) => return None,
                 };
             }
@@ -335,18 +364,13 @@ impl Parsed {
         } else {
             let inner = line.strip_prefix(b"PHRASE \"")?.strip_suffix(b"\"")?;
             self.order.push(PHRASE | self.term_ends.len() as u32);
-            words = Words {
-                line: inner,
-                pos: 0,
-                base: at + 8,
-            };
-            for (start, len) in words {
-                word(self, start, len)?;
+            for w in inner.split(|&b| b == b' ') {
+                self.phrase_words.push(word(w)?);
                 self.terms.push(0);
             }
-            let n = self.terms.len() - self.term_ends.last().map_or(0, |&e| e as usize);
-            if n == 0 || n > usize::from(u8::MAX) {
-                return None;
+            let start = self.term_ends.last().map_or(0, |&e| e as usize);
+            if self.terms.len() - start > usize::from(u8::MAX) {
+                return None; // anchor positions are bytes
             }
             self.term_ends.push(self.terms.len() as u32);
         }
@@ -354,42 +378,38 @@ impl Parsed {
     }
 
     pub fn word_count(&self) -> usize {
-        self.words.len()
+        self.bool_words.len() + self.phrase_words.len()
     }
 
-    /// Puts every term into the table, counts how often each occurs and flags
-    /// BOOL terms. Words were recorded in line order, so they are consumed
-    /// line by line into the BOOL steps or the phrase terms.
+    /// Puts every word into the table, turning steps and phrase terms into
+    /// term ids, counts how often each term occurs and flags BOOL terms.
     pub fn insert(&mut self, table: &Table, text: &[u8]) {
-        let (mut w, mut s, mut t) = (0, 0, 0);
         let mut ids = Ids { next: 0, end: 0 };
-        for &entry in &self.order {
-            let (count, phrase) = match entry & PHRASE {
-                0 => (self.ends[entry as usize] as usize - s, false),
-                _ => (
-                    self.term_ends[(entry & !PHRASE) as usize] as usize - t,
-                    true,
-                ),
-            };
-            for _ in 0..count {
-                let (at, len) = self.words[w];
-                w += 1;
-                let (id, slot) = table.insert(text, at as usize, len as usize, &mut ids);
-                if table.freq[id as usize].load(Relaxed) < FREQ_CAP {
-                    table.freq[id as usize].fetch_add(1, Relaxed);
-                }
-                if phrase {
-                    self.terms[t] = id;
-                    self.slots.push(slot as u32);
-                    t += 1;
-                } else {
-                    table.flag(slot, BOOL_TERM);
-                    self.steps[s] |= id;
-                    s += 1;
-                }
+        let mut insert = |(at, len): (u32, u8)| {
+            let (id, slot) = table.insert(text, at as usize, len as usize, &mut ids);
+            if table.freq[id as usize].load(Relaxed) < FREQ_CAP {
+                table.freq[id as usize].fetch_add(1, Relaxed);
             }
+            (id, slot)
+        };
+        let ahead = |words: &[(u32, u8)], k: usize| {
+            if let Some(&(at, len)) = words.get(k + INSERT_AHEAD) {
+                table.prefetch(table.slot(Key::new(text, at as usize, len as usize)));
+            }
+        };
+        for (k, (step, &word)) in self.steps.iter_mut().zip(&self.bool_words).enumerate() {
+            ahead(&self.bool_words, k);
+            let (id, slot) = insert(word);
+            table.flag(slot, BOOL_TERM);
+            *step |= id;
         }
-        self.words = Vec::new();
+        for (k, (term, &word)) in self.terms.iter_mut().zip(&self.phrase_words).enumerate() {
+            ahead(&self.phrase_words, k);
+            let (id, slot) = insert(word);
+            *term = id;
+            self.slots.push(slot as u32);
+        }
+        (self.bool_words, self.phrase_words) = (Vec::new(), Vec::new());
     }
 
     /// Anchors each phrase at its term with the fewest occurrences in the
@@ -399,15 +419,7 @@ impl Parsed {
     /// rarest terms and 52 million for "the longest term".
     pub fn choose_anchors(&mut self, table: &Table, range: usize) {
         for i in 0..self.term_ends.len() {
-            let start = if i == 0 {
-                0
-            } else {
-                self.term_ends[i - 1] as usize
-            };
-            let (terms, slots) = (
-                self.phrase(i),
-                &self.slots[start..self.term_ends[i] as usize],
-            );
+            let (terms, slots) = (self.phrase(i), span(&self.slots, &self.term_ends, i));
             let rank = |j: usize| {
                 (
                     table.freq[terms[j] as usize].load(Relaxed),
@@ -419,31 +431,9 @@ impl Parsed {
             table.flag(slot as usize, ANCHOR);
             self.anchor.push(a as u8);
             let phrase = (range as u32) << RANGE_SHIFT | i as u32;
-            self.next
-                .push(table.heads[term as usize].swap(phrase, AcqRel));
+            let previous = table.heads[term as usize].swap(phrase + 1, AcqRel);
+            self.next.push(previous.wrapping_sub(1)); // 0, no phrase, becomes NONE
         }
         self.slots = Vec::new();
-    }
-}
-
-/// Space-separated words of a line, as `(offset in the file, length)`.
-struct Words<'a> {
-    line: &'a [u8],
-    pos: usize,
-    base: usize,
-}
-
-impl Iterator for Words<'_> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<(usize, usize)> {
-        if self.pos > self.line.len() {
-            return None;
-        }
-        let rest = &self.line[self.pos..];
-        let len = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
-        let start = self.base + self.pos;
-        self.pos += len + 1;
-        Some((start, len))
     }
 }
