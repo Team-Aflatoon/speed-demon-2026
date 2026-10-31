@@ -248,6 +248,26 @@ impl EdgeSource for Csr {
     }
 }
 
+/// Big buffers handed on by a finished phase. The next phase overwrites pages that are
+/// already mapped instead of faulting in fresh zeroed ones: a run takes about 32,000 page
+/// faults, and on the scoring box each costs several times what it does locally.
+#[derive(Default)]
+struct Spare {
+    edges: Vec<u32>,
+    low: Vec<u16>,
+    off: Vec<u32>,
+}
+
+/// `v` with length `len`, keeping its old contents (the caller overwrites every element it
+/// later reads), or a fresh zeroed buffer if `v` is too small.
+fn reuse<T: Copy + Default>(mut v: Vec<T>, len: usize) -> Vec<T> {
+    if v.capacity() < len {
+        return vec![T::default(); len];
+    }
+    v.resize(len, T::default()); // shrinks, or writes only the few missing elements
+    v
+}
+
 /// Builds the CSR of n nodes holding the edge `map(u, v)` = (tail, head), of weight w,
 /// for every edge (u, v, w) of `source`. No atomic read-modify-write is needed: pass 1
 /// counts edges per (thread, bucket of 4096 tails), pass 2 writes each edge into its
@@ -258,7 +278,8 @@ fn build_csr(
     parts: usize,
     n: usize,
     map: impl Fn(usize, usize) -> (usize, usize) + Sync,
-) -> Csr {
+    spare: Spare,
+) -> (Csr, Vec<u16>) {
     // Bits left for the weight once a head id below n is stored.
     let weight_bits = 32 - (usize::BITS - (n.max(2) - 1).leading_zeros());
     assert!(weight_bits >= 6, "too many nodes for 32-bit edges");
@@ -283,7 +304,10 @@ fn build_csr(
     }
     bucket_start[buckets] = at;
     // calloc'd: the writers fault the pages in. Relaxed atomic stores are plain stores.
-    let (mut edges, mut low) = (vec![0u32; at as usize], vec![0u16; at as usize]);
+    let (mut edges, mut low) = (
+        reuse(spare.edges, at as usize),
+        reuse(spare.low, at as usize),
+    );
     let (edge_cells, low_cells) = (as_atomic(&mut edges), as_atomic(&mut low));
     let escaped = parallel(cursors, |k, mut cursor| {
         let mut escaped = Vec::new();
@@ -306,7 +330,8 @@ fn build_csr(
 
     // Counting-sort every bucket by tail; its histogram is also that bucket's offsets.
     // Buckets are disjoint, so the arrays are split between threads.
-    let mut off = vec![0u32; n + 1];
+    let mut off = reuse(spare.off, n + 1);
+    off[0] = 0; // every other entry is written below
     let mut work = Vec::with_capacity(buckets);
     let (mut rest_e, mut rest_l, mut rest_o) = (&mut edges[..], &low[..], &mut off[1..]);
     for b in 0..buckets {
@@ -341,12 +366,15 @@ fn build_csr(
             e.copy_from_slice(&sorted);
         }
     });
-    Csr {
-        off,
-        edges,
-        weight_bits,
-        escapes,
-    }
+    (
+        Csr {
+            off,
+            edges,
+            weight_bits,
+            escapes,
+        },
+        low,
+    )
 }
 
 /// Hints the CPU to pull the cache line holding `data[0]` into L1.
@@ -368,18 +396,24 @@ fn prefetch<T>(data: &[T]) {
 /// down, `rank` itself is the claim flag: 0 while unclaimed, then `(k << 27 | i) + 1` for
 /// thread k's i-th node until the threads' counts are known. Degrees are kept in a byte
 /// each (255 means "see `wide`"), and the BFS queue holds only the frontier.
-fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
+fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr, Vec<u32>) {
     let n = g.rows();
-    let mut rank = vec![0u32; n];
+    // One spare slot, so that `rank` can later become the n + 1 in-edge offsets.
+    let mut rank = vec![0u32; n + 1];
+    rank.truncate(n);
     let ids = as_atomic(&mut rank);
+    // The rows a thread copies go to its own stretch of one buffer, sized from its share
+    // of the edges with a margin (anything past it spills), which later holds the in-edges.
+    let cap = g.edges.len() / threads * 9 / 8 + 4096;
+    let mut copies = vec![0u32; cap * threads];
     // The plain load first: most neighbours are already claimed, and skipping the
     // locked exchange for them keeps the walk free of fences.
     let claim = |v: usize, id: u32| {
         ids[v].load(Relaxed) == 0 && ids[v].compare_exchange(0, id, Relaxed, Relaxed).is_ok()
     };
-    let walks = parallel(vec![(); threads], |k, ()| {
-        let (mut queue, mut degrees, mut wide, mut rows) =
-            (VecDeque::new(), Vec::new(), Vec::new(), Vec::new());
+    let walks = parallel(copies.chunks_mut(cap).collect(), |k, rows: &mut [u32]| {
+        let (mut queue, mut degrees, mut wide, mut used, mut spill) =
+            (VecDeque::new(), Vec::new(), Vec::new(), 0, Vec::new());
         // i < 2^27 always: `build_csr` asserts n <= 2^26 (at least 6 weight bits).
         let mut next = (k << 27) as u32 + 1;
         for root in k * n / threads..(k + 1) * n / threads {
@@ -403,7 +437,12 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
                     }
                 }
                 let row = g.row(u as usize);
-                rows.extend_from_slice(row);
+                if spill.is_empty() && used + row.len() <= rows.len() {
+                    rows[used..used + row.len()].copy_from_slice(row);
+                    used += row.len();
+                } else {
+                    spill.extend_from_slice(row);
+                }
                 degrees.push(row.len().min(255) as u8);
                 if row.len() >= 255 {
                     wide.push(row.len() as u32);
@@ -416,13 +455,16 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
                 }
             }
         }
-        (degrees, wide, rows)
+        (degrees, wide, used, spill)
     });
     // Thread k's nodes take the next run of new ids and its rows the next run of edges.
     let starts: Vec<_> = walks
         .iter()
         .scan((0, 0), |at, w| {
-            Some(std::mem::replace(at, (at.0 + w.0.len(), at.1 + w.2.len())))
+            Some(std::mem::replace(
+                at,
+                (at.0 + w.0.len(), at.1 + w.2 + w.3.len()),
+            ))
         })
         .collect();
     let ranges = (0..threads)
@@ -442,13 +484,14 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let mask = (1 << weight_bits) - 1;
     parallel(
         walks.into_iter().zip(starts).collect(),
-        |_, ((degrees, wide, rows), (first, at))| {
+        |k, ((degrees, wide, used, spill), (first, at))| {
             let (mut w, mut end) = (wide.into_iter(), at as u32);
             for (i, &d) in degrees.iter().enumerate() {
                 end += if d < 255 { d as u32 } else { w.next().unwrap() };
                 off_cells[first + i].store(end, Relaxed);
             }
-            for (i, &e) in rows.iter().enumerate() {
+            let rows = copies[k * cap..k * cap + used].iter().chain(&spill);
+            for (i, &e) in rows.enumerate() {
                 edge_cells[at + i].store(
                     ids[(e >> weight_bits) as usize].load(Relaxed) << weight_bits | e & mask,
                     Relaxed,
@@ -467,6 +510,7 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
             weight_bits,
             escapes,
         },
+        copies,
     )
 }
 
@@ -676,8 +720,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     number(text, &mut i); // m: the edge count is implied by the lines themselves
     let text = Text(split_lines(&text[i..], threads));
 
-    let first = build_csr(&text, threads, n, |u, v| (u, v));
-    let (rank, fwd) = bfs_layout(first, threads);
+    let (first, low) = build_csr(&text, threads, n, |u, v| (u, v), Spare::default());
+    let (rank, fwd, copies) = bfs_layout(first, threads);
     let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
     let queries = std::fs::read_to_string("/data/queries.txt")?
         .lines()
@@ -686,8 +730,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((node(s)?, node(t)?))
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-    drop(rank);
-    let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
+    // The walk's copy buffer, the first build's side array and `rank` become the in-edges.
+    let spare = Spare {
+        edges: copies,
+        low,
+        off: rank,
+    };
+    let (bwd, _) = build_csr(&fwd, threads, n, |u, v| (v, u), spare);
 
     let answers: Vec<AtomicI64> = (0..queries.len()).map(|_| AtomicI64::new(0)).collect();
     let next = AtomicUsize::new(0);
