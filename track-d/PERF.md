@@ -41,6 +41,7 @@ rows say so. Points for runs without a board figure are computed from T, M and S
 | 17 | Review fixes, no change in speed: rustfmt, named libc constants, SAFETY notes. One real bug fixed: `split_lines` read `text[at - 1]` at `at == 0` when the edge text is shorter than the thread count (a one-edge graph on 12 threads aborted). New one-edge cases added to the tests. S 538 to 544 (named constants) | | same (local) | 68 (local) | |
 | 17 (board) | v3 with the review fixes (commit 2cfc0f4), S 544 | run-83d74bc76638 | 0.1421 | 71.1 | 70.5 (computed) |
 | 18 | A third prefetch stage in the BFS walk: the claim flags (`rank` entries at random old ids) of the heads of the row 4 places ahead. The profile put about 70% of the walk on those loads | | total CPU -2.4% / -4% (local, two interleaved A/B runs of 6-8, medians); wall about 100 vs 104 ms | 68 (local) | |
+| 18 (board) | v4 as submitted, S 551 | run-92dc80fd3ba2 | 0.1479 | | |
 
 Where the CPU goes (local, step 18, wall ms / total CPU ms / parallel efficiency, i.e.
 CPU / (wall x 12), measured from the cgroup's `cpu.stat` at each phase boundary; a
@@ -71,6 +72,30 @@ phase was on top.
 | In-edge transpose | 68 | **66.5** | forward 27 + in-edges being built 37 |
 | Queries | **77** | **68** | both CSRs 54 + per-search state (v2 18, v3 10) |
 | Write output | 60 | 60 | both CSRs + answers |
+
+## Box ablation probes
+
+Local speedups did not always survive the scoring box (turbo off, about 2.5 GHz against
+the laptop's ~4.5 GHz boost, DDR4, 1.25 MB of L2 per core shared by two hyperthreads). So
+the build was cut into prefixes and each prefix was run on the board. Each probe is v4 with
+everything after one point replaced by a placeholder answer (one `0` per query), so the
+board measures T and M even though the hash fails.
+
+| Probe | Runs up to | Run ID | Box T (ms) | Box M (MB) | Local T (ms) |
+|---|---|---|---|---|---|
+| d0 | start-up only: map the file, split it, start the threads | run-94d4d2fef344 | 1.5 | 7.2 | 3.9 |
+| d3 | + one full parse (the counting pass) | run-e96c9c86ab33 | 11.1 | 7.7 | 10.3 |
+| d4 | + the second parse and the scatter | run-148c3b623aad | 24.7 | 33.0 | 19.1 |
+| d2 | + the counting sort and offsets: the whole first CSR | run-9efbc7bcc92f | 43.0 | 40.1 | 23-27 |
+| d1 | + BFS walk, layout and in-edges: the whole build, no queries | run-8db29a146c98 | 72.7 | 69.3 | 57-70 |
+| v4 | everything | run-92dc80fd3ba2 | 147.9 | | 108-127 |
+
+By difference on the box: one parse about 9.6 ms, the second parse plus scatter 13.6 ms,
+counting sort plus offsets 18.3 ms, BFS + layout + in-edges about 30 ms, and the queries
+about 75 ms. The first CSR costs 1.7x its local time, about the clock ratio, but the sort
+step costs 4-5x, which the local profile does not explain (its working set per bucket,
+about 165 KB, fits in L2). Probes with 1,024- and 2,048-node buckets are queued to test
+that.
 
 ## Experiments that did not make it
 
@@ -123,6 +148,14 @@ phase was on top.
 - **Reusing the first CSR's tail side array for the in-edge build** (it has the same
   size, so no fresh page faults): median CPU 1051 against 1069 ms, within noise, and M
   unchanged. Not worth the extra parameter.
+- **One parse for the first CSR** (box probe d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
+  Each thread scatters into its own per-bucket runs, sized from its share of the text
+  with a spill list for overflow, and a counting sort per bucket writes the final CSR
+  straight from the runs. Locally that phase took 30% less CPU (105-124 against 146-198
+  ms), and the whole run 2-3% less. On the box the full run came in at 140.3 against
+  v4's 141-148 ms, inside the box's run-to-run spread. It needs a second build function,
+  because the in-edges must stay in place to keep their phase under the memory peak:
+  S 551 to 662, so K would fall (25.09 against 25.69). Dropped.
 - **Interleaving out- and in-edge rows behind one offset array** (the lead's idea, -5 MiB):
   not tried in the end. Building it within the current peak needs an in-place serial
   expansion of the edge array, and compressed offsets had already shown that the extra
