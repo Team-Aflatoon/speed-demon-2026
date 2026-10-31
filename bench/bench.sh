@@ -33,13 +33,13 @@ export MSYS_NO_PATHCONV=1
 docker run --rm -v sd-data:/d:ro "$DEB" sh -c "cat /d/$sub/* > /dev/null"
 
 for i in $(seq 1 "$runs"); do
-  docker run --rm -v sd-out:/out "$DEB" sh -c 'rm -rf /out/* && chmod 777 /out'
+  docker run --rm -v sd-out-$track:/out "$DEB" sh -c 'rm -rf /out/* && chmod 777 /out'
   docker run --rm --network=none --read-only --tmpfs /tmp:rw,size=1g,exec \
     --memory=8g --memory-swap=8g --pids-limit=512 --cpuset-cpus=0-11 \
     --cap-drop=ALL --security-opt=no-new-privileges --user 65534:65534 --ulimit nofile=8192:8192 \
     -e TRACK="$track" \
     --mount "type=volume,src=sd-data,dst=/data,volume-subpath=$sub,readonly" \
-    -v sd-out:/out --entrypoint /bin/sh "$tag" -c "
+    -v sd-out-$track:/out --entrypoint /bin/sh "$tag" -c "
       s=\$(date +%s%N); $cmd; rc=\$?; e=\$(date +%s%N)
       peak=\$(cat /sys/fs/cgroup/memory.peak)
       files=\$(ls /out | tr '\n' ' ')
