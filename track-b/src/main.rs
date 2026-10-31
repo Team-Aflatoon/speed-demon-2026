@@ -12,7 +12,9 @@
 //!   sorted lists and bitmaps (`index.rs`); one extra build task folds the
 //!   segment's phrase matches into the phrase answers;
 //! - eval (per query range): answer every BOOL query against the segment and
-//!   add the result to its running answer.
+//!   add the result to its running answer;
+//! - format (per query range, after the last segment): write the range's
+//!   answer lines.
 //!
 //! The queue is `scan 0, scan 1, build 0, eval 0, scan 2, build 1, eval 1, ...`,
 //! and a task waits only for what it reads: chunk streams are double buffered
@@ -28,7 +30,7 @@ use query::{Parsed, Setup, Table, MAX_QUERY_BYTES, PHRASE, QUERY_PAD, RANGE_SHIF
 use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 const MAX_THREADS: usize = 12;
@@ -44,7 +46,7 @@ fn main() {
 /// `exit` must not run on two threads at once, so only the first caller
 /// reports; any other thread that fails meanwhile waits for the exit.
 pub fn fail(msg: &str) -> ! {
-    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static FAILED: AtomicBool = AtomicBool::new(false);
     if FAILED.swap(true, AcqRel) {
         loop {
             std::thread::park();
@@ -86,7 +88,10 @@ enum Task {
 /// Everything the tasks share. Each lock is taken by one writer task or by
 /// readers, never both at once: the done counters order the tasks (a task
 /// only starts once every task it reads from has counted itself done), so
-/// the locks are never contended for long.
+/// the locks are never contended for long. The `unwrap`s on locks and on
+/// `OnceLock::get` cannot fire: with `panic = "abort"` a panic ends the
+/// process, so no lock is ever poisoned, and every `OnceLock` is set before
+/// the barrier that precedes its reads.
 struct Shared<'a> {
     file: &'a File,
     segments: Vec<Segment>,
@@ -283,6 +288,10 @@ fn wait(count: &AtomicU32, n: usize) {
 
 /// One worker: takes tasks from the queue in order until it is empty. Each
 /// task's locks are released before it counts itself done.
+///
+/// It cannot deadlock: tasks are claimed in queue order and a task waits only
+/// on tasks earlier in the queue, so the oldest unfinished task waits on
+/// nothing. It is always running, and so the queue always drains.
 fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
     let mut scanner = Scanner::new(table, queries, parsed);
     let mut eval = Evaluator::default();

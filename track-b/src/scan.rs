@@ -6,7 +6,7 @@
 
 use crate::fail;
 use crate::index::PARTS;
-use crate::query::{Key, Parsed, Table, ANCHOR, BOOL_TERM, RANGE_SHIFT};
+use crate::query::{Key, Parsed, Table, ANCHOR, BOOL_TERM, NONE, RANGE_SHIFT};
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -278,7 +278,7 @@ impl Doc {
         for &at in &self.hits {
             let at = at as usize - self.first;
             let mut phrase = table.head(doc[at]);
-            while phrase != crate::query::NONE {
+            while phrase != NONE {
                 let p = phrases[(phrase >> RANGE_SHIFT) as usize];
                 let i = (phrase & ((1 << RANGE_SHIFT) - 1)) as usize;
                 let (terms, anchor) = (p.phrase(i), usize::from(p.anchor[i]));

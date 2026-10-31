@@ -1,6 +1,27 @@
 # Track B: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+## Summary
+
+**Final: v4.2 (step 13).** Board: 189.6 ms, 36.6 MB, K 25.25 (run-d4d593bc34cf); the
+reference takes 56.35 s and 2.2 GB.
+
+Decisive steps (all board runs):
+
+1. **v1:** index only the query terms; a throwaway index per 4,096 documents, all queries
+   answered per batch: 309 ms, 59.7 MB (run-7450e3d4343b).
+2. **v2-v3:** memory, not time (THP off, bitmap stripes): 59.7 → 39.1 MB at ~303 ms
+   (run-43f854129993, run-d53081aa4120). Local CPU gains of 5-10% never showed on the box.
+3. **v4 redesign:** phrases checked during the scan at a rare anchor chosen by query frequency
+   (no positions, no re-reads); postings built once per 8 MB segment; one task queue: 184.3 ms,
+   35.8 MB (run-64a666bd15fb).
+4. **v4.1/v4.2:** every capacity provable for any valid input; table size changed nothing
+   (run-0778bc8cbf5f vs run-1ca61642aede).
+
+Lesson: ten tuning steps moved the board 3%; removing repeated work (84 query passes,
+candidate re-reads) moved it 39%. Every Track B board run is a correct build; no probes were
+run.
+
+## Steps
 
 Rows with a Run ID are board measurements; row 0 is the board's reference figures. Every other
 T and M is **local**: `bench/bench.sh b 5` (the harness's sandbox flags, cpuset 0-11, warm page
@@ -9,6 +30,10 @@ runs. The laptop was shared with other jobs, so its absolute timings drift by ±
 hour to hour. Every decision under about 10% was therefore made from interleaved A/B runs of the
 two builds (median of 7 to 9 runs each, plus the cgroup's CPU time), and those numbers are given
 per step. Compare a step's A/B with its parent, not its local T with another row's.
+
+Points are 50 × log10(K), which reproduces the board's figures (K 25.45 is 70.29 points, K 25.25
+is 70.11, up to the rounding of K). Rows 7 and 10 ("≈ … (computed)") and row 12 (from its board K
+of 25.26) were worked out from K; the other points are read off the board.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
@@ -22,10 +47,10 @@ per step. Compare a step's A/B with its parent, not its local T with another row
 | 7 | BOOL accumulator simplified back to borrowed term or scratch bitmap: OR/NOT apply a list's bits directly, AND spreads it into a mask. It is faster than the step-4 sorted-list accumulator and 50 lines shorter. A/B: 184 vs 192 ms, CPU 1,832 vs 1,888 ms. **This is v2.** | run-43f854129993 | 0.3157 | 52.5 | ≈ 64.7 (computed) |
 | 8 | Term table slots shrunk from 24 to 16 bytes (first 12 bytes of the term inline, id and length packed into one word; longer terms are confirmed against their text), so four slots share a cache line and the table is 2 MB instead of 3. A/B against v2: 207.8 vs 215.0 ms, CPU 1,986 vs 2,008 ms, M 0.7 MiB lower: a small win, within noise. (The local T of 0.20 looks worse than step 7's only because it was measured on a busier machine.) | | 0.20 (local) | 51 (local) | |
 | 9 | Dense bits written into a one-word-per-term stripe for the current 64 documents and flushed into the bitmaps every 64 documents, instead of into a full transposed copy of every bitmap. It stays as L1-friendly as step 4, drops a ~770 KB buffer per thread and the per-batch transpose. A/B: M 38.7 vs 50.9 MiB, 194 vs 202 ms median, CPU 1,956 vs 1,897 ms (within noise). M is now under the 44 MB cap of the memory axis. | | 0.19 (local) | 40 (local) | |
-| 10 | Line count, no behaviour change: `query.rs` folded into `main.rs`, `Answer::merge` reduced to a sort of at most 20 ids. S 1,013 to 1,006. **This is v3.** | run-d53081aa4120 (reruns run-4f979d5ac144: 0.3021 s, 39.7 MB; run-a5f9c82b0e45: 0.3070 s) | 0.3035 | 39.1 | ≈ 65.9 (computed) |
-| 11 | Clean-room redesign, built separately and adopted whole (see "v4" below): phrases checked during the scan against each document's token ids, so they need no index; postings built once per 8 MB segment by partition instead of a throwaway index per 4,096 documents; BOOL queries answered once per segment instead of once per batch; corpus read with `pread`; parallel query parse into a lock-free table. Head-to-head on the board: T 184.3 vs ~302 ms, K 25.45 vs 20.87. S rose from 993 to 1,364. **This is v4.** | run-64a666bd15fb | 0.1843 | 35.8 | |
-| 12 | Provable safety for any valid input (see "v4.1" below): the term table is sized from a distinct-term estimate but falls back to a table with room for every word when an insert runs out of probes, so it can no longer fill up; segments are bisected so that none holds more than 65,536 documents. Also: inserts prefetch 8 words ahead, the table comes from `calloc`ed memory, and S fell from 1,364 to 1,347. Board: K 25.26, within noise of v4. A/B on the board with a table half the size (run-0778bc8cbf5f: 0.1932 s, 35.3 MB, K 25.09): also within noise. **This is v4.1.** | run-1ca61642aede | 0.1906 | 37.0 | |
-| 13 | Clarity: v4.1's distinct-term estimate, probe limit and fallback table are dropped. The board showed table size is not a lever, and on seed 1 the estimate produced the same 262,144-slot table as sizing for every query word to be distinct, which needs no fallback because it can never fill up. Query start-up moved into `query::Setup`. S 1,347 → 1,317 | | | | |
+| 10 | Line count, no behaviour change: `query.rs` folded into `main.rs`, `Answer::merge` reduced to a sort of at most 20 ids. S down 7 lines, to 993 as the board counts it. **This is v3.** | run-d53081aa4120 (reruns run-4f979d5ac144: 0.3021 s, 39.7 MB; run-a5f9c82b0e45: 0.3070 s) | 0.3035 | 39.1 | ≈ 65.9 (computed) |
+| 11 | Clean-room redesign, built separately and adopted whole (see "v4" below): phrases checked during the scan against each document's token ids, so they need no index; postings built once per 8 MB segment by partition instead of a throwaway index per 4,096 documents; BOOL queries answered once per segment instead of once per batch; corpus read with `pread`; parallel query parse into a lock-free table. Head-to-head on the board: T 184.3 vs ~302 ms, K 25.45 vs 20.87. S rose from 993 to 1,364. **This is v4.** | run-64a666bd15fb | 0.1843 | 35.8 | 70.29 |
+| 12 | Provable safety for any valid input (see "v4.1" below): the term table is sized from a distinct-term estimate but falls back to a table with room for every word when an insert runs out of probes, so it can no longer fill up; segments are bisected so that none holds more than 65,536 documents. Also: inserts prefetch 8 words ahead, the table comes from `calloc`ed memory (the estimate and `calloc` were dropped again in step 13), and S fell from 1,364 to 1,347. Board: K 25.26, within noise of v4. A/B on the board with a table half the size (run-0778bc8cbf5f: 0.1932 s, 35.3 MB, K 25.09): also within noise. **This is v4.1.** | run-1ca61642aede | 0.1906 | 37.0 | 70.12 |
+| 13 | Clarity: v4.1's distinct-term estimate, probe limit and fallback table are dropped. The board showed table size is not a lever, and on seed 1 the estimate produced the same 262,144-slot table as sizing for every query word to be distinct, which needs no fallback because it can never fill up. With the estimate went v4.1's `calloc`: the slots are again filled by one thread before the inserts, with no board difference (189.6 vs 190.6 ms). Query start-up moved into `query::Setup`. S 1,347 → 1,317, K 25.25. After this run the binary was linked statically (`+crt-static`, as in Tracks A and C; same output on seeds 1 and 7 and all 23 fuzz cases), and comments, names and error messages were revised. **This is v4.2, the final version.** | run-d4d593bc34cf | 0.1896 | 36.6 | 70.11 |
 
 **What the board says.** Board T stayed at 302-316 ms from v1 to v3: the local gains of
 steps 5-10 (a few percent each in A/B) are within the board's run-to-run spread. The board win
@@ -132,8 +157,8 @@ What changed, and why:
 5. **One task queue instead of phase barriers**, with chunk streams double buffered by
    segment parity, so the next segment is scanned while one is built and answered. Waiting
    is about 1% of CPU time.
-6. **Parallel query parse into a lock-free table** (CAS on a slot's first word) with dense ids
-   from per-thread blocks.
+6. **Parallel query parse into a lock-free table** (CAS on a slot's first word) with
+   block-dense ids: each thread takes 1,024 at a time from a shared counter.
 
 ### Steps (local)
 
@@ -184,7 +209,8 @@ and a failed run scores zero. Two of v4's could, in principle, end the run on a 
    insert into it gives up after 64 probes, and if any insert gives up all threads redo the
    inserts into a table with room for every word at a load of at most 3/4. That table always has
    free slots, so its inserts may sweep it whole and always succeed. On the generated data the
-   fallback never runs; tests force it.
+   fallback never runs; tests force it. *The estimate and fallback were removed in step 13: the
+   final table is always sized for every word, which can never fill up and needs neither.*
 2. **Documents per segment.** Documents are numbered from 0 in each segment as `u16`, and v4's
    segments were plain 8 MB byte ranges: one would overflow if its documents averaged under
    128 bytes (the generator's average about 1 KB). v4.1 reads the last line's id to get the
@@ -207,7 +233,8 @@ failing on malformed queries could both call `exit` and hang; only the first now
 For v4.1, two more builds force the safety paths: one pins the distinct-term estimate to 1 (a
 1,024-slot first table, so the fallback always runs) and is byte-identical on seeds 1 and 7 and
 passes all 23 cases; one caps segments at 100 documents (so every segment is bisected) and passes
-all 23 cases.
+all 23 cases. The fallback was removed in step 13 (the final table is always sized for every
+word); the segment cap stays, and v4.2 passes the 100-document build too.
 
 ### Lessons (v4)
 

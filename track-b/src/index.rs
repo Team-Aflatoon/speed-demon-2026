@@ -6,7 +6,7 @@
 //! sorted list; a term in more than 1/`DENSE` of the segment's documents also
 //! has a bitmap, which turns AND and NOT against it into bit tests.
 
-use crate::query::{AND, NONE, NOT, OR, SLOT_BITS};
+use crate::query::{AND, NONE, NOT, OR, TERM_BITS};
 
 pub const PARTS: usize = 64;
 const DENSE: usize = 16;
@@ -135,11 +135,11 @@ impl Evaluator {
         self.mask.resize(words, 0);
         let mut acc = Acc::Empty;
         for &step in steps {
-            let op = step >> SLOT_BITS;
+            let op = step >> TERM_BITS;
             if let (Acc::Empty, AND | NOT) = (acc, op) {
                 continue; // nothing to intersect with or subtract from
             }
-            let set = Set::of(parts, (step & ((1 << SLOT_BITS) - 1)) as usize, words);
+            let set = Set::of(parts, (step & ((1 << TERM_BITS) - 1)) as usize, words);
             acc = self.step(acc, op, set, docs);
         }
         match acc {
@@ -150,6 +150,13 @@ impl Evaluator {
         }
     }
 
+    /// `acc op set`. In order: an empty `set` (AND empties `acc`, OR and NOT
+    /// keep it); an empty `acc` (OR borrows `set`, AND and NOT stay empty); a
+    /// bitmap `acc` (`bits_op`); otherwise `acc` is a list, either the borrowed
+    /// first term or `self.list` (which `Acc::List` stands for, and which is
+    /// taken out while `self.out` receives the result). A list is combined by
+    /// bitmap tests against a dense set, by `combine` or a merge with a list,
+    /// or, for a large OR, spread into the bitmap.
     fn step<'a>(&mut self, acc: Acc<'a>, op: u32, set: Set<'a>, docs: usize) -> Acc<'a> {
         if let Set::Empty = set {
             return if op == AND { Acc::Empty } else { acc };
@@ -225,6 +232,7 @@ impl Evaluator {
             }),
             (AND, _) => {
                 filter(set.list(), &self.bits, false, &mut self.list);
+                // A list, or `Empty` if nothing is left.
                 return [Acc::List, Acc::Empty][usize::from(self.list.is_empty())];
             }
             (OR, _) => set_bits(&mut self.bits, set.list()),

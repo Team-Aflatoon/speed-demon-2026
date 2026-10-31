@@ -10,9 +10,10 @@ The queries are part of the input, so the program reads `queries.txt` first and 
 only its terms. Twelve threads parse line-aligned ranges of the file and insert every word
 into one open-addressing hash table at the same time: a thread claims an empty slot with a
 compare-and-swap on its first word, so no locks are needed. A slot is 16 bytes: the first
-12 bytes of the term inline, its length, a dense term id and two flags (the term appears in a
-BOOL query; the term anchors a phrase). Ids come from per-thread blocks of 1,024, so handing
-them out costs no shared counter per term. The table has room for every query word to be a
+12 bytes of the term inline, its length, a term id and two flags (the term appears in a BOOL
+query; the term anchors a phrase). Ids are block-dense: each thread takes 1,024 at a time from
+a shared counter and hands them out in order, so an id costs no shared counter per term and
+each thread leaves at most one block partly unused. The table has room for every query word to be a
 distinct term at a load of at most 3/4, so it can never fill up, whatever the input.
 
 **Phrases need no index.** Every phrase gets one anchor term: the one that occurs least often
@@ -62,17 +63,19 @@ with a `SAFETY` note.
 ## Dependencies
 
 None. The Rust standard library only. `prctl` is declared by hand with `extern "C"`. The
-build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`) and refuses to compile without it.
+build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`) and refuses to compile without it,
+and links the binary statically so that a run never pays for the dynamic loader.
 
 ## With another 24 hours
 
-- The query parse runs before the scan can start and takes about 6 ms of wall time. Its
-  inserts already prefetch ahead and its memory is allocated lazily; what is left are four
-  barriers and twelve threads faulting in fresh pages. Letting the first scan tasks start on the
-  corpus bytes (which need no table) while the table is filled would hide most of it.
-- About 40% of the scan's CPU time is the table lookup itself. Halving the table changed nothing
-  on the board, so the lookups are bound by their own work (hashing, compares, branches), not
-  by where the table lives.
+- The query parse runs before the scan can start and takes about 6 ms of wall time: four
+  barriers, a 4 MB table filled by one thread while the others wait, and inserts that already
+  prefetch ahead. Letting the first scan tasks read and lex the corpus (which needs no table)
+  while the table is filled would hide most of it.
+- About 40% of the scan's CPU time is the table lookup itself, and halving the table changed
+  nothing on the board, so the lookup's own work (hashing, compares, branches) is what to cut.
+  Next would be a direct table for the one- and two-byte tokens (1,332 entries), which are among
+  the most frequent and would then need no hash, measured on the box.
 - Writing the BOOL postings costs about 4 ns per (term, document) pair. The commonest terms make
   up about a third of the pairs and end up as bitmaps anyway, so the scan could set their bits
   directly and skip their postings and their counting sort.

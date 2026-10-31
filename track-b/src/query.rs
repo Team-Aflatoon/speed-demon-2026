@@ -15,7 +15,9 @@ pub const ANCHOR: u64 = 1 << 63;
 pub const AND: u32 = 0;
 pub const OR: u32 = 1;
 pub const NOT: u32 = 2;
-pub const SLOT_BITS: u32 = 30;
+/// A BOOL step is `op << TERM_BITS | term`: the term id in bits 0..30, the
+/// operator in bits 30 and 31.
+pub const TERM_BITS: u32 = 30;
 /// `order` entries with this bit are phrases.
 pub const PHRASE: u32 = 1 << 31;
 /// A slot holds the first 12 bytes of its term inline; longer terms are
@@ -71,9 +73,10 @@ impl Key {
 /// Open addressing with linear probing; a slot is `[lo, w2]`. Inserts claim a
 /// slot with a CAS on `lo`, so all threads insert at once; after the parse the
 /// table is only read. It has room for every query word to be a distinct term
-/// at a load of at most 3/4, so it can never fill up. Term ids are dense:
-/// each thread hands them out from its own block of `ID_BLOCK`, so ids cost
-/// no shared counter per term.
+/// at a load of at most 3/4, so it can never fill up. Term ids are
+/// block-dense: a thread takes `ID_BLOCK` ids at a time from a shared counter
+/// and hands them out in order, so ids cost no shared counter per term, and
+/// each thread leaves at most one block partly unused.
 pub struct Table {
     slots: Vec<[AtomicU64; 2]>,
     pub mask: usize,
@@ -123,7 +126,8 @@ impl Table {
         self.heads[id as usize].load(Relaxed)
     }
 
-    /// One past the largest term id handed out.
+    /// One past the last id of the last block taken: a bound on the term ids
+    /// (larger than the number of terms by the unused ends of blocks).
     pub fn ids(&self) -> usize {
         self.next_block.load(Relaxed) as usize
     }
@@ -248,7 +252,7 @@ impl Table {
 pub struct Parsed {
     /// Per line: the index of its BOOL query, or `PHRASE |` its phrase index.
     pub order: Vec<u32>,
-    /// BOOL query `i` is `span(steps, ends, i)`, each step `op << 30 | term`;
+    /// BOOL query `i` is `span(steps, ends, i)`, each step `op << TERM_BITS | term`;
     /// the first step is `OR t1` applied to an empty set.
     pub steps: Vec<u32>,
     pub ends: Vec<u32>,
@@ -267,7 +271,9 @@ pub struct Parsed {
     slots: Vec<u32>,
 }
 
-/// A phrase is named across ranges by `range << 28 | index`.
+/// A phrase is named across ranges by `range << 28 | index`, which allows 16
+/// ranges (one per thread, so at most 16 threads; there are 12) of up to 2^28
+/// phrases.
 pub const RANGE_SHIFT: u32 = 28;
 
 /// Record `i` of a list of variable-length records that end at `ends`.
@@ -286,16 +292,17 @@ impl Parsed {
     }
 
     /// Parses the lines of `text[from..to]` (a whole number of lines). Term
-    /// ids are filled in by `insert`.
+    /// ids are filled in by `insert`. Every line must be a query (spec 2.3);
+    /// only the empty piece after the final LF is not a line.
     pub fn parse(text: &[u8], from: usize, to: usize) -> Parsed {
         let mut p = Parsed::default();
-        for line in text[from..to]
-            .split(|&b| b == b'\n')
-            .filter(|l| !l.is_empty())
-        {
+        let lines = &text[from..to];
+        let lines = lines.strip_suffix(b"\n").unwrap_or(lines);
+        // An empty range has no lines (splitting it would give one empty one).
+        for line in lines.split(|&b| b == b'\n').take_while(|_| from < to) {
             if p.line(line, text).is_none() {
                 let line = String::from_utf8_lossy(line);
-                fail(&format!("malformed query: {line}"));
+                fail(&format!("malformed query: {line:?}"));
             }
         }
         p
@@ -315,7 +322,7 @@ impl Parsed {
             let (mut words, mut op) = (rest.split(|&b| b == b' '), OR);
             loop {
                 self.bool_words.push(word(words.next()?)?);
-                self.steps.push(op << SLOT_BITS);
+                self.steps.push(op << TERM_BITS);
                 op = match words.next() {
                     None => break,
                     Some(b"AND") => AND,
