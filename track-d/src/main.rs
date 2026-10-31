@@ -300,6 +300,11 @@ fn build_csr(
         });
         escaped
     });
+    // PROBE d4: stop after the scatter, before the sort.
+    std::hint::black_box((&edges, &low, &escaped));
+    let lines = std::fs::read_to_string("/data/queries.txt").unwrap().lines().count();
+    std::fs::write("/out/distances.txt", "0\n".repeat(lines)).unwrap();
+    std::process::exit(0);
     let mut escapes = escaped.concat();
     escapes.sort_unstable();
     escapes.dedup_by_key(|e| (e.0, e.1));
@@ -676,15 +681,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     number(text, &mut i); // m: the edge count is implied by the lines themselves
     let text = Text(split_lines(&text[i..], threads));
 
-    // PROBE d3: build_csr's counting pass only (one full parse).
-    let buckets = (n >> 12) + 1;
-    let counts = parallel(vec![(); threads], |k, ()| {
-        let mut count = vec![0u32; buckets];
-        text.each(k, threads, |u, _, _| count[u >> 12] += 1);
-        count
+    let first = build_csr(&text, threads, n, |u, v| (u, v));
+    let (rank, fwd) = bfs_layout(first, threads);
+    let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
+    let queries = std::fs::read_to_string("/data/queries.txt")?
+        .lines()
+        .map(|line| {
+            let (s, t) = line.split_once(' ').ok_or("bad line in queries.txt")?;
+            Ok((node(s)?, node(t)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    drop(rank);
+    let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
+
+    let answers: Vec<AtomicI64> = (0..queries.len()).map(|_| AtomicI64::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    parallel(vec![(); threads], |_, ()| {
+        // 32-bit distances halve the searches' memory. The rare query whose distances
+        // pass 2^32 - 2 (it needs a near-2^32 edge) is answered again with 64 bits.
+        let mut narrow = [Side::<u32>::new(n), Side::new(n)];
+        let mut wide = [Side::<u64>::new(n), Side::new(n)];
+        loop {
+            let q = next.fetch_add(1, Relaxed);
+            let Some(&(s, t)) = queries.get(q) else { break };
+            let g = [&fwd, &bwd];
+            let answer = distance(g, &mut narrow, s, t).or_else(|| distance(g, &mut wide, s, t));
+            answers[q].store(answer.expect("64-bit distances always fit"), Relaxed);
+        }
     });
-    std::hint::black_box(&counts);
-    let lines = std::fs::read_to_string("/data/queries.txt")?.lines().count();
-    std::fs::write("/out/distances.txt", "0\n".repeat(lines))?;
+    let out: String = answers
+        .iter()
+        .map(|a| format!("{}\n", a.load(Relaxed)))
+        .collect();
+    std::fs::write("/out/distances.txt", out)?;
     Ok(())
 }
