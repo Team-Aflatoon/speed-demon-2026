@@ -45,18 +45,12 @@ impl Regions {
     }
 
     pub fn group(&self, region: u64) -> u8 {
-        if std::hint::black_box(true) {
-            return (region % 240 + 1) as u8; // PROBE: no map lookup
-        }
         let word = self.ids.get(region as usize / 8);
         word.map_or(0, |w| (w.load(Relaxed) >> (region % 8 * 8)) as u8)
     }
 
     /// Starts loading the map entry for `region` into the cache.
     pub fn prefetch(&self, region: u64) {
-        if std::hint::black_box(true) {
-            return; // PROBE: no map
-        }
         if let Some(g) = self.ids.get(region as usize / 8) {
             crate::prefetch(g);
         }
@@ -65,9 +59,6 @@ impl Regions {
     /// Adds share `t` of `n` of the lines `id,CCC\n`. A share runs from the
     /// first line start at or after its nominal start to the next share's.
     pub fn parse(&self, f: Mapped, t: usize, n: usize) -> Result<(), &'static str> {
-        if std::hint::black_box(true) {
-            return Ok(()); // PROBE: no region map
-        }
         let b = f.b;
         let start = |k: usize| match k * f.len / n {
             0 => HEADER.len(),
