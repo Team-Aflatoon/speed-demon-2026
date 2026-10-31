@@ -11,9 +11,9 @@ use crate::names::Names;
 use crate::records::{Fail, BOM_FIRST};
 use crate::regions::Regions;
 use crate::{die, Agg, GROUPS};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::thread::{self, Scope};
 
@@ -47,8 +47,9 @@ pub struct Shared<'a> {
     fail: AtomicU8,
 }
 
-/// Parses everything with `threads` workers, `chunks` chunks and a name
-/// table of `slots` slots, and returns the aggregates by group.
+/// Parses everything with `threads` workers, in chunks of nominally `piece`
+/// bytes, with a name table of `slots` slots, and returns the aggregates by
+/// group.
 ///
 /// records.csv is cut into chunks just after an LF that is followed by a
 /// digit or a BOM byte. By spec 2.2 no quoted value holds a digit or a
@@ -71,8 +72,16 @@ pub fn run(
     let chunks = len.div_ceil(piece).max(1);
     let quotes = (0..chunks).map(|_| AtomicU64::new(0)).collect();
     let (next, fail) = (AtomicUsize::new(0), AtomicU8::new(0));
-    let regions_map = regions.0;
-    let shared = Shared { file, len, piece, regions: regions_map, names, next, quotes, fail };
+    let shared = Shared {
+        file,
+        len,
+        piece,
+        regions: regions.0,
+        names,
+        next,
+        quotes,
+        fail,
+    };
     // Before records start, the first workers fault in the name tables (see
     // `Names::touch`) while the others split regions.csv; one worker alone
     // does both.
@@ -170,7 +179,11 @@ impl Shared<'_> {
                 die(&format!("records.csv: {e}"));
             }
             let whole = from + want == self.len;
-            let start = if c == 0 { Some(0) } else { cut(&buffer[..want], 0) };
+            let start = if c == 0 {
+                Some(0)
+            } else {
+                cut(&buffer[..want], 0)
+            };
             let end = match nominal_end == self.len - from {
                 true => Some(want),
                 false => cut(&buffer[..want], nominal_end),
@@ -189,6 +202,9 @@ impl Shared<'_> {
 /// a BOM byte, if `b` holds one. The byte after the LF must be in `b`, so an
 /// LF at its very end is not taken: the caller reads further and asks again.
 fn cut(b: &[u8], from: usize) -> Option<usize> {
-    let boundary = |i: &usize| b[*i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == BOM_FIRST);
-    (from..b.len().saturating_sub(1)).find(boundary).map(|i| i + 1)
+    let boundary =
+        |i: &usize| b[*i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == BOM_FIRST);
+    (from..b.len().saturating_sub(1))
+        .find(boundary)
+        .map(|i| i + 1)
 }

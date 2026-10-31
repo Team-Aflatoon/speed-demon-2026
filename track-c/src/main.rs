@@ -2,6 +2,11 @@
 //! joins it to /data/regions.csv and writes /out/aggregates.txt.
 //! README.md explains the design; the spec is specs/c-join.md.
 
+// The parser's SIMD needs AVX2, which .cargo/config.toml turns on for the
+// whole crate (target-cpu=x86-64-v3); refuse any other build.
+#[cfg(not(target_feature = "avx2"))]
+compile_error!("track-c needs AVX2: build with -C target-cpu=x86-64-v3 (see .cargo/config.toml)");
+
 mod map;
 mod names;
 mod pipeline;
@@ -23,9 +28,10 @@ const MAX_THREADS: usize = 12;
 /// Groups: `_UNMATCHED` (0) and up to 255 countries.
 pub const GROUPS: usize = 256;
 
-/// Running aggregates for one group, which is one output line. `sums` are
-/// count, id sum, amount sum (cents), distinct names, name bytes and note
-/// bytes; `NAMES` indexes the distinct names.
+/// Running aggregates for one group, which is one output line. `sums` holds,
+/// in this order: count, id sum, amount sum (cents), distinct names, name
+/// bytes and note bytes. The parser adds whole records to it at once, and the
+/// name counter adds to the distinct names alone, at index `DISTINCT`.
 #[derive(Clone, Copy)]
 pub struct Agg {
     pub sums: [i64; 6],
@@ -33,7 +39,7 @@ pub struct Agg {
     pub max: i64,
 }
 
-pub const NAMES: usize = 3;
+pub const DISTINCT: usize = 3;
 
 impl Agg {
     pub const EMPTY: Agg = Agg {
@@ -74,7 +80,10 @@ fn main() {
     let out = args.get(2).map_or("/out", |s| s);
     let path = format!("{data}/records.csv");
     let file = File::open(&path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-    let len = file.metadata().map_or(0, |m| m.len()) as usize;
+    let meta = file
+        .metadata()
+        .unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let len = meta.len() as usize;
     if len > u32::MAX as usize {
         die("records.csv is over 4 GiB; chunk offsets are 32-bit"); // spec: 202 MB
     }

@@ -24,8 +24,10 @@ pub struct Regions {
 }
 
 impl Regions {
-    /// An empty map, sized by the id on the file's last line: the largest,
-    /// as the spec lists ids in ascending order (`parse` checks that).
+    /// An empty map, sized by the id on the file's last line, which is the
+    /// largest because spec 2.3 lists the ids unique and in ascending order.
+    /// `parse` rejects any id above it, so a file breaking that order can
+    /// never index outside the map.
     pub fn new(f: Mapped) -> Result<Self, &'static str> {
         let (b, len) = (f.b, f.len);
         if !b.starts_with(HEADER) || b[len - 1] != b'\n' {

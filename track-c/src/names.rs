@@ -9,7 +9,7 @@
 //! cores. Ids are exact: a lookup always compares the name's bytes.
 
 use crate::records::{load, Fail, Record, BATCH};
-use crate::{map, prefetch, Agg, Padded, NAMES};
+use crate::{map, prefetch, Agg, Padded, DISTINCT};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 
 /// Words per table slot: up to three words of name, then `meta`.
@@ -61,7 +61,9 @@ impl Names {
     /// Faults in this worker's share of the tables (see `map::touch`).
     pub fn touch(&self, part: usize, parts: usize) {
         map::touch(self.table, part, parts);
-        map::touch(self.pairs, parts - 1 - part, parts); // the others start here
+        // The bitset's stretches go out in the opposite order, so that the
+        // workers given the table's first stretches get its last ones.
+        map::touch(self.pairs, parts - 1 - part, parts);
     }
 
     /// Interns a batch of names and adds every new (name, group) pair to its
@@ -82,7 +84,7 @@ impl Names {
         for (&at, n) in at.iter().zip(batch) {
             let bit = 1 << (n.group % 64);
             let new = self.pairs[at].fetch_or(bit, Relaxed) & bit == 0;
-            aggs[usize::from(n.group)].sums[NAMES] += i64::from(new);
+            aggs[usize::from(n.group)].sums[DISTINCT] += i64::from(new);
         }
         Ok(())
     }

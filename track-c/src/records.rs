@@ -66,12 +66,21 @@ struct Separators {
     batch: [Record; BATCH],
 }
 
+// The parser is written as methods of the workers' shared state, which holds
+// the region map and the name table that records are joined and counted into.
 impl Shared<'_> {
     /// Parses the records in `b[..end]` into `aggs`: one chunk of the file,
     /// read into a buffer and followed there by `pipeline::PAD` zero bytes. It
     /// must start at a record start, or with the header if `header`; `eof`
     /// says whether it ends the file. Returns the number of quote bytes in it.
-    pub fn chunk(&self, b: &[u8], end: usize, header: bool, eof: bool, aggs: &mut [Agg]) -> Result<u64, Fail> {
+    pub fn chunk(
+        &self,
+        b: &[u8],
+        end: usize,
+        header: bool,
+        eof: bool,
+        aggs: &mut [Agg],
+    ) -> Result<u64, Fail> {
         let base = if header { self.header(b)? } else { 0 };
         let (at, quotes, batch) = ([0; ROOM], [0; ROOM], [Record::default(); BATCH]);
         let mut s = Separators {
@@ -225,10 +234,11 @@ fn masks(b: &[u8], p: usize) -> [u64; 4] {
     let block = b[p..p + 64].as_ptr().cast::<simd::__m256i>();
     // SAFETY: `block` points to 64 readable bytes. The intrinsics need AVX2,
     // which the whole crate is compiled for (`-C target-cpu=x86-64-v3` in
-    // the Dockerfile), so every function here may use it.
+    // .cargo/config.toml; main.rs refuses to build without it), so every
+    // function here may use it.
     unsafe {
         let halves = [block, block.add(1)].map(|h| simd::_mm256_loadu_si256(h));
-        [b'"', b',', b'\n', b'\r'].map(|c| {
+        (*b"\",\n\r").map(|c| {
             let c = simd::_mm256_set1_epi8(c as i8);
             let [lo, hi] = halves.map(|h| simd::_mm256_cmpeq_epi8(h, c));
             let [lo, hi] = [lo, hi].map(|m| simd::_mm256_movemask_epi8(m) as u32);
@@ -299,10 +309,10 @@ pub fn uint(b: &[u8], start: usize) -> Option<(u64, usize)> {
 }
 
 /// The bytes of `w` minus '0', and bit 7 set in every byte that is not a
-/// digit. Digits become 0..=9; any other byte becomes >= 10 (or wraps to
-/// >= 0xD0), which adding 0x76 lifts to bit 7. Borrows and carries only move
-/// towards later bytes, so bytes up to and including the first non-digit are
-/// classified correctly, which is all the callers rely on.
+/// digit. Digits become 0 to 9; any other byte becomes 10 or more (or wraps
+/// to 0xD0 or more), which adding 0x76 lifts to bit 7. Borrows and carries
+/// only move towards later bytes, so bytes up to and including the first
+/// non-digit are classified correctly, which is all the callers rely on.
 fn classify(w: u64) -> (u64, u64) {
     let values = w.wrapping_sub(ZEROS);
     (values, (values.wrapping_add(TENS) | values) & HIGH)
