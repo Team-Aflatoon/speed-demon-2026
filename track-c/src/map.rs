@@ -77,10 +77,7 @@ pub fn zeroed(n: usize) -> io::Result<&'static [AtomicU64]> {
 /// 2 MiB; giving each stretch to one worker faults it all in parallel.
 pub fn touch(words: &[AtomicU64], part: usize, parts: usize) {
     for stretch in words.chunks(STRETCH / 8).skip(part).step_by(parts) {
-        stretch
-            .iter()
-            .step_by(PAGE / 8)
-            .for_each(|w| w.store(0, Relaxed));
+        stretch.iter().step_by(PAGE / 8).for_each(|w| w.store(0, Relaxed));
     }
 }
 

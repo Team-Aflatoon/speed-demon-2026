@@ -15,14 +15,7 @@ use crate::Agg;
 use std::arch::x86_64 as simd;
 
 const HEADER: &[u8] = b"id,name,note,region_id,amount";
-/// The BOM's bytes EF BB BF as the low three bytes of a little-endian load.
-const BOM: u64 = 0xBF_BB_EF;
-pub const BOM_FIRST: u8 = 0xEF;
-/// SWAR constants: '0' in every byte, 0x80 - 10 in every byte, and bit 7 of
-/// every byte (see `classify`).
-const ZEROS: u64 = 0x3030_3030_3030_3030;
-const TENS: u64 = 0x7676_7676_7676_7676;
-const HIGH: u64 = 0x8080_8080_8080_8080;
+const BOM: u64 = 0xBF_BB_EF; // EF BB BF, read little-endian
 /// Records are parsed once `FLUSH` separators have piled up. `ROOM` adds a
 /// block's worth, flattened eight at a time without bounds checks.
 const FLUSH: usize = 160;
@@ -74,14 +67,7 @@ impl Shared<'_> {
         let b = self.b;
         let base = if start == 0 { self.header()? } else { start };
         let (at, quotes, batch) = ([0; ROOM], [0; ROOM], [Record::default(); BATCH]);
-        let mut s = Separators {
-            at,
-            quotes,
-            n: 0,
-            base,
-            record: base,
-            batch,
-        };
+        let mut s = Separators { at, quotes, n: 0, base, record: base, batch };
         // Carried between blocks: in-quotes state (all ones or zero), quotes
         // so far, and whether the previous block's last byte was `,` or `"`.
         let (mut inside, mut quotes, mut sep_before) = (0u64, 0u32, 0u64);
@@ -125,7 +111,7 @@ impl Shared<'_> {
 
     /// The header line; returns where the first record starts.
     fn header(&self) -> Result<usize, Fail> {
-        let p = 3 * usize::from(bom_at(self.b, 0));
+        let p = 3 * usize::from(load(self.b, 0) & 0xFF_FFFF == BOM);
         let q = p + HEADER.len();
         let crlf = usize::from(self.b[q] == b'\r');
         let ok = self.b[p..q] == *HEADER && self.b[q + crlf] == b'\n';
@@ -163,7 +149,7 @@ impl Shared<'_> {
             return None;
         }
         // A BOM directly after a terminator is not data (spec 2.1).
-        let id_at = s.record + 3 * usize::from(bom_at(b, s.record));
+        let id_at = s.record + 3 * usize::from(load(b, s.record) & 0xFF_FFFF == BOM);
         let (start, len, name_len) = text(c0, c1, s.quotes[k + 1] - s.quotes[k]);
         let (_, _, note_len) = text(c1, c2, s.quotes[k + 2] - s.quotes[k + 1]);
         let (id, region) = (number(b, id_at, c0)? as i64, number(b, c2 + 1, c3)?);
@@ -224,9 +210,8 @@ fn text(before: usize, after: usize, quotes: u32) -> (usize, usize, i64) {
 /// bit i stands for byte `p + i`.
 fn masks(b: &[u8], p: usize) -> [u64; 4] {
     let block = b[p..p + 64].as_ptr().cast::<simd::__m256i>();
-    // SAFETY: `block` points to 64 readable bytes. The intrinsics need AVX2,
-    // which the whole crate is compiled for (`-C target-cpu=x86-64-v3` in
-    // the Dockerfile), so every function here may use it.
+    // SAFETY: `block` points to 64 readable bytes, and the build enables
+    // AVX2 (target-cpu=x86-64-v3, see the Dockerfile).
     unsafe {
         let halves = [block, block.add(1)].map(|h| simd::_mm256_loadu_si256(h));
         [b'"', b',', b'\n', b'\r'].map(|c| {
@@ -254,11 +239,10 @@ fn number(b: &[u8], start: usize, end: usize) -> Option<u64> {
     if n > 8 {
         return uint(b, start).and_then(|(value, stop)| (stop == end).then_some(value));
     }
-    // Shift the n digits to the top: the bytes after the field fall off,
-    // and the vacated low bytes read as leading zeros.
-    let (values, other) = classify(load(b, start));
-    let shift = 64 - 8 * n;
-    (other << shift == 0).then(|| eight_digits(values << shift))
+    let w = load(b, start).wrapping_sub(0x3030_3030_3030_3030) << (64 - 8 * n);
+    // As in `uint`: bit 7 of a byte is set unless it was a digit.
+    let other = (w.wrapping_add(0x7676_7676_7676_7676) | w) & 0x8080_8080_8080_8080;
+    (other == 0).then(|| eight_digits(w))
 }
 
 /// The amount `-?[0-9]+\.[0-9]{2}` that is exactly `b[start..end]`, in cents.
@@ -282,15 +266,18 @@ pub fn load(b: &[u8], p: usize) -> u64 {
 pub fn uint(b: &[u8], start: usize) -> Option<(u64, usize)> {
     let (mut value, mut p) = (0u64, start);
     loop {
-        let (w, other) = classify(load(b, p));
+        // Bytes minus '0': digits become 0..=9. Any other byte becomes >= 10
+        // (or wraps to >= 0xD0), which the +0x76 sets bit 7 for. Borrows and
+        // carries only move towards later bytes, so bytes up to and including
+        // the first non-digit are classified correctly.
+        let w = load(b, p).wrapping_sub(0x3030_3030_3030_3030);
+        let other = (w.wrapping_add(0x7676_7676_7676_7676) | w) & 0x8080_8080_8080_8080;
         let n = other.trailing_zeros() as usize / 8;
         if n > 0 {
             // Shift the n digits to the top, so the vacated low bytes act as
             // leading zeros, and convert all eight lanes at once.
             let digits = eight_digits(w << (64 - 8 * n));
-            value = value
-                .checked_mul(10u64.pow(n as u32))?
-                .checked_add(digits)?;
+            value = value.checked_mul(10u64.pow(n as u32))?.checked_add(digits)?;
         }
         p += n;
         if n < 8 {
@@ -299,24 +286,7 @@ pub fn uint(b: &[u8], start: usize) -> Option<(u64, usize)> {
     }
 }
 
-/// The bytes of `w` minus '0', and bit 7 set in every byte that is not a
-/// digit. Digits become 0..=9; any other byte becomes >= 10 (or wraps to
-/// >= 0xD0), which adding 0x76 lifts to bit 7. Borrows and carries only move
-/// towards later bytes, so bytes up to and including the first non-digit are
-/// classified correctly, which is all the callers rely on.
-fn classify(w: u64) -> (u64, u64) {
-    let values = w.wrapping_sub(ZEROS);
-    (values, (values.wrapping_add(TENS) | values) & HIGH)
-}
-
-/// Whether a BOM starts at `p`.
-fn bom_at(b: &[u8], p: usize) -> bool {
-    load(b, p) & 0xFF_FFFF == BOM
-}
-
-/// Eight digit values (0..=9, first digit in the lowest byte) to an integer:
-/// adjacent digits combine into pairs, the pairs into fours (times 100),
-/// and the fours into eight (times 10,000), two lanes per multiply.
+/// Eight digit values (0..=9, first digit in the lowest byte) to an integer.
 fn eight_digits(v: u64) -> u64 {
     let v = v.wrapping_mul(10).wrapping_add(v >> 8); // pairs of digits
     let lo = (v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32));
