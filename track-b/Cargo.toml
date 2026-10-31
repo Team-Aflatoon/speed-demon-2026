@@ -1,6 +1,6 @@
 [package]
 name = "track-b"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 description = "Speed Demon 2026, Track B: boolean and phrase queries over a text corpus"
 
