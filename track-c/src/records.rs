@@ -56,8 +56,7 @@ pub struct Record {
 
 /// A chunk's separators not yet consumed: offsets from `base`, the quote
 /// bytes before each, how many there are, and where their record starts;
-/// the batch the records they complete are parsed into; and the chunk's LF
-/// separators and records so far (see `chunk`).
+/// and the batch the records they complete are parsed into.
 struct Separators {
     at: [u32; ROOM],
     quotes: [u32; ROOM],
@@ -65,8 +64,6 @@ struct Separators {
     base: usize,
     record: usize,
     batch: [Record; BATCH],
-    lfs: u64,
-    records: u64,
 }
 
 impl Shared<'_> {
@@ -84,8 +81,6 @@ impl Shared<'_> {
             base,
             record: base,
             batch,
-            lfs: 0,
-            records: 0,
         };
         // Carried between blocks: in-quotes state (all ones or zero), quotes
         // so far, and whether the previous block's last byte was `,` or `"`.
@@ -111,7 +106,6 @@ impl Shared<'_> {
             }
             s.push((comma | lf) & !ins, (o - base) as u32, quote, quotes);
             quotes += quote.count_ones();
-            s.lfs += u64::from((lf & !ins).count_ones());
             inside = ((ins as i64) >> 63) as u64; // bit 63, broadcast
             sep_before = sep >> 63;
             if s.n >= FLUSH {
@@ -125,12 +119,7 @@ impl Shared<'_> {
             self.join(&mut s.batch[..1], aggs)?;
             (s.n, s.record) = (0, end);
         }
-        // Separators are commas or LFs, and each record's fifth was checked
-        // to be an LF. So if the LFs number exactly the records, none of
-        // the first four was one: they were all commas, and each record had
-        // exactly five fields. (A last record without a terminator has no LF
-        // and is not counted.)
-        let whole = s.n == 0 && s.record == end && s.lfs == s.records;
+        let whole = s.n == 0 && s.record == end;
         whole.then_some(u64::from(quotes)).ok_or(Fail::Malformed)
     }
 
@@ -149,7 +138,6 @@ impl Shared<'_> {
     /// cache, overlap.
     fn records(&self, s: &mut Separators, aggs: &mut [Agg]) -> Result<(), Fail> {
         let done = s.n / 5;
-        s.records += done as u64;
         for r in 0..done {
             let lf = s.base + s.at[5 * r + 4] as usize;
             let parsed = self.b[lf] == b'\n' && self.parse(s, 5 * r, lf, r).is_some();
@@ -170,8 +158,10 @@ impl Shared<'_> {
     /// file) is at `end`.
     fn parse(&self, s: &mut Separators, k: usize, end: usize, r: usize) -> Option<()> {
         let b = self.b;
-        // That these are commas is checked for the whole chunk at its end.
         let [c0, c1, c2, c3] = [0, 1, 2, 3].map(|j| s.base + s.at[k + j] as usize);
+        if [c0, c1, c2, c3].iter().any(|&c| b[c] != b',') {
+            return None;
+        }
         // A BOM directly after a terminator is not data (spec 2.1).
         let id_at = s.record + 3 * usize::from(bom_at(b, s.record));
         let (start, len, name_len) = text(c0, c1, s.quotes[k + 1] - s.quotes[k]);
@@ -275,23 +265,11 @@ fn number(b: &[u8], start: usize, end: usize) -> Option<u64> {
 #[inline(always)]
 fn cents(b: &[u8], start: usize, end: usize) -> Option<i64> {
     let negative = b[start] == b'-';
-    let (digits, dot) = (start + usize::from(negative), end.checked_sub(3)?);
-    if b[dot] != b'.' || dot <= digits {
-        return None;
-    }
-    let cents = if end - digits <= 8 {
-        // Up to seven digits: drop the dot by moving the bytes after it
-        // down one, and convert all the digits in one step, as in `number`.
-        let (w, whole) = (load(b, digits), dot - digits);
-        let low = u64::MAX >> (64 - 8 * whole);
-        let (values, other) = classify(w & low | (w >> 8) & !low);
-        let shift = 64 - 8 * (whole + 2);
-        (other << shift == 0).then(|| eight_digits(values << shift) as i64)?
-    } else {
-        let whole = i64::try_from(number(b, digits, dot)?).ok()?;
-        whole.checked_mul(100)? + number(b, dot + 1, end)? as i64
-    };
-    Some(if negative { -cents } else { cents })
+    let dot = end.checked_sub(3)?;
+    let whole = number(b, start + usize::from(negative), dot)?;
+    let fraction = number(b, dot + 1, end)? as i64;
+    let cents = i64::try_from(whole).ok()?.checked_mul(100)? + fraction;
+    (b[dot] == b'.').then_some(if negative { -cents } else { cents })
 }
 
 /// Little-endian load of the 8 bytes at `p`.

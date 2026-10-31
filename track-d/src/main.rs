@@ -4,7 +4,7 @@
 //! 2. Renumber the nodes in BFS order (`bfs_layout`): node ids in the file are random;
 //!    renumbered, road-network neighbours sit at nearby ids, so a search touches a few
 //!    cache lines instead of one per node. The walk lays out the forward graph in the
-//!    new order as it goes; transposing that gives the in-edges (`transpose`).
+//!    new order as it goes; transposing that gives the in-edges (`build_csr` again).
 //! 3. Answer the queries on all threads, each with a bidirectional Dijkstra.
 
 use std::collections::VecDeque;
@@ -162,12 +162,17 @@ fn parallel<S: Send, R: Send>(states: Vec<S>, f: impl Fn(usize, S) -> R + Sync) 
         .collect()
 }
 
-/// The edge lines of graph.txt, split at line boundaries into one piece per thread.
+/// Anything that can list a graph's edges `(tail, head, weight)` in `parts` disjoint
+/// parts, one per thread.
+trait EdgeSource: Sync {
+    fn each(&self, part: usize, parts: usize, f: impl FnMut(usize, usize, u64));
+}
+
+/// The edge lines of graph.txt, split at line boundaries into one piece per part.
 struct Text<'a>(Vec<&'a [u8]>);
 
-impl Text<'_> {
-    /// Calls `f(u, v, w)` for every edge line of piece `part`.
-    fn each(&self, part: usize, mut f: impl FnMut(usize, usize, u64)) {
+impl EdgeSource for Text<'_> {
+    fn each(&self, part: usize, _: usize, mut f: impl FnMut(usize, usize, u64)) {
         let (piece, mut i) = (self.0[part], 0);
         while i < piece.len() {
             let u = number(piece, &mut i) as usize;
@@ -178,16 +183,20 @@ impl Text<'_> {
 }
 
 /// Views a slice of integers as atomics, so threads can fill disjoint slots of it.
-fn as_atomic(v: &mut [u32]) -> &[AtomicU32] {
-    // SAFETY: AtomicU32 has the same size, alignment and bit validity as u32, and the
-    // exclusive borrow rules out non-atomic access while the view lives.
-    unsafe { &*(v as *mut [u32] as *const [AtomicU32]) }
+fn as_atomic<T: Atomic>(v: &mut [T]) -> &[T::Cell] {
+    // SAFETY: each atomic type has the same size, alignment and bit validity as its
+    // integer, and the exclusive borrow rules out non-atomic access while the view lives.
+    unsafe { &*(v as *mut [T] as *const [T::Cell]) }
 }
 
-/// `as_atomic` for the 16-bit side array.
-fn as_atomic16(v: &mut [u16]) -> &[AtomicU16] {
-    // SAFETY: as for `as_atomic`, with AtomicU16 and u16.
-    unsafe { &*(v as *mut [u16] as *const [AtomicU16]) }
+trait Atomic {
+    type Cell;
+}
+impl Atomic for u16 {
+    type Cell = AtomicU16;
+}
+impl Atomic for u32 {
+    type Cell = AtomicU32;
 }
 
 /// Adjacency in compressed sparse rows: the edges of row r are `edges[off[r]..off[r + 1]]`.
@@ -230,155 +239,35 @@ impl Csr {
     }
 }
 
-/// One thread's share of the first parse: for every bucket of tails a run of packed
-/// edges, with the tails' low bits alongside, how full each run is, and what did not fit.
-struct Runs {
-    cap: usize,
-    edges: Vec<u32>,
-    low: Vec<u16>,
-    fill: Vec<u32>,
-    spill: Vec<(u32, u16, u32)>, // (bucket, tail's low bits, packed edge)
-    escaped: Vec<(u32, u32, u32)>,
+/// A CSR lists its edges by contiguous ranges of rows.
+impl EdgeSource for Csr {
+    fn each(&self, part: usize, parts: usize, mut f: impl FnMut(usize, usize, u64)) {
+        for r in part * self.rows() / parts..(part + 1) * self.rows() / parts {
+            self.out(r).for_each(|(v, w)| f(r, v, w));
+        }
+    }
 }
 
-const BUCKET_BITS: u32 = 12; // a bucket's histogram stays in L1
-
-/// Builds the CSR of the n-node, m-edge graph in `text` in a single parse, with no atomic
-/// read-modify-write. Each thread writes every edge into its own run for the edge's
-/// bucket of 4096 tails. Runs are sized from the thread's share of the text plus a margin,
-/// since tails spread evenly over the buckets (ids are random); an edge that still does
-/// not fit goes to a spill list, so the sizes only matter for speed. Then every bucket is
-/// counting-sorted by tail on its own thread, straight from the runs into the final
-/// array, and its histogram doubles as that bucket's row offsets.
-fn build_csr(text: &Text, n: usize, m: usize) -> Csr {
+/// Builds the CSR of n nodes holding the edge `map(u, v)` = (tail, head), of weight w,
+/// for every edge (u, v, w) of `source`. No atomic read-modify-write is needed: pass 1
+/// counts edges per (thread, bucket of 4096 tails), pass 2 writes each edge into its
+/// thread's private run of its bucket (with the tail's low bits alongside, in `low`),
+/// and finally every bucket is counting-sorted by tail on its own thread.
+fn build_csr(
+    source: &impl EdgeSource,
+    parts: usize,
+    n: usize,
+    map: impl Fn(usize, usize) -> (usize, usize) + Sync,
+) -> Csr {
     // Bits left for the weight once a head id below n is stored.
     let weight_bits = 32 - (usize::BITS - (n.max(2) - 1).leading_zeros());
     assert!(weight_bits >= 6, "too many nodes for 32-bit edges");
     let escape = (1u64 << weight_bits) - 1;
+    const BUCKET_BITS: u32 = 12; // a bucket's histogram stays in L1
     let buckets = (n >> BUCKET_BITS) + 1;
-    let total = text.0.iter().map(|piece| piece.len()).sum::<usize>().max(1);
-    let runs = parallel(text.0.clone(), |k, piece| {
-        let cap = m * piece.len() / total / buckets * 9 / 8 + 16;
-        let (edges, low, fill) = (
-            vec![0; buckets * cap],
-            vec![0; buckets * cap],
-            vec![0; buckets],
-        );
-        let mut r = Runs {
-            cap,
-            edges,
-            low,
-            fill,
-            spill: Vec::new(),
-            escaped: Vec::new(),
-        };
-        text.each(k, |u, v, w| {
-            let (b, low) = (u >> BUCKET_BITS, (u & ((1 << BUCKET_BITS) - 1)) as u16);
-            let edge = (v << weight_bits) as u32 | w.min(escape) as u32;
-            if w >= escape {
-                r.escaped.push((u as u32, v as u32, w as u32));
-            }
-            let at = r.fill[b] as usize;
-            if at < cap {
-                r.edges[b * cap + at] = edge;
-                r.low[b * cap + at] = low;
-                r.fill[b] += 1;
-            } else {
-                r.spill.push((b as u32, low, edge));
-            }
-        });
-        r
-    });
-    let mut escapes: Vec<_> = runs
-        .iter()
-        .flat_map(|r| r.escaped.iter().copied())
-        .collect();
-    escapes.sort_unstable();
-    escapes.dedup_by_key(|e| (e.0, e.1));
-    let mut spill: Vec<_> = runs.iter().flat_map(|r| r.spill.iter().copied()).collect();
-    spill.sort_unstable_by_key(|s| s.0);
-    let mut size = vec![0u32; buckets];
-    spill.iter().for_each(|s| size[s.0 as usize] += 1);
-    runs.iter()
-        .for_each(|r| size.iter_mut().zip(&r.fill).for_each(|(s, f)| *s += f));
-    let bucket_start: Vec<u32> = std::iter::once(0)
-        .chain(size.iter().scan(0, |at, s| {
-            *at += s;
-            Some(*at)
-        }))
-        .collect();
-
-    // Counting-sort every bucket by tail; buckets are disjoint, so split the arrays.
-    let (mut off, mut edges) = (
-        vec![0u32; n + 1],
-        vec![0u32; bucket_start[buckets] as usize],
-    );
-    let mut work = Vec::with_capacity(buckets);
-    let (mut rest_e, mut rest_o) = (&mut edges[..], &mut off[1..]);
-    for b in 0..buckets {
-        let (e, tail_e) = rest_e.split_at_mut((bucket_start[b + 1] - bucket_start[b]) as usize);
-        let (o, tail_o) = rest_o.split_at_mut(rest_o.len().min(1 << BUCKET_BITS));
-        work.push((b, bucket_start[b], e, o));
-        (rest_e, rest_o) = (tail_e, tail_o);
-    }
-    let per = buckets.div_ceil(runs.len());
-    let mut chunks = Vec::new();
-    while !work.is_empty() {
-        chunks.push(work.drain(..per.min(work.len())).collect::<Vec<_>>());
-    }
-    parallel(chunks, |_, chunk| {
-        let mut count = vec![0u32; 1 << BUCKET_BITS];
-        for (b, start, e, o) in chunk {
-            // The bucket's edges: the filled part of every thread's run, then any spills.
-            let filled = || {
-                runs.iter()
-                    .map(|r| (b * r.cap..b * r.cap + r.fill[b] as usize, r))
-            };
-            let spilled = &spill[spill.partition_point(|s| (s.0 as usize) < b)..];
-            let spilled = &spilled[..spilled.partition_point(|s| s.0 as usize == b)];
-            count.fill(0);
-            filled().for_each(|(at, r)| r.low[at].iter().for_each(|&x| count[x as usize] += 1));
-            spilled.iter().for_each(|&(_, x, _)| count[x as usize] += 1);
-            let mut sum = 0;
-            for (x, c) in count.iter_mut().enumerate() {
-                (*c, sum) = (sum, sum + *c); // count becomes each tail's first slot
-                if let Some(end) = o.get_mut(x) {
-                    *end = start + sum; // off[r + 1] = end of row r
-                }
-            }
-            let entries = filled().flat_map(|(at, r)| r.low[at.clone()].iter().zip(&r.edges[at]));
-            for (&x, &edge) in entries.chain(spilled.iter().map(|(_, x, edge)| (x, edge))) {
-                e[count[x as usize] as usize] = edge;
-                count[x as usize] += 1;
-            }
-        }
-    });
-    Csr {
-        off,
-        edges,
-        weight_bits,
-        escapes,
-    }
-}
-
-/// The in-edges of `g`: row v lists (u, weight) for every edge u -> v. The same bucketed
-/// build as `build_csr`, but in place. With the graph in memory a counting pass is cheap,
-/// so every (thread, bucket) run gets its exact size and the runs of a bucket lie side by
-/// side, which lets each bucket be sorted inside the final array, with its tails' low
-/// bits in a side array. A separate output, as in `build_csr`, would add 20 MB to this
-/// phase's memory peak.
-fn transpose(g: &Csr, parts: usize) -> Csr {
-    let (n, weight_bits) = (g.rows(), g.weight_bits);
-    let escape = (1u64 << weight_bits) - 1;
-    let buckets = (n >> BUCKET_BITS) + 1;
-    let ranges: Vec<_> = (0..parts)
-        .map(|k| k * n / parts..(k + 1) * n / parts)
-        .collect();
-    let counts = parallel(ranges.clone(), |_, rows| {
+    let counts = parallel(vec![(); parts], |k, ()| {
         let mut count = vec![0u32; buckets];
-        for e in rows.flat_map(|u| g.row(u)) {
-            count[(e >> weight_bits) as usize >> BUCKET_BITS] += 1;
-        }
+        source.each(k, parts, |u, v, _| count[map(u, v).0 >> BUCKET_BITS] += 1);
         count
     });
     // Each thread's cursor per bucket: bucket start plus what earlier threads put there.
@@ -394,28 +283,23 @@ fn transpose(g: &Csr, parts: usize) -> Csr {
     }
     bucket_start[buckets] = at;
     // calloc'd: the writers fault the pages in. Relaxed atomic stores are plain stores.
-    let mut edges = vec![0u32; at as usize];
-    let mut low = vec![0u16; at as usize];
-    let (edge_cells, low_cells) = (as_atomic(&mut edges), as_atomic16(&mut low));
-    let escaped = parallel(
-        ranges.into_iter().zip(cursors).collect(),
-        |_, (rows, mut cursor)| {
-            let mut escaped = Vec::new();
-            for u in rows {
-                for (v, w) in g.out(u) {
-                    let slot = &mut cursor[v >> BUCKET_BITS];
-                    edge_cells[*slot as usize]
-                        .store((u << weight_bits) as u32 | w.min(escape) as u32, Relaxed);
-                    low_cells[*slot as usize].store((v & ((1 << BUCKET_BITS) - 1)) as u16, Relaxed);
-                    *slot += 1;
-                    if w >= escape {
-                        escaped.push((v as u32, u as u32, w as u32));
-                    }
-                }
+    let (mut edges, mut low) = (vec![0u32; at as usize], vec![0u16; at as usize]);
+    let (edge_cells, low_cells) = (as_atomic(&mut edges), as_atomic(&mut low));
+    let escaped = parallel(cursors, |k, mut cursor| {
+        let mut escaped = Vec::new();
+        source.each(k, parts, |u, v, w| {
+            let (x, y) = map(u, v);
+            let slot = &mut cursor[x >> BUCKET_BITS];
+            edge_cells[*slot as usize]
+                .store((y << weight_bits) as u32 | w.min(escape) as u32, Relaxed);
+            low_cells[*slot as usize].store((x & ((1 << BUCKET_BITS) - 1)) as u16, Relaxed);
+            *slot += 1;
+            if w >= escape {
+                escaped.push((x as u32, y as u32, w as u32));
             }
-            escaped
-        },
-    );
+        });
+        escaped
+    });
     let mut escapes = escaped.concat();
     escapes.sort_unstable();
     escapes.dedup_by_key(|e| (e.0, e.1));
@@ -789,10 +673,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = map_file("/data/graph.txt")?;
     let mut i = 0;
     let n = number(text, &mut i) as usize;
-    let m = number(text, &mut i) as usize; // only sizes buffers: lines are counted anyway
+    number(text, &mut i); // m: the edge count is implied by the lines themselves
     let text = Text(split_lines(&text[i..], threads));
 
-    let first = build_csr(&text, n, m);
+    let first = build_csr(&text, threads, n, |u, v| (u, v));
     let (rank, fwd) = bfs_layout(first, threads);
     let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
     let queries = std::fs::read_to_string("/data/queries.txt")?
@@ -803,7 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
     drop(rank);
-    let bwd = transpose(&fwd, threads);
+    let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
 
     let answers: Vec<AtomicI64> = (0..queries.len()).map(|_| AtomicI64::new(0)).collect();
     let next = AtomicUsize::new(0);
