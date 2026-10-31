@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::{fs::File, io, ptr::null_mut, slice};
 
 extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: c_long)
-        -> *mut c_void;
-    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn mmap(at: *mut c_void, n: usize, prot: c_int, how: c_int, fd: c_int, o: c_long) -> *mut u8;
+    fn madvise(at: *mut u8, n: usize, advice: c_int) -> c_int;
 }
 
 const PROT_READ: c_int = 1;
@@ -18,12 +17,14 @@ const PROT_WRITE: c_int = 2;
 const MAP_PRIVATE: c_int = 0x02;
 const MAP_FIXED: c_int = 0x10;
 const MAP_ANONYMOUS: c_int = 0x20;
-const MAP_FAILED: *mut c_void = !0 as *mut c_void;
-const MADV_HUGEPAGE: c_int = 14;
-const HUGE_PAGE: usize = 2 << 20;
+const MAP_FAILED: *mut u8 = !0 as *mut u8;
+const MADV_NOHUGEPAGE: c_int = 15;
+const PAGE: usize = 4096;
+/// The memory one page-table page maps.
+const STRETCH: usize = 2 << 20;
 
 /// Zero bytes guaranteed readable after the end of every mapped file.
-pub const PAD: usize = 4096;
+pub const PAD: usize = PAGE;
 
 /// A mapped file: `b` is its `len` bytes followed by at least `PAD` zero
 /// bytes. The padding lets the parsers load whole words and vectors near
@@ -41,55 +42,52 @@ pub fn map(path: &str) -> io::Result<Mapped> {
     let file = File::open(path)?;
     let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
     let span = len.next_multiple_of(PAD) + PAD;
-    let base = anonymous(span, 1, PROT_READ)?;
-    if len > 0 {
-        let fd = file.as_raw_fd();
-        // SAFETY: MAP_FIXED replaces the start of our own fresh reservation,
-        // which nothing else refers to, with the file.
-        let at = unsafe { mmap(base.cast(), len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) };
-        if at == MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
+    let base = anonymous(span, PROT_READ)?;
+    let (fd, flags) = (file.as_raw_fd(), MAP_PRIVATE | MAP_FIXED);
+    // SAFETY: MAP_FIXED replaces the start of our own fresh reservation,
+    // which nothing else refers to, with the file.
+    let at = unsafe { mmap(base.cast(), len, PROT_READ, flags, fd, 0) };
+    if len > 0 && at == MAP_FAILED {
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: `span` readable bytes that are never unmapped, of a file under
     // the read-only /data, so they stay valid and unchanged: 'static holds.
-    Ok(Mapped { b: unsafe { slice::from_raw_parts(base, span) }, len })
+    let b = unsafe { slice::from_raw_parts(base, span) };
+    Ok(Mapped { b, len })
 }
 
-/// `n` zeroed atomics. Pages never touched are never backed by memory.
-/// With `huge`, the memory is 2 MiB-aligned and offered to the kernel as
-/// transparent huge pages: for the shared name table, one page fault per
-/// 2 MiB instead of 512 (workers would otherwise queue on the page-table
-/// lock), and a handful of TLB entries for millions of random lookups.
-pub fn zeroed(n: usize, huge: bool) -> io::Result<&'static [AtomicU64]> {
-    let (bytes, align) = (n * 8, if huge { HUGE_PAGE } else { 1 });
-    let base = anonymous(bytes, align, PROT_READ | PROT_WRITE)?;
-    if huge {
-        // SAFETY: only a hint about our own mapping; if the kernel refuses
-        // it, the pages simply stay small.
-        unsafe { madvise(base.cast(), bytes, MADV_HUGEPAGE) };
-    }
+/// `n` zeroed atomics, in 4 KiB pages: transparent huge pages are refused.
+/// They made no measurable difference to speed, a huge-page fault can stall
+/// for milliseconds while the kernel compacts memory, and a kernel set to
+/// use them everywhere would charge 2 MiB for a table that is barely
+/// touched. Only touched pages are ever backed by memory.
+pub fn zeroed(n: usize) -> io::Result<&'static [AtomicU64]> {
+    let bytes = n * 8;
+    let base = anonymous(bytes, PROT_READ | PROT_WRITE)?;
+    // SAFETY: only a hint about our own mapping.
+    unsafe { madvise(base, bytes, MADV_NOHUGEPAGE) };
     // SAFETY: `bytes` zeroed, writable, aligned bytes that are never
     // unmapped, and all-zero bits are a valid AtomicU64.
-    let words: &[AtomicU64] = unsafe { slice::from_raw_parts(base.cast(), n) };
-    if huge {
-        // Fault each huge page in now, from this one thread. Workers racing
-        // to touch a page first can each be given (and charged) 2 MiB, all
-        // but one freed right away, which shows up in peak memory.
-        words.iter().step_by(HUGE_PAGE / 8).for_each(|w| w.store(0, Relaxed));
-    }
-    Ok(words)
+    Ok(unsafe { slice::from_raw_parts(base.cast(), n) })
 }
 
-/// A fresh private anonymous mapping of `bytes` plus `align` of slack,
-/// returned at its first `align`-aligned address.
-fn anonymous(bytes: usize, align: usize, prot: c_int) -> io::Result<*mut u8> {
+/// Faults in every page of 2 MiB stretches `part`, `part + parts`, ... of
+/// `words`. A shared table touched at random by all workers would fault in
+/// with every worker queueing on the lock of the page table covering each
+/// 2 MiB; giving each stretch to one worker faults it all in parallel.
+pub fn touch(words: &[AtomicU64], part: usize, parts: usize) {
+    for stretch in words.chunks(STRETCH / 8).skip(part).step_by(parts) {
+        stretch.iter().step_by(PAGE / 8).for_each(|w| w.store(0, Relaxed));
+    }
+}
+
+/// A fresh private anonymous mapping of `bytes`.
+fn anonymous(bytes: usize, prot: c_int) -> io::Result<*mut u8> {
     let flags = MAP_PRIVATE | MAP_ANONYMOUS;
     // SAFETY: asks for new memory and touches none that exists.
-    let raw = unsafe { mmap(null_mut(), bytes + align, prot, flags, -1, 0) };
+    let raw = unsafe { mmap(null_mut(), bytes, prot, flags, -1, 0) };
     if raw == MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    let raw = raw.cast::<u8>();
-    Ok(raw.wrapping_add(raw.align_offset(align)))
+    Ok(raw)
 }

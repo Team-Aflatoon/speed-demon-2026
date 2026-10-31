@@ -4,7 +4,7 @@
 
 use crate::map::Mapped;
 use crate::records::uint;
-use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Mutex;
 
 const HEADER: &[u8] = b"region_id,country\n";
@@ -13,10 +13,12 @@ const CODES: usize = 26 * 26 * 26;
 const MAX_ID: usize = 100_000_000;
 
 pub struct Regions {
-    /// Group by region id; 0 for an id the table does not contain.
-    by_id: Vec<AtomicU8>,
+    /// Group by region id, eight per word (id 8w + k in byte k of word w);
+    /// 0 for an id the table does not contain. Lazily zeroed memory, so the
+    /// workers that fill it also fault it in, instead of the main thread.
+    ids: &'static [AtomicU64],
     /// Group by country code index (`AAA` = 0); 0 until the code is seen.
-    by_code: Vec<AtomicU8>,
+    codes: Vec<AtomicU8>,
     /// Groups handed out so far; held while handing out a new one.
     groups: Mutex<u8>,
 }
@@ -27,24 +29,26 @@ impl Regions {
     pub fn new(f: Mapped) -> Result<Self, &'static str> {
         let (b, len) = (f.b, f.len);
         if !b.starts_with(HEADER) || b[len - 1] != b'\n' {
-            return Err("bad header, or no LF at the end");
+            return Err("regions.csv: bad header, or no LF at the end");
         }
         let last = b[..len - 1].iter().rposition(|&c| c == b'\n');
         let max = uint(b, last.map_or(0, |i| i + 1)).map_or(0, |(id, _)| id as usize);
         if max > MAX_ID {
-            return Err("region ids over 100,000,000 (the spec's stay below 1,000,000)");
+            return Err("regions.csv: ids over 100,000,000 (the spec's are below 1,000,000)");
         }
-        let zeros = |n| (0..n).map(|_| AtomicU8::new(0)).collect();
-        Ok(Regions { by_id: zeros(max + 1), by_code: zeros(CODES), groups: Mutex::new(0) })
+        let ids = crate::map::zeroed(max / 8 + 1).map_err(|_| "out of memory")?;
+        let (codes, groups) = ((0..CODES).map(|_| AtomicU8::new(0)).collect(), Mutex::new(0));
+        Ok(Regions { ids, codes, groups })
     }
 
     pub fn group(&self, region: u64) -> u8 {
-        self.by_id.get(region as usize).map_or(0, |g| g.load(Relaxed))
+        let word = self.ids.get(region as usize / 8);
+        word.map_or(0, |w| (w.load(Relaxed) >> (region % 8 * 8)) as u8)
     }
 
     /// Starts loading the map entry for `region` into the cache.
     pub fn prefetch(&self, region: u64) {
-        if let Some(g) = self.by_id.get(region as usize) {
+        if let Some(g) = self.ids.get(region as usize / 8) {
             crate::prefetch(g);
         }
     }
@@ -55,41 +59,45 @@ impl Regions {
         let b = f.b;
         let start = |k: usize| match k * f.len / n {
             0 => HEADER.len(),
-            at => b[at - 1..f.len].iter().position(|&c| c == b'\n').map_or(f.len, |i| at + i),
+            // The file ends in an LF (checked in `new`), so one is found.
+            at => at + b[at - 1..f.len].iter().position(|&c| c == b'\n').unwrap(),
         };
         let (mut p, end) = (start(t), start(t + 1));
         while p < end {
-            let (id, q) = uint(b, p).ok_or("bad region id")?;
+            let (id, q) = uint(b, p).ok_or("regions.csv: bad region id")?;
             let code = &b[q + 1..q + 4];
             if b[q] != b',' || b[q + 4] != b'\n' || !code.iter().all(u8::is_ascii_uppercase) {
-                return Err("bad line");
+                return Err("regions.csv: bad line");
             }
             let code = code.iter().fold(0, |c, &l| c * 26 + usize::from(l - b'A'));
-            let slot = self.by_id.get(id as usize).ok_or("ids are not ascending")?;
-            slot.store(self.group_of(code)?, Relaxed);
+            let word = self.ids.get(id as usize / 8);
+            let word = word.ok_or("regions.csv: ids are not ascending")?;
+            word.fetch_or(u64::from(self.group_of(code)?) << (id % 8 * 8), Relaxed);
             p = q + 5;
         }
         Ok(())
     }
 
     fn group_of(&self, code: usize) -> Result<u8, &'static str> {
-        let g = self.by_code[code].load(Relaxed);
+        let g = self.codes[code].load(Relaxed);
         if g != 0 {
             return Ok(g);
         }
         let mut groups = self.groups.lock().unwrap();
         // Another worker may have handed this code a group meanwhile.
-        if self.by_code[code].load(Relaxed) == 0 {
-            *groups = groups.checked_add(1).ok_or("more than 255 countries")?;
-            self.by_code[code].store(*groups, Relaxed);
+        if self.codes[code].load(Relaxed) == 0 {
+            let next = groups.checked_add(1);
+            *groups = next.ok_or("regions.csv: more than 255 countries")?;
+            self.codes[code].store(*groups, Relaxed);
         }
-        Ok(self.by_code[code].load(Relaxed))
+        Ok(self.codes[code].load(Relaxed))
     }
 
     /// `(code, group)` for every country seen, in code order.
     pub fn countries(&self) -> impl Iterator<Item = (String, u8)> + '_ {
         let letters = |c: usize| [c / 676, c / 26 % 26, c % 26].map(|l| (b'A' + l as u8) as char);
-        let groups = self.by_code.iter().map(|g| g.load(Relaxed)).enumerate();
-        groups.filter(|&(_, g)| g != 0).map(move |(c, g)| (letters(c).iter().collect(), g))
+        let groups = self.codes.iter().map(|g| g.load(Relaxed)).enumerate();
+        let seen = groups.filter(|&(_, g)| g != 0);
+        seen.map(move |(c, g)| (letters(c).iter().collect(), g))
     }
 }
