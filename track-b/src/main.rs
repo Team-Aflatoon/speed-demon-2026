@@ -1,389 +1,223 @@
 //! Speed Demon 2026, Track B: answers the BOOL and PHRASE queries of
 //! `/data/queries.txt` over `/data/docs.txt` and writes `/out/results.txt`.
 //!
-//! The queries are read first, so only their terms are ever indexed. The
-//! corpus is cut into segments of about 8 MB, each into chunks of 512 KB, and
-//! twelve threads run one queue of tasks, in this order:
-//!
-//! - scan (per chunk): tokenize, look every token up in the term table, emit
-//!   each document's BOOL terms into 64 partition streams, and check the
-//!   phrases anchored at its tokens (`scan.rs`);
-//! - build (per partition): counting-sort the streams of a segment into
-//!   sorted lists and bitmaps (`index.rs`); one extra build task folds the
-//!   segment's phrase matches into the phrase answers;
-//! - eval (per query range): answer every BOOL query against the segment and
-//!   add the result to its running answer.
-//!
-//! The queue is `scan 0, scan 1, build 0, eval 0, scan 2, build 1, eval 1, ...`,
-//! and a task waits only for what it reads: chunk streams are double buffered
-//! by segment parity, so the next segment is scanned while one is built and
-//! answered, and no thread idles at a phase boundary.
+//! The queries are known before the corpus is read, so there is no global
+//! index. The corpus is cut into blocks of whole lines; worker threads claim
+//! blocks, index each one for the query terms only, answer every query against
+//! it and fold the per-block answers into one running answer per query. Count
+//! and sum simply add up, and the ten smallest ids merge like sorted lists.
 
+mod dict;
+mod eval;
 mod index;
-mod query;
-mod scan;
+mod lex;
+mod mmap;
+mod simd;
 
-use index::{Answer, Evaluator, Part, PARTS};
-use query::{Parsed, Table, MAX_QUERY_BYTES, PHRASE, RANGE_SHIFT};
-use scan::{read_full, ChunkOut, Scanner};
-use std::fs::File;
-use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex, OnceLock, RwLock};
+use dict::Dict;
+use eval::{Answer, Evaluator};
+use index::{bad_corpus, Index};
+use mmap::Mmap;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::thread;
 
+/// About 3,100 average documents (3 MiB at ~1,015 bytes each), so most blocks
+/// are a single batch.
+const BLOCK_BYTES: usize = 3 << 20;
 const MAX_THREADS: usize = 12;
-const SEGMENT_BYTES: u64 = 8 << 20;
-const CHUNK_BYTES: u64 = 512 << 10;
 
 fn main() {
-    disable_huge_pages();
-    run("/data", "/out");
-}
-
-/// Prints `msg` and exits with status 1. Every input and I/O error ends here.
-/// `exit` must not run on two threads at once, so only the first caller
-/// reports; any other thread that fails meanwhile waits for the exit.
-pub fn fail(msg: &str) -> ! {
-    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if FAILED.swap(true, AcqRel) {
-        loop {
-            std::thread::park();
-        }
+    mmap::disable_huge_pages();
+    if let Err(err) = run(Path::new("/data"), Path::new("/out")) {
+        eprintln!("track-b: {err}");
+        std::process::exit(1);
     }
-    eprintln!("track-b: {msg}");
-    std::process::exit(1)
 }
 
-extern "C" {
-    fn prctl(option: i32, ...) -> i32;
+fn run(data_dir: &Path, out_dir: &Path) -> io::Result<()> {
+    let (queries, dict) = parse(&Mmap::open(&data_dir.join("queries.txt"))?)?;
+    let docs = Mmap::open(&data_dir.join("docs.txt"))?;
+    if !docs.is_empty() && !docs.ends_with(b"\n") {
+        return Err(bad_corpus("the last line has no LF"));
+    }
+    let answers = search(&docs, &dict, &queries)?;
+    let mut out =
+        io::BufWriter::with_capacity(1 << 16, std::fs::File::create(out_dir.join("results.txt"))?);
+    answers
+        .iter()
+        .try_for_each(|answer| write_answer(&mut out, answer))?;
+    out.flush()
 }
 
-/// Turns transparent huge pages off for this process, so partly used 2 MB
-/// heap regions are not backed (and counted in our memory peak) as whole huge
-/// pages. It is only a hint, so a failure is ignored.
-fn disable_huge_pages() {
-    const PR_SET_THP_DISABLE: i32 = 41;
-    // SAFETY: PR_SET_THP_DISABLE takes integer arguments and touches no memory of ours.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+fn search(docs: &[u8], dict: &Dict, queries: &Queries) -> io::Result<Vec<Answer>> {
+    let answers: Vec<Mutex<Answer>> = queries.list.iter().map(|_| Mutex::default()).collect();
+    let blocks = docs.len().div_ceil(BLOCK_BYTES);
+    let next = AtomicUsize::new(0);
+    let threads = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS);
+    let worker = || -> io::Result<()> {
+        let mut index = Index::new(dict.len());
+        let mut eval = Evaluator::new();
+        loop {
+            let block = next.fetch_add(1, Ordering::Relaxed);
+            if block >= blocks {
+                return Ok(());
+            }
+            let mut pos = line_start(docs, block * BLOCK_BYTES);
+            let end = line_start(docs, (block + 1) * BLOCK_BYTES);
+            while pos < end {
+                pos = index.build(docs, pos, end, dict)?;
+                for (&query, total) in queries.list.iter().zip(&answers) {
+                    let answer = eval.run(&index, queries.steps(query), query.phrase, docs, dict);
+                    if answer.count > 0 {
+                        total.lock().unwrap().merge(&answer);
+                    }
+                }
+            }
+        }
+    };
+    // The `unwrap`s on `join` and `lock` cannot fire: with `panic = "abort"` a
+    // panicking thread ends the process, so no thread result is a panic and no
+    // mutex is ever poisoned.
+    thread::scope(|s| {
+        let handles: Vec<_> = (0..threads).map(|_| s.spawn(worker)).collect();
+        handles.into_iter().try_for_each(|h| h.join().unwrap())
+    })?;
+    Ok(answers
+        .into_iter()
+        .map(|a| a.into_inner().unwrap())
+        .collect())
 }
 
-/// A run of whole lines of `docs.txt`, starting at document `first`.
-struct Segment {
-    start: u64,
-    end: u64,
-    first: u32,
-    chunks: usize,
+/// The first line start at or after `pos`, so every line belongs to exactly
+/// the block its first byte falls in.
+fn line_start(docs: &[u8], pos: usize) -> usize {
+    if pos == 0 || pos >= docs.len() {
+        return pos.min(docs.len());
+    }
+    docs[pos - 1..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(docs.len(), |i| pos + i)
+}
+
+fn write_answer(out: &mut impl Write, answer: &Answer) -> io::Result<()> {
+    write!(out, "{} {}", answer.count, answer.sum)?;
+    answer
+        .ten()
+        .iter()
+        .try_for_each(|id| write!(out, " {id}"))?;
+    out.write_all(b"\n")
+}
+
+// ---- Queries (spec 2.3): parsed into term ids and operators.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    And,
+    Or,
+    Not,
 }
 
 #[derive(Clone, Copy)]
-enum Task {
-    Scan(usize, usize),
-    Build(usize, usize),
-    Eval(usize, usize),
-    Format(usize),
+pub struct Step {
+    pub op: Op,
+    pub term: u32,
 }
 
-/// Everything the tasks share. Each lock is taken by one writer task or by
-/// readers, never both at once: the done counters order the tasks (a task
-/// only starts once every task it reads from has counted itself done), so
-/// the locks are never contended for long.
-struct Shared<'a> {
-    file: &'a File,
-    segments: Vec<Segment>,
-    tasks: Vec<Task>,
-    next: AtomicUsize,
-    /// Chunk outputs of the even and the odd segments.
-    chunks: [Vec<RwLock<ChunkOut>>; 2],
-    /// Documents in each segment, known once it is scanned.
-    docs: Vec<AtomicU32>,
-    parts: Vec<RwLock<Part>>,
-    bool_answers: Vec<Mutex<Vec<Answer>>>,
-    phrase_answers: Vec<Mutex<Vec<Answer>>>,
-    lines: Vec<Mutex<Vec<u8>>>,
-    scanned: Vec<AtomicU32>,
-    built: Vec<AtomicU32>,
-    evaluated: Vec<AtomicU32>,
+/// One query line: `steps[start..end]` of its `Queries`. A BOOL query is a
+/// list of steps applied left to right to an initially empty set, so its first
+/// step is `OR t1`. A phrase is a list of `AND` steps, which gives the
+/// candidate documents to verify.
+#[derive(Clone, Copy)]
+pub struct Query {
+    pub phrase: bool,
+    pub start: u32,
+    pub end: u32,
 }
 
-fn run(data: &str, out_dir: &str) {
-    let mut queries = std::fs::read(format!("{data}/queries.txt"))
-        .unwrap_or_else(|e| fail(&format!("queries.txt: {e}")));
-    if queries.len() >= MAX_QUERY_BYTES {
-        fail("queries.txt is larger than 16 MB");
+/// All queries in file order, with their steps in one shared array.
+pub struct Queries {
+    pub list: Vec<Query>,
+    pub steps: Vec<Step>,
+}
+
+impl Queries {
+    pub fn steps(&self, query: Query) -> &[Step] {
+        &self.steps[query.start as usize..query.end as usize]
     }
-    queries.extend_from_slice(&[0; 16]); // keys read 12 bytes from a term's start
-    let queries = &queries[..];
-    let text_len = queries.len() - 16;
-    let file =
-        File::open(format!("{data}/docs.txt")).unwrap_or_else(|e| fail(&format!("docs.txt: {e}")));
-    let segments = plan(&file);
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(MAX_THREADS);
-    let ranges: Vec<usize> = (0..=threads)
-        .map(|i| line_start(&queries[..text_len], text_len * i / threads))
-        .collect();
-    let max_chunks = segments.iter().map(|s| s.chunks).max().unwrap_or(0);
-    let shared = Shared {
-        file: &file,
-        tasks: schedule(&segments, threads),
-        next: AtomicUsize::new(0),
-        chunks: [0, 1].map(|_| (0..max_chunks).map(|_| RwLock::default()).collect()),
-        docs: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        parts: (0..PARTS).map(|_| RwLock::default()).collect(),
-        bool_answers: (0..threads).map(|_| Mutex::default()).collect(),
-        phrase_answers: (0..threads).map(|_| Mutex::default()).collect(),
-        lines: (0..threads).map(|_| Mutex::default()).collect(),
-        scanned: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        built: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        evaluated: segments.iter().map(|_| AtomicU32::new(0)).collect(),
-        segments,
+}
+
+/// Parses every line, then numbers the terms.
+///
+/// The term table is filled in a second pass: about 150,000 inserts into a
+/// fresh table would each wait on a cache miss, so each one first prefetches
+/// the slot of the word 16 places ahead.
+pub fn parse(text: &[u8]) -> io::Result<(Queries, Dict)> {
+    let mut queries = Queries {
+        list: Vec::new(),
+        steps: Vec::new(),
     };
-    let words = AtomicUsize::new(0);
-    let table = OnceLock::new();
-    let parsed: Vec<OnceLock<Parsed>> = (0..threads).map(|_| OnceLock::new()).collect();
-    let barrier = Barrier::new(threads);
-    std::thread::scope(|s| {
-        for i in 0..threads {
-            let (shared, words, table, parsed, barrier, ranges) =
-                (&shared, &words, &table, &parsed, &barrier, &ranges);
-            s.spawn(move || {
-                // Parse in parallel, size the table, insert in parallel, then anchor.
-                let mut mine = Parsed::parse(queries, ranges[i], ranges[i + 1]);
-                words.fetch_add(mine.word_count(), Relaxed);
-                if barrier.wait().is_leader() {
-                    let _ = table.set(Table::new(words.load(Relaxed), threads));
-                }
-                barrier.wait();
-                let table = table.get().unwrap();
-                mine.insert(table, queries);
-                barrier.wait();
-                mine.choose_anchors(table, i);
-                *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
-                *shared.phrase_answers[i].lock().unwrap() =
-                    vec![Answer::default(); mine.term_ends.len()];
-                let _ = parsed[i].set(mine);
-                barrier.wait();
-                let parsed: Vec<&Parsed> = parsed.iter().map(|p| p.get().unwrap()).collect();
-                work(shared, table, queries, &parsed);
-            });
+    let mut words = Vec::new();
+    for line in text.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        let start = queries.steps.len() as u32;
+        let phrase =
+            parse_line(line, &mut queries.steps, &mut words).ok_or_else(|| bad_query(line))?;
+        let end = queries.steps.len() as u32;
+        queries.list.push(Query { phrase, start, end });
+    }
+    let mut dict = Dict::with_capacity(words.len() / 2);
+    for (i, step) in queries.steps.iter_mut().enumerate() {
+        if let Some(ahead) = words.get(i + 16) {
+            dict.prefetch_term(ahead);
         }
-    });
-    let out = format!("{out_dir}/results.txt");
-    let mut file = File::create(&out).unwrap_or_else(|e| fail(&format!("{out}: {e}")));
-    for lines in &shared.lines {
-        file.write_all(&lines.lock().unwrap())
-            .unwrap_or_else(|e| fail(&format!("{out}: {e}")));
+        step.term = dict.insert(words[i]);
     }
+    Ok((queries, dict))
 }
 
-/// Cuts `docs.txt` into segments at line starts.
-fn plan(file: &File) -> Vec<Segment> {
-    let len = file
-        .metadata()
-        .unwrap_or_else(|e| fail(&format!("docs.txt: {e}")))
-        .len();
-    let mut last = [0u8; 1];
-    if len > 0 && (read_full(file, &mut last, len - 1) != 1 || last[0] != b'\n') {
-        fail("docs.txt must end with an LF");
-    }
-    if len >= 1 << 32 {
-        fail("docs.txt is larger than 4 GB");
-    }
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut start = 0;
-    while start < len {
-        let (end, first) = (
-            next_line(file, len, start + SEGMENT_BYTES),
-            id_at(file, start),
-        );
-        let chunks = (end - start).div_ceil(CHUNK_BYTES) as usize;
-        segments.push(Segment {
-            start,
-            end,
-            first,
-            chunks,
-        });
-        start = end;
-    }
-    segments
-}
-
-/// The first line start at or after `at` (or the end of the file).
-fn next_line(file: &File, len: u64, at: u64) -> u64 {
-    let mut buf = [0u8; 4096];
-    let mut pos = at - 1;
-    while pos < len {
-        let n = read_full(file, &mut buf, pos);
-        if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
-            return pos + i as u64 + 1;
-        }
-        pos += n as u64;
-    }
-    len
-}
-
-/// The id of the line starting at `at`.
-fn id_at(file: &File, at: u64) -> u32 {
-    let mut buf = [0u8; 16];
-    let n = read_full(file, &mut buf, at);
-    let digits = buf[..n].iter().position(|&b| b == b'\t').unwrap_or(0);
-    std::str::from_utf8(&buf[..digits])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| fail("a line of docs.txt does not start with a document id"))
-}
-
-/// The first line start of `text` at or after `at`.
-fn line_start(text: &[u8], at: usize) -> usize {
-    match at {
-        0 => 0,
-        _ => text[at - 1..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(text.len(), |i| at + i),
-    }
-}
-
-/// The task queue: see the module comment.
-fn schedule(segments: &[Segment], ranges: usize) -> Vec<Task> {
-    let mut tasks = Vec::new();
-    let finish = |tasks: &mut Vec<Task>, s: usize| {
-        tasks.extend((0..=PARTS).map(|p| Task::Build(s, p)));
-        tasks.extend((0..ranges).map(|r| Task::Eval(s, r)));
+/// Appends the steps of one line, and their words to `words`; returns whether
+/// it is a phrase. Term ids are filled in later.
+fn parse_line<'a>(
+    line: &'a [u8],
+    steps: &mut Vec<Step>,
+    words: &mut Vec<&'a [u8]>,
+) -> Option<bool> {
+    let mut push = |op, word: &'a [u8]| {
+        let valid = (1..=32).contains(&word.len())
+            && word
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        steps.push(Step { op, term: 0 });
+        words.push(word);
+        valid.then_some(())
     };
-    for (s, segment) in segments.iter().enumerate() {
-        tasks.extend((0..segment.chunks).map(|c| Task::Scan(s, c)));
-        if s > 0 {
-            finish(&mut tasks, s - 1);
+    if let Some(rest) = line.strip_prefix(b"BOOL ") {
+        let mut words = rest.split(|&b| b == b' ');
+        let mut op = Op::Or;
+        loop {
+            push(op, words.next()?)?;
+            op = match words.next() {
+                None => return Some(false),
+                Some(b"AND") => Op::And,
+                Some(b"OR") => Op::Or,
+                Some(b"NOT") => Op::Not,
+                Some(_) => return None,
+            };
         }
     }
-    if !segments.is_empty() {
-        finish(&mut tasks, segments.len() - 1);
+    let inner = line.strip_prefix(b"PHRASE \"")?.strip_suffix(b"\"")?;
+    for (i, word) in inner.split(|&b| b == b' ').enumerate() {
+        push(if i == 0 { Op::Or } else { Op::And }, word)?;
     }
-    tasks.extend((0..ranges).map(Task::Format));
-    tasks
+    Some(true)
 }
 
-/// Waits until `count` reaches `n`; the Acquire pairs with the Release of
-/// the tasks that counted themselves done, so their writes are visible.
-fn wait(count: &AtomicU32, n: usize) {
-    while (count.load(Acquire) as usize) < n {
-        std::thread::yield_now();
-    }
-}
-
-/// One worker: takes tasks from the queue in order until it is empty. Each
-/// task's locks are released before it counts itself done.
-fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
-    let mut scanner = Scanner::new(table, queries, parsed);
-    let mut eval = Evaluator::default();
-    let mut cursor = Vec::new();
-    let terms = table.ids().div_ceil(PARTS);
-    loop {
-        let Some(&task) = sh.tasks.get(sh.next.fetch_add(1, Relaxed)) else {
-            return;
-        };
-        let done = match task {
-            Task::Scan(s, c) => {
-                if s >= 2 {
-                    wait(&sh.built[s - 2], PARTS + 1); // the build of s - 2 read this buffer
-                }
-                let seg = &sh.segments[s];
-                let at = |c: usize| (seg.start + c as u64 * CHUNK_BYTES).min(seg.end);
-                scanner.scan(
-                    sh.file,
-                    at(c),
-                    at(c + 1),
-                    seg.first,
-                    &mut sh.chunks[s % 2][c].write().unwrap(),
-                );
-                &sh.scanned[s]
-            }
-            Task::Build(s, p) => {
-                wait(&sh.scanned[s], sh.segments[s].chunks);
-                if s >= 1 {
-                    wait(&sh.evaluated[s - 1], parsed.len()); // the eval of s - 1 read `parts`
-                }
-                build(sh, s, p, terms, &mut cursor);
-                &sh.built[s]
-            }
-            Task::Eval(s, r) => {
-                wait(&sh.built[s], PARTS + 1);
-                let guards: Vec<_> = sh.parts.iter().map(|p| p.read().unwrap()).collect();
-                let parts: Vec<&Part> = guards.iter().map(|p| &**p).collect();
-                let (docs, base) = (sh.docs[s].load(Relaxed) as usize, sh.segments[s].first);
-                for (q, answer) in sh.bool_answers[r].lock().unwrap().iter_mut().enumerate() {
-                    eval.run(&parts, parsed[r].bool_steps(q), docs, base, answer);
-                }
-                &sh.evaluated[s]
-            }
-            Task::Format(r) => {
-                if let Some(last) = sh.evaluated.last() {
-                    wait(last, parsed.len());
-                }
-                let (bools, phrases) = (
-                    sh.bool_answers[r].lock().unwrap(),
-                    sh.phrase_answers[r].lock().unwrap(),
-                );
-                let out = &mut sh.lines[r].lock().unwrap();
-                for &entry in &parsed[r].order {
-                    match entry & PHRASE {
-                        0 => bools[entry as usize].write(out),
-                        _ => phrases[(entry & !PHRASE) as usize].write(out),
-                    }
-                }
-                continue;
-            }
-        };
-        done.fetch_add(1, Release);
-    }
-}
-
-/// Build task `p` of segment `s`: partition `p`'s postings, or (`p == PARTS`)
-/// the segment's phrase matches folded into the phrase answers, in document order.
-fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
-    let chunks: Vec<_> = sh.chunks[s % 2][..sh.segments[s].chunks]
-        .iter()
-        .map(|c| c.read().unwrap())
-        .collect();
-    let docs = check_ids(&sh.segments, s, &chunks);
-    sh.docs[s].store(docs, Relaxed);
-    if p < PARTS {
-        let streams = chunks.iter().map(|c| c.streams[p].as_slice());
-        sh.parts[p]
-            .write()
-            .unwrap()
-            .build(streams, terms, docs as usize, cursor);
-        return;
-    }
-    let mut answers: Vec<_> = sh
-        .phrase_answers
-        .iter()
-        .map(|a| a.lock().unwrap())
-        .collect();
-    for &(phrase, doc) in chunks.iter().flat_map(|c| &c.matches) {
-        answers[(phrase >> RANGE_SHIFT) as usize][(phrase & ((1 << RANGE_SHIFT) - 1)) as usize]
-            .push(doc);
-    }
-}
-
-/// Checks that the chunks of segment `s` hold consecutive document ids that
-/// end where the next segment starts, and returns the segment's document count.
-fn check_ids(
-    segments: &[Segment],
-    s: usize,
-    chunks: &[impl std::ops::Deref<Target = ChunkOut>],
-) -> u32 {
-    let mut next = segments[s].first;
-    for c in chunks.iter().filter(|c| c.lines > 0) {
-        if c.first != next {
-            fail("document ids must be 0, 1, 2, ... in order");
-        }
-        next += c.lines;
-    }
-    if segments.get(s + 1).is_some_and(|n| n.first != next) || (s == 0 && segments[0].first != 0) {
-        fail("document ids must be 0, 1, 2, ... in order");
-    }
-    next - segments[s].first
+fn bad_query(line: &[u8]) -> io::Error {
+    let msg = format!("malformed query: {}", String::from_utf8_lossy(line));
+    io::Error::new(io::ErrorKind::InvalidData, msg)
 }
