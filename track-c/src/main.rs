@@ -36,6 +36,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
+    // PROBE p0: exec + exit floor. An empty output, then main's own return.
+    if std::hint::black_box(true) { // PROBE
+        _ = fs::write(format!("{out}/aggregates.txt"), ""); // PROBE
+        return; // PROBE
+    } // PROBE
     let path = format!("{data}/records.csv");
     let file = or_die(fs::File::open(&path), &path);
     let len = or_die(file.metadata(), &path).len() as usize;
