@@ -60,7 +60,7 @@ Live board: seed 1, one run. Final scoring: private holdout seed, five runs.
 - Rust, standard library only; libc calls declared by hand
 - Parallel over all 12 cores of the scoring box (cores 0-11)
 - Do less work: remove repeated passes, not just tune loops
-- Short code: S counts, so every line must earn its place
+- Short code: S counts, so every line must earn its place (the one exception: error handling that makes unseen input fail loudly)
 - Exact on any valid input: speculation is always checked, never trusted
 - Every speed decision is settled by a board run; figures marked "local" are laptop numbers that only chose candidates
 
@@ -208,8 +208,8 @@ Speed that is wrong scores zero, and the final data is a seed we have never seen
 - No data from seed 1 in the code: everything is computed from the input
 - Full-size unseen seeds, tiny and sample seeds, adversarial spec-valid inputs
 - Every fallback forced on purpose and checked for the right bytes
-- Holdout-safety audit of every fixed limit; two Track B limits made provably safe
-- Concurrency audit: 8,895 runs with injected delays, 0 wrong
+- Holdout-safety audit of every fixed limit; one Track B limit made provably safe
+- Concurrency audit of A, B and D: every shared protocol argued correct, then 5,200 real runs + 3,000 with injected delays, 0 wrong
 
 | Track | Fallback we forced |
 |---|---|
