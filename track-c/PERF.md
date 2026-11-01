@@ -2,9 +2,11 @@
 
 ## Summary
 
-Final: **v4.2 as submitted** (commit 5f8b6df, row 36). Board 48.9 ms, 12.6 MB, K 25.15, 70.03 points (run-31b13fc9019b) and 50.5 ms, 12.3 MB, K 24.85, 69.77 points (run-8721232bf1f2): median 49.7 ms. S 767. The reference is 14.44 s and 367 MB. v4.2 is v4.1 (row 35: the race fix, 49.1 ms, S 734) plus error paths only. S rose by 33 lines so that input the generator never writes fails loudly: the byte offset of the first grammar error, the byte offset of a bad regions.csv line, a note on stderr for each fallback, and a cap on the table retries.
+Final: **v5** (commit 6d23622, row 38), a clean-room rework. Board 37.4 ms, 16.9 MB, K 26.81, 71.42 points (run-41dfe519e529); S 827, D 1. The reference is 14.44 s and 367 MB. Why it won: on the box the distinct-name path cost about 21 ms of v4.2's 48.5, mostly an atomic OR per record on a shared bitset line that another core held. v5 interns names in a read-mostly table and appends private (id, group) pairs, which are counted after one barrier in an L1-resident bitset. It costs 4.6 MB more memory for the pair arenas, which is worth it: K is 5.6% higher than v4.2's 25.38. See "v5: two-phase distinct names" below.
 
-Final repository state (commit eba990a; code fbf7e89 = 5f8b6df plus the removal of a partial output on a failed write, S 768): run-d79219fb688a, 48.5 ms, 12.3 MB, K 25.38. Runs of this error-path code: 48.9, 50.5 and 48.5 ms, median 48.9 ms.
+Previous final: **v4.2 as submitted** (commit 5f8b6df, row 36). Board 48.9 ms, 12.6 MB, K 25.15, 70.03 points (run-31b13fc9019b) and 50.5 ms, 12.3 MB, K 24.85, 69.77 points (run-8721232bf1f2): median 49.7 ms. S 767. v4.2 is v4.1 (row 35: the race fix, 49.1 ms, S 734) plus error paths only. S rose by 33 lines so that input the generator never writes fails loudly: the byte offset of the first grammar error, the byte offset of a bad regions.csv line, a note on stderr for each fallback, and a cap on the table retries.
+
+v4.2's repository state (commit eba990a; code fbf7e89 = 5f8b6df plus the removal of a partial output on a failed write, S 768): run-d79219fb688a, 48.5 ms, 12.3 MB, K 25.38. Runs of this error-path code: 48.9, 50.5 and 48.5 ms, median 48.9 ms.
 
 **A race in v4, found by a stress test and fixed in one line.** v4 as first submitted (row 33, run-1e5d2353fd9f) printed a wrong output in about 1 run of 100: one group's distinct-name count off by one. A 300-run stress test of the submitted image found it; final scoring needs all five runs correct, so it was about a 5% chance of a zero. `Names::fill` wrote all four words of the name's key into its table slot, and the fourth word, the hash, landed on the slot's `meta` for a moment before the Release store of its real value; a lookup on another core could take that value for a published slot of another length, probe on, and insert the same name a second time. The fix writes only the three name words (row 35). The board never showed it: each board run is a single run.
 
@@ -17,8 +19,9 @@ Decisive steps, all board runs:
 5. pread instead of mmap: 49.3 ms (run-2890a0259c6b); 64 KiB pieces and a 128-byte pad bring M back: v4, 49.2 to 49.3 ms, 12.4 to 12.5 MB.
 6. v4.1, the race fix: 49.1 and 49.4 ms, 12.1 and 12.3 MB. A simplification pass shipped with the fix first ran 58.9 ms (row 34) and was reverted.
 7. v4.2, error paths: 48.9 and 50.5 ms, 12.6 and 12.3 MB, the same speed.
+8. v5, a clean-room rework with two-phase distinct names: 37.4 ms, 16.9 MB, K 26.81 (run-41dfe519e529).
 
-Of the board's 12.1 to 12.6 MB, about 9.7 MB is the program's own tables and buffers: a 4.2 MB name table, a 3.7 MB pair bitset, a 1.0 MB region map and 0.8 MB of read buffers. The rest is code, stacks, page tables and the container runtime's own processes, which are charged to the same cgroup before `main` runs.
+For v4.x, of the board's 12.1 to 12.6 MB, about 9.7 MB is the program's own tables and buffers: a 4.2 MB name table, a 3.7 MB pair bitset, a 1.0 MB region map and 0.8 MB of read buffers. The rest is code, stacks, page tables and the container runtime's own processes, which are charged to the same cgroup before `main` runs.
 
 Lessons: local A/B on memory-bound changes did not transfer to the box, only measurements on the box did; and one board run per build cannot show a 1% failure, a few hundred local runs can.
 
@@ -28,7 +31,7 @@ K is the board's efficiency coefficient, K = (T_ref/T)^0.50 × min(M_ref/M, 50)^
 
 Rows with a Run ID are board measurements. All other T and M are **local** (i7-14650HX, Docker Desktop, `--cpuset-cpus=0-11`, the bench script that mirrors the harness); the board box was about 1.6x slower than this machine when quiet. Units: board M is bytes / 10^6 (MB). Local M is the bench's cgroup peak in KiB divided by 1,000, so a local "MB" is 1.024 MB; local figures are only compared with each other. Power-of-two sizes are in KiB and MiB. The local machine was shared with other heavy benchmark jobs during this work, so single runs varied by up to 2x. Small changes were therefore compared by interleaving runs of the two builds (A/B) and taking medians of wall time and of total CPU time (`perf stat` task-clock), which is far less sensitive to the other jobs. Hardware counters are not available in this VM. "CPU 1t" means one worker on one core.
 
-Labels: v1 to v4.2 are the builds submitted as the track's entry; c1 to c11 are probe and candidate builds, numbered as they were made. c1 to c6 are the probes in the table below, c8 is row 31's PREFETCHW build, c9 its group-bits-in-the-slot build, c10 is row 32's first pread build (128 KiB buffers), and c11 is row 33's version of it, which became v4. c-next and c-next2 are row 30's local experiments.
+Labels: v1 to v5 are the builds submitted as the track's entry; c1 to c11 are probe and candidate builds, numbered as they were made. c1 to c6 are the probes in the table below, c8 is row 31's PREFETCHW build, c9 its group-bits-in-the-slot build, c10 is row 32's first pread build (128 KiB buffers), and c11 is row 33's version of it, which became v4. c-next and c-next2 are row 30's local experiments.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
@@ -70,6 +73,7 @@ Labels: v1 to v4.2 are the builds submitted as the track's entry; c1 to c11 are 
 | 35 | **v4.1, before the error paths:** v4 plus the one-line race fix. 49.4 ms, 12.3 MB, K 25.29, then 49.1 ms, 12.1 MB, S 734, K 25.47. | run-0f99c23b4b3e, run-0fc0507654be | 0.0494, 0.0491 | 12.3, 12.1 | 70.15, 70.30 |
 | 36 | **v4.2 as submitted (5f8b6df):** v4.1 plus error paths only: stderr notes for both fallbacks, the byte offset of the first grammar error, regions.csv errors naming their line's byte offset, a cap on the table retries, one message when several workers fail at once. S 734 to 767. Median 49.7 ms. | run-31b13fc9019b, run-8721232bf1f2 | 0.0489, 0.0505 | 12.6, 12.3 | 70.03, 69.77 |
 | 37 | After 5f8b6df, not yet on the board: a failed write of aggregates.txt removes the partial file before exiting. S 768. | | | | |
+| 38 | **v5 (6d23622):** clean-room rework with two-phase distinct names: names interned in a read-mostly table, private (id, group) pairs counted after one barrier; two-array name table; separators-only text lengths; window parsing in two passes; start-up tasks. Correct on seeds 1, 7, 101 and 202, 50 fuzz cases, 0 wrong in 300 + 100 stress runs. S 827, D 1. See the section below. | run-41dfe519e529 | 0.0374 | 16.9 | 71.42 |
 
 Notes on the longer rows:
 
@@ -103,4 +107,83 @@ Lessons:
 - Most of what remains is memory latency, not instructions: three random lines per record (region map, name slot, group bits) and an atomic OR. Prefetching already hides what it can; only a sparser table measurably helped, at a memory cost.
 - The box differs from the laptop in what is expensive, not just in speed: with turbo off, its page faults, page-table set-up and tear-down for a 200 MB mapping cost more than copying the same bytes with pread, a difference invisible locally. Probes that strip work out of a correct build, timed on the box itself, found that; local A/B could not.
 - Of the board's 12.1 to 12.6 MB, about 9.7 MB is the program's own tables and buffers: a 4.2 MB name table, a 3.7 MB pair bitset, a 1.0 MB region map and 0.8 MB of read buffers. The rest is code, stacks, page tables and the container runtime's own processes, which are charged to the same cgroup before `main` runs. The pair bitset is near the floor for exact distinct counting, so M moved little.
-- The atomic OR on the shared pair bitset looked like the main remaining parallel cost in the profile, but swapping in a racy plain load and store (for timing only) saved just 7% of CPU (A/B 267 vs 248 ms), and dropping the update entirely 249 ms. Owner-private bitsets fed by queues could win at most that, so the shared atomic version stays: it never makes one worker wait for another.
+- The atomic OR on the shared pair bitset looked like the main remaining parallel cost in the profile, but swapping in a racy plain load and store (for timing only) saved just 7% of CPU (A/B 267 vs 248 ms), and dropping the update entirely 249 ms. Owner-private bitsets fed by queues could win at most that, so the shared atomic version stays: it never makes one worker wait for another. (This held for v4.x; v5 removes the shared writes altogether, see below.)
+
+## v5: two-phase distinct names
+
+A clean-room rewrite (commit 6d23622, row 38) aimed at the costs the box's probes measured, not at the laptop's. Same language, thread count, usage and output as v4.2; only the design below changed.
+
+### Why
+
+The probes (above) split v4.2's 48.5 ms on the box into: scan 12.7 ms (with process start), separator flattening 5.2, field parsing and aggregates 12.3, region map 1.1, **distinct names 21.1**. v4 counted distinct (name, country) pairs in one shared bitset with an atomic OR per record. Each name's bits are OR'ed about 33 times in a run, by random cores, so nearly every OR hit a line that another core held modified: a cross-core transfer plus a locked instruction that cannot overlap with anything. At 2.5 GHz with turbo off, 3.32 M of those are about what the 21 ms is. The box had also been shown to punish page faults and random access into multi-MB tables.
+
+### Design
+
+**Distinct names in two phases** (`names.rs`), so that the hot path never writes a line another core reads.
+
+- Phase 1, while parsing: every name is interned in one shared lock-free table, and the slot index is the name's id. The table is read-mostly after the first few percent of the file. The record then appends its (id, group) pair, 16 bits, to a bucket in its own worker's arena: bucket `id >> 8`, entry `group << 8 | id & 255`. These are private stores to a few hot lines. Arenas are chains of 256-byte blocks, lazily backed, and the expected share is faulted in at start-up with one `MADV_POPULATE_WRITE`.
+- Phase 2, after one barrier: workers claim buckets. A bucket's pairs from all 12 arenas are counted against an 8 KiB bitset (256 ids x 256 groups) that stays in L1. A new bit is a new distinct pair, and every entry also adds its record and its name's unescaped length to the group. Phase 2 takes about 0.5 ms locally.
+- Unlike row 28's owner-partitioned build, no pair is sent to another worker while parsing: the arenas are private and are read only after the barrier, so no worker waits for another during phase 1.
+
+**Name table.** Two arrays.
+
+- Short names (at most 15 raw bytes, 87% of records) use 16-byte slots, four to a 64-byte line: the first name word plus `meta`, where `meta` is the tag (length + 1) with bytes 8 to 14 above it. A short name's home is a whole line, and the fast path compares all four slots without a branch per slot. It hits for 88.6% of short lookups at full scale. Overflow goes to lines `step` (odd) apart, not to the next line, which avoids runs of full lines.
+- Longer names use 32-byte slots of three words plus `meta`, probed linearly; bytes past 24 go to an arena.
+- Counters showed that linear probing over 32-byte slots, as in v4, left 36% of lookups off their home slot and 28% in another line. That, in branches, was the main cost of the lookups, not memory.
+- Insertion uses the protocol v4.1 proved (row 35): claim `meta` 0 to FILLING by CAS, write the name words, publish `meta` with one Release store; nothing else writes `meta`.
+- Workers reserve slot capacity 64 at a time. Insert-heavy profiles had shown the shared "used" counter at 4.5% of multi-threaded samples.
+- The table is 3 MB, down from 4.2.
+
+**Parsing** (`parse.rs`) keeps the approach and the proof of the chunk cuts (AVX2 masks with a prefix-XOR in-quotes mask, separators flattened 8 at a time, cuts guessed after an LF followed by a digit or BOM and proven by quote parity, single-chunk fallback). What changed:
+
+- A record's text bytes come from its separators and one quote count at its LF: name + note = width - quotes/2 - delimiters. Name bytes come from phase 2, using the unescaped length computed once per distinct name; note bytes are the difference. Quote counts are no longer kept per separator.
+- Amounts with up to 5 integer digits convert in one SWAR step, with the dot shifted out.
+- Records are handled in windows of 2 KiB. Pass 1 parses fields and prefetches the region-map byte and the name-table line; pass 2 joins, aggregates, interns and appends.
+- Every record must be 4 commas + LF outside quotes with valid digits, and the LFs outside quotes must equal the number of records. A quote misplaced inside an unquoted field is not diagnosed.
+- Numbers of more than 8 digits saturate, so a huge region id is simply unknown, as the reference treats it. v4.2 rejected that case.
+
+**Start-up** (`run.rs`). The first threads up claim small tasks: six 512 KiB stretches of the name table to populate, and 32 pieces of regions.csv. Workers wait only for those tasks, not for the last thread to start; late threads just join phase 1. `prctl(PR_SET_THP_DISABLE)` runs first. records.csv is still read with pread in 64 KiB pieces, which the box measured faster than mmap (rows 32 and 33).
+
+### Measurements
+
+Local i7-14650HX, Docker, cpuset 0-11; the machine is noisy, so runs were interleaved.
+
+| | v4.2 | v5 | change |
+|---|---|---|---|
+| task-clock, 12 threads, median of 15 interleaved | 358 ms | 245 ms | -32% |
+| user / sys time, same runs | 249 / 40 ms | 169 / 30 ms | |
+| page faults | 2,623 | 1,194 | |
+| task-clock, 1 thread (taskset), median of 5 | 196 ms | 144 ms | -27% |
+| instructions, 1 thread, full seed 1 (cachegrind) | 2.741 G | 2.106 G | -23% (634 per record) |
+| bench.sh wall, 2 x 5 interleaved, median | about 40 ms | about 30 ms | machine busy; quiet earlier: 28 vs 21 |
+| bench.sh M (local KiB / 1000, includes the shell) | 13.1 to 16.6 | 17.1 to 17.8 | about +3.5 to 4 MB |
+| S | 768 | 827 | |
+| D | 1 | 1 | |
+
+Ablations, 1 thread, an earlier build: no name lookups at all -27 ms; name lookup and pair append both removed -41 ms (of 137); table prefetch off +6 ms; region prefetch off +9 ms.
+
+Phase timeline, 12 threads: records begin at about 1.5 to 1.8 ms (locally, threads take up to 1 to 3 ms to get scheduled); phase 1 takes about 15 ms with an end-of-phase imbalance of about 50 us; phase 2 about 0.5 ms.
+
+**On the board** (run-41dfe519e529): 37.4 ms, 16.9 MB, K 26.81, 71.42 points, S 827, D 1, against v4.2's 48.5 to 50.5 ms, 12.3 to 12.6 MB, K 25.15 to 25.38. The pre-board estimate in the design notes was 32 to 38 ms at about 16 MB, from removing about 23% of instructions and all the shared atomic ORs; the box landed at the slow end of it. The notes' K estimate was +11% over v4.2, and the board gave +5.6% over 25.38.
+
+**The memory trade.** The pair arenas cost 2 bytes per record (about 6.6 MB), against v4.2's 3.7 MB shared bitset, and the name table shrank from 4.2 to 3 MB. On the board M rose by 4.6 MB (12.3 to 16.9). It is worth it: the time term of K gained far more than the memory term lost, K +5.6%.
+
+### Correctness
+
+- Byte-identical to the reference on seeds 1, 7, 101 and 202, on a case with a digit after an in-quote LF (which forces the single-chunk fallback), and on 50 fuzz cases. The fuzz cases include 7 out-of-range ones that v4.2 failed: huge amounts, leading zeros, huge region ids. They are outside spec section 2.2, so the generator never writes them.
+- Malformed inputs (7 cases) are rejected with exit 1 and a byte offset.
+- Stress: 0 wrong in 300 runs of seed 1 and in 100 runs of seed 7.
+
+### What did not work, and what was left
+
+The design notes record no failed v5 experiment of their own; the failed tries in this direction are the earlier ones in the log, and they shaped v5:
+
+- Row 28: sending each (name, group) pair to a worker that owned its name, with queues: 52.2 ms on the box at S 889. v5 does not route anything during parsing.
+- Row 26: PREFETCHW, a software-pipelined slot prefetch, the group bits inside the name's slot and probes starting at the line's first slot all made no measurable difference; only a sparser table helped, at a memory cost. v5's gain came from removing the shared writes and the off-line probes.
+- Lessons (above): swapping a plain store for the atomic OR saved only 7% of CPU locally. The local result did not predict the box, where the names cost 21 ms, mostly the shared-line atomics.
+
+Not done:
+
+- Instructions are about 634 per record and spread thin: pass 1 about 260, block scan about 68, flatten + pass 2 about 160, slow lookups about 50, phase 2 about 20. Bounds checks are about 20 per record. PCLMULQDQ for the prefix XOR would save about 8 per block but needs a target feature beyond x86-64-v3 (row 22 saw no gain from it).
+- Memory: 256-byte pair blocks leave about 1 MB of partly filled blocks; 128-byte blocks would halve that at the cost of longer chains in phase 2. The region map could be a rank bitmap (about 0.4 MB instead of 1 MB).
+- S could drop further: rustfmt explodes every struct literal over 18 characters.
