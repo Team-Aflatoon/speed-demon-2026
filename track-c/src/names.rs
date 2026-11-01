@@ -40,37 +40,24 @@ const STRETCH: usize = 1 << 16;
 pub const BUCKET: usize = 256;
 
 /// A name as its table key: its first 24 raw bytes as three zero-padded
-/// words (all of it, for nearly every name), its tag (length + 1) and its
-/// hash. The raw bytes keep `""` escapes doubled; escaping is one-to-one, so equal raw bytes mean
+/// words (all of it, for nearly every name), its tag (length + 1) and the
+/// slot its lookup starts at (see `Table::key`). The raw bytes keep `""`
+/// escapes doubled; escaping is one-to-one, so equal raw bytes mean
 /// equal values, and both empty forms have length 0.
 #[derive(Clone, Copy, Default)]
 pub struct Key {
     w: [u64; 3],
     tag: u32,
-    hash: u32,
+    home: u32,
 }
 
-/// The key of the `len` raw name bytes at `b[start..]`. Reads at most 24
-/// bytes past `start` beyond the name (the buffer's padding covers that).
-#[inline(always)]
-pub fn key(b: &[u8], start: usize, len: usize) -> Key {
-    let w = [0, 1, 2].map(|k| word(b, start, len, k));
-    // SAFETY (both intrinsics): BMI2 and SSE4.2 are part of x86-64-v3, which
-    // the whole crate is compiled for (.cargo/config.toml; main.rs refuses
-    // any other build).
-    let crc = |h, w| unsafe { _mm_crc32_u64(h, w) };
-    let mut h = crc(crc(crc(len as u64, w[0]), w[1]), w[2]);
-    if len > INLINE {
-        h = (3..len.div_ceil(8)).fold(h, |h, k| crc(h, word(b, start, len, k)));
-    }
-    let (tag, hash) = (len as u32 + 1, h as u32);
-    Key { w, tag, hash }
-}
-
-/// Word `k` of the name, zero-padded past its end.
+/// Word `k` of the name at `b[start..]`, zero-padded past its end; `k` is
+/// below 3 or within the name, so the load is in the buffer (see `load`).
 fn word(b: &[u8], start: usize, len: usize, k: usize) -> u64 {
     let bits = (8 * len.saturating_sub(8 * k)).min(64) as u32;
-    // SAFETY: see `key`.
+    // SAFETY: BMI2 is part of x86-64-v3, which the whole crate is compiled
+    // for (.cargo/config.toml; main.rs refuses any other build); the load
+    // as above.
     unsafe { _bzhi_u64(load(b, start + 8 * k), bits) }
 }
 
@@ -149,17 +136,36 @@ impl Table {
         [self.short, self.long][W / 4]
     }
 
-    /// The slot a lookup of `k` in the `W`-word slots starts at: the start
-    /// of its home line for a short name, its home slot for a long one.
-    fn home<const W: usize>(&self, k: &Key) -> usize {
-        k.hash as usize & (self.slots::<W>().len() / W - 1) & if W == 2 { !3 } else { !0 }
+    /// The key of the `len` raw name bytes at `b[start..]`. Reads at most 24
+    /// bytes past `start` beyond the name (the buffer's padding covers that).
+    /// Its lookup starts at the start of its home line for a short name, at
+    /// its home slot for a long one.
+    #[inline(always)]
+    pub fn key(&self, b: &[u8], start: usize, len: usize) -> Key {
+        // `bzhi` keeps the low `bits` bits, and the whole word from 64 on.
+        let bits = (8 * len).min(255) as u32;
+        // SAFETY (both intrinsics, and the loads): BMI2 and SSE4.2 are part
+        // of x86-64-v3, which the whole crate is compiled for (see `word`);
+        // the loads end at most 24 bytes past the name (see `load`).
+        let w = [0, 1, 2].map(|k| unsafe { _bzhi_u64(load(b, start + 8 * k), bits.saturating_sub(64 * k as u32)) });
+        let crc = |h, w| unsafe { _mm_crc32_u64(h, w) };
+        let mut h = crc(crc(crc(len as u64, w[0]), w[1]), w[2]) as usize;
+        if len > INLINE {
+            h = (3..len.div_ceil(8)).fold(h as u64, |h, k| crc(h, word(b, start, len, k))) as usize;
+        }
+        let home = match len <= SHORT {
+            true => h & (self.short.len() / 2 - 1) & !3,
+            false => h & (self.long.len() / 4 - 1),
+        };
+        let (tag, home) = (len as u32 + 1, home as u32);
+        Key { w, tag, home }
     }
 
     /// Starts loading the cache line a lookup of `k` reads first.
     pub fn prefetch(&self, k: &Key) {
         match k.tag as usize - 1 <= SHORT {
-            true => crate::prefetch(&self.short[2 * self.home::<2>(k)]),
-            false => crate::prefetch(&self.long[4 * self.home::<4>(k)]),
+            true => crate::prefetch(&self.short[2 * k.home as usize]),
+            false => crate::prefetch(&self.long[4 * k.home as usize]),
         }
     }
 
@@ -173,7 +179,7 @@ impl Table {
         // The four slots of the home line at once. A slot only matches once
         // published, and the Acquire load of its `meta` makes the word
         // written before it (in `fill`) visible.
-        let ([w, meta], first) = (want::<2>(k), self.home::<2>(k));
+        let ([w, meta], first) = (want::<2>(k), k.home as usize);
         let l = &self.short[2 * first..2 * first + 8];
         let same = |j: usize| (l[2 * j + 1].load(Acquire) == meta) & (l[2 * j].load(Relaxed) == w);
         let hit = (0..4).rev().fold(4, |hit, j| if same(j) { j } else { hit });
@@ -192,8 +198,8 @@ impl Table {
     /// low 32 bits, the tag.
     fn probe<const W: usize>(&self, k: &Key, b: &[u8], budget: &mut Budget) -> Res<usize> {
         let (words, want, len) = (self.slots::<W>(), want::<W>(k), k.tag as usize - 1);
-        let (mask, step) = (words.len() / W - 1, (k.hash >> 16 | 1) as usize);
-        let mut i = self.home::<W>(k);
+        let mix = (k.w[0] ^ k.w[1] ^ k.w[2]).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let (mask, step, mut i) = (words.len() / W - 1, (mix >> 40 | 1) as usize, k.home as usize);
         loop {
             let slot = &words[W * i..W * i + W];
             let mut meta = slot[W - 1].load(Acquire);
@@ -305,8 +311,9 @@ fn quote_bytes(w: u64) -> u32 {
 }
 
 /// u16s per pair block: a 32-bit link to the bucket's previous block, then
-/// 126 entries. 256 bytes, so a block is four whole cache lines.
-const BLOCK: usize = 128;
+/// 62 entries. 128 bytes, so a block is two whole cache lines, and a bucket's
+/// last, partly filled block wastes 64 bytes on average.
+const BLOCK: usize = 64;
 
 /// One worker's pairs. Each bucket is a chain of blocks in the worker's own
 /// arena; `cur[bucket]` is where its next entry goes, or 0 before its first.
