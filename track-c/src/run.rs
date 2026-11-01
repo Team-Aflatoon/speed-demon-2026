@@ -1,8 +1,8 @@
-//! The parallel engine. The workers first build the region map and fault in
-//! the name table, then claim chunks of records.csv until none are left
+//! The parallel engine. The workers first fault in the name table and build
+//! the region map, then claim chunks of records.csv until none are left
 //! (phase 1), then claim name buckets until none are left (phase 2, see
-//! names.rs). A worker waits on the others only twice: for the region map,
-//! and at the end of phase 1.
+//! names.rs). A worker waits on the others only twice: for the table and
+//! the region map, and at the end of phase 1.
 //!
 //! Choosing the chunk cuts is where the quote-parity problem lives; see `run`.
 
@@ -17,8 +17,9 @@ use std::thread::{self, Scope};
 
 /// The most worker threads (the scoring machine gives us twelve).
 const MAX_THREADS: usize = 12;
-/// Start-up tasks: pieces of regions.csv to parse, then of the name table
-/// to fault in.
+/// Start-up tasks: quarters of the name table to fault in, then pieces of
+/// regions.csv to parse.
+const TOUCH: usize = 4;
 const PARTS: usize = 32;
 /// Stack size for workers, which need about 40 KiB; a small stack can never
 /// be given a huge page.
@@ -54,7 +55,7 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
     // Shared counters: the next chunk, start-up task and name bucket to
     // claim, start-up tasks to wait for, workers still in phase 1.
     let [chunk, task, bucket] = [0, 0, 0].map(AtomicUsize::new);
-    let (pending, parsing) = (AtomicUsize::new(PARTS), AtomicUsize::new(threads));
+    let (pending, parsing) = (AtomicUsize::new(TOUCH + PARTS), AtomicUsize::new(threads));
     // The lowest offset where the file broke the grammar, if it did. No
     // chunk is claimed after that.
     let fail = Mutex::new(None::<usize>);
@@ -67,17 +68,18 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
     let total = Mutex::new(vec![(EMPTY, [0; 2]); GROUPS]);
     let work = |t: usize| {
         // The start-up tasks go to whichever workers are up first, so that
-        // none waits for the last thread to start, only for the region map.
+        // none waits for the last thread to start, only for the tasks. The
+        // table comes first: faulting it in takes longest (pages fault in
+        // about one at a time, however many workers ask), and a lookup that
+        // faulted instead would cost far more.
         loop {
             match task.fetch_add(1, Relaxed) {
-                k if k < PARTS => regions.parse(k, &pending),
-                k if k < 2 * PARTS => table.touch(k - PARTS, PARTS),
+                k if k < TOUCH => _ = (table.touch(k, TOUCH), pending.fetch_sub(1, Release)),
+                k if k < TOUCH + PARTS => regions.parse(k - TOUCH, &pending),
                 _ => break,
             }
         }
-        // Most of this worker's pairs, at 2 bytes for a record of about 61,
-        // are faulted in now.
-        let pairs = Pairs::new(buckets, len, len / 64 / threads);
+        let pairs = Pairs::new(buckets, len);
         let aggs = [EMPTY; GROUPS];
         let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
         let mut local = Local { aggs, pairs };
