@@ -39,6 +39,8 @@ const CHUNK_BYTES: u64 = 512 << 10;
 
 /// Ranges are named by `range << RANGE_SHIFT` in a u32 (see `query.rs`).
 const _: () = assert!(MAX_THREADS <= 1 << (32 - RANGE_SHIFT));
+/// A term's use count has seven bits (see `query.rs`).
+const _: () = assert!(query::USES_CAP + MAX_THREADS as u32 <= 127);
 
 /// `track-b [data dir] [out dir]`, by default `/data` and `/out`.
 fn main() {
@@ -118,41 +120,22 @@ struct Shared<'a> {
 
 fn run(data: &str, out_dir: &str) {
     let (query_path, docs_path) = (format!("{data}/queries.txt"), format!("{data}/docs.txt"));
-    let mut queries =
-        std::fs::read(&query_path).unwrap_or_else(|e| fail(&format!("{query_path}: {e}")));
-    if queries.len() >= MAX_QUERY_BYTES {
-        fail(&format!("{query_path} is larger than 1 GB"));
-    }
-    queries.extend_from_slice(&[0; QUERY_PAD]);
+    let queries = read_queries(&query_path);
     let queries = &queries[..];
     let file = File::open(&docs_path).unwrap_or_else(|e| fail(&format!("{docs_path}: {e}")));
-    let segments = plan(&file, &docs_path);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS);
-    let (n, max_chunks) = (segments.len(), segments.iter().map(|s| s.chunks).max());
-    let shared = Shared {
-        file: &file,
-        tasks: schedule(&segments, threads),
-        next: AtomicUsize::new(0),
-        chunks: [0, 1].map(|_| many(max_chunks.unwrap_or(0))),
-        docs: many(n),
-        parts: many(PARTS),
-        bool_answers: many(threads),
-        phrase_answers: many(threads),
-        lines: many(threads),
-        scanned: many(n),
-        built: many(n),
-        evaluated: many(n),
-        segments,
-    };
     let setup = Setup::new(queries, threads);
     let parsed: Vec<OnceLock<Parsed>> = many(threads);
+    // Set by this thread while the workers parse the queries.
+    let shared: OnceLock<Shared> = OnceLock::new();
     std::thread::scope(|s| {
         for i in 0..threads {
             let (shared, setup, parsed) = (&shared, &setup, &parsed);
             s.spawn(move || {
                 let (mine, table) = setup.run(i);
+                let shared = shared.wait();
                 *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
                 *shared.phrase_answers[i].lock().unwrap() =
                     vec![Answer::default(); mine.term_ends.len()];
@@ -162,7 +145,25 @@ fn run(data: &str, out_dir: &str) {
                 work(shared, table, queries, &parsed);
             });
         }
+        let segments = plan(&file, &docs_path);
+        let (n, max_chunks) = (segments.len(), segments.iter().map(|s| s.chunks).max());
+        let _ = shared.set(Shared {
+            file: &file,
+            tasks: schedule(&segments, threads),
+            next: AtomicUsize::new(0),
+            chunks: [0, 1].map(|_| many(max_chunks.unwrap_or(0))),
+            docs: many(n),
+            parts: many(PARTS),
+            bool_answers: many(threads),
+            phrase_answers: many(threads),
+            lines: many(threads),
+            scanned: many(n),
+            built: many(n),
+            evaluated: many(n),
+            segments,
+        });
     });
+    let shared = shared.get().unwrap();
     let out = format!("{out_dir}/results.txt");
     let mut file = File::create(&out).unwrap_or_else(|e| fail(&format!("{out}: {e}")));
     for lines in &shared.lines {
@@ -171,6 +172,26 @@ fn run(data: &str, out_dir: &str) {
             fail(&format!("{out}: {e}"));
         }
     }
+}
+
+/// `queries.txt` and `QUERY_PAD` zero bytes, read into a buffer with room
+/// for both (appending to an exact-size one would copy the whole file).
+fn read_queries(path: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut file = File::open(path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+    let len = file.metadata().map_or(0, |m| m.len() as usize);
+    if len >= MAX_QUERY_BYTES {
+        fail(&format!("{path} is larger than 1 GB"));
+    }
+    let mut queries = Vec::with_capacity(len + QUERY_PAD);
+    if let Err(e) = file.read_to_end(&mut queries) {
+        fail(&format!("{path}: {e}"));
+    }
+    if queries.len() >= MAX_QUERY_BYTES {
+        fail(&format!("{path} is larger than 1 GB"));
+    }
+    queries.extend_from_slice(&[0; QUERY_PAD]);
+    queries
 }
 
 /// `n` default values (locks, counters).
@@ -283,11 +304,22 @@ fn schedule(segments: &[Segment], ranges: usize) -> Vec<Task> {
     tasks
 }
 
+/// Each BOOL query prefetches the term entries of the query this far ahead.
+const AHEAD: usize = 4;
+
 /// Waits until `count` reaches `n`; the Acquire pairs with the Release of
 /// the tasks that counted themselves done, so their writes are visible.
+/// Most waits are short, so it first spins with `PAUSE`, which leaves the
+/// core to its other hardware thread, and only then yields to the kernel.
 fn wait(count: &AtomicU32, n: usize) {
+    let mut spins = 0;
     while (count.load(Acquire) as usize) < n {
-        std::thread::yield_now();
+        if spins < 2000 {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -313,6 +345,10 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
     let terms = table.ids().div_ceil(PARTS);
     loop {
         let Some(&task) = sh.tasks.get(sh.next.fetch_add(1, Relaxed)) else {
+            // Freeing the scratch would unmap memory while the other threads
+            // run, which costs every core a TLB flush; the process is about
+            // to exit and frees it all at once.
+            std::mem::forget((scanner, eval, cursor));
             return;
         };
         let done = match task {
@@ -339,7 +375,12 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 let guards: Vec<_> = sh.parts.iter().map(|p| p.read().unwrap()).collect();
                 let parts: Vec<&Part> = guards.iter().map(|p| &**p).collect();
                 let (docs, base) = (sh.docs[s].load(Relaxed) as usize, sh.segments[s].first);
-                for (q, answer) in sh.bool_answers[r].lock().unwrap().iter_mut().enumerate() {
+                let mut answers = sh.bool_answers[r].lock().unwrap();
+                let queries = answers.len();
+                for (q, answer) in answers.iter_mut().enumerate() {
+                    if q + AHEAD < queries {
+                        index::prefetch(&parts, parsed[r].bool_steps(q + AHEAD));
+                    }
                     eval.run(&parts, parsed[r].bool_steps(q), docs, base, answer);
                 }
                 &sh.evaluated[s]
@@ -351,6 +392,9 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 let bools = sh.bool_answers[r].lock().unwrap();
                 let phrases = sh.phrase_answers[r].lock().unwrap();
                 let out = &mut sh.lines[r].lock().unwrap();
+                // A line is at most 11 numbers of up to 20 digits; most are far
+                // shorter, so this only saves the regrowth copies.
+                out.reserve(32 * parsed[r].order.len());
                 for &entry in &parsed[r].order {
                     match entry & PHRASE {
                         0 => bools[entry as usize].write(out),
