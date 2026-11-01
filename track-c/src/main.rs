@@ -33,12 +33,6 @@ const PIECE: usize = 64 << 10;
 /// Groups: `_UNMATCHED` (0) and up to 255 countries.
 pub const GROUPS: usize = 256;
 
-/// A value alone on its own pair of cache lines (Intel's adjacent-line
-/// prefetcher moves lines in pairs), for counters that one core writes
-/// while others read their neighbours.
-#[repr(align(128))]
-pub struct Padded<T>(pub T);
-
 /// Asks the CPU to start loading the cache line of element `i` of `s`, so
 /// that a later read finds it there. Used to overlap the cache misses of a
 /// window's records. An `i` past the end is harmless, so it is not checked.
@@ -51,6 +45,9 @@ pub fn prefetch<T>(s: &[T], i: usize) {
 }
 
 fn main() {
+    if !std::arch::is_x86_feature_detected!("pclmulqdq") {
+        die("this CPU lacks PCLMULQDQ, which the parser uses (see parse::prefix_xor)");
+    }
     sys::no_huge_pages();
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
@@ -82,7 +79,8 @@ fn main() {
     let mut text = String::new();
     // `_` sorts after every capital letter, so _UNMATCHED comes last.
     for (key, group) in regions.countries().chain([("_UNMATCHED".into(), 0)]) {
-        let ([ids, cents, txt, min, max], [records, distinct, names]) = totals[usize::from(group)];
+        let ([ids, cents, txt, min, max], [distinct, both]) = totals[usize::from(group)];
+        let (records, names) = (both >> 32, both & 0xFFFF_FFFF);
         let (sum, min, max) = (money(cents), money(min), money(max));
         let notes = txt - names as i64;
         let line = format!("{key} {records} {ids} {sum} {min} {max} {distinct} {names}");
