@@ -348,13 +348,13 @@ pub struct Pairs {
 
 impl Pairs {
     /// Room for every record of a file of `len` bytes (a record takes at
-    /// least 11) in `buckets` buckets, backed by memory only where used. Its
-    /// pages fault in as blocks are taken, one after another: faulting them
-    /// in up front only kept the worker from parsing sooner.
-    pub fn new(buckets: usize, len: usize) -> Self {
+    /// least 11) in `buckets` buckets, backed by memory only where used; the
+    /// first `touch` entries are faulted in now.
+    pub fn new(buckets: usize, len: usize, touch: usize) -> Self {
         // SAFETY: zero is a valid u16.
         let blocks = len / 11 / (BLOCK - 2) + buckets + 1;
         let arena: &mut [u16] = unsafe { crate::mapped(blocks * BLOCK, -1) };
+        crate::populate(&arena[..touch.min(arena.len())]);
         Pairs { cur: vec![0; buckets], arena, n: 0 }
     }
 
