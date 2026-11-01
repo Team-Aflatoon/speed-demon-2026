@@ -10,17 +10,17 @@
 
 use crate::records::{load, Fail, Record, BATCH};
 use crate::{map, prefetch, Agg, Padded, DISTINCT};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::Mutex;
 
-/// Words per table slot: up to three words of name, then `meta`.
+/// Words per table slot: three words of name, then `meta`.
 const SLOT: usize = 4;
-/// The longest name kept in its slot; longer ones live in the arena.
+/// The longest name kept in the table; longer ones are in `long`.
 const INLINE: usize = 8 * (SLOT - 1);
 /// `meta` of a slot whose claimer is still filling it in. Otherwise `meta`
-/// is 0 for an empty slot, or `(id + 1) << 32 | length`, where a length of
-/// `LONG` or more is `LONG` and the slot's first word holds the real one.
+/// is 0 for an empty slot, or `(id + 1) << 32 | length`.
 const FILLING: u64 = u64::MAX;
-const LONG: usize = u32::MAX as usize;
 
 pub struct Names {
     /// Open addressing with linear probing over 32-byte slots, so a lookup
@@ -28,32 +28,27 @@ pub struct Names {
     /// compare. Slot i is `table[SLOT * i..][..SLOT]`.
     table: &'static [AtomicU64],
     mask: usize,
-    /// Names longer than `INLINE`: their slot holds their length and where
-    /// their words start here.
-    arena: &'static [AtomicU64],
+    /// Names longer than `INLINE` bytes, by their raw bytes. The spec's are
+    /// a few hundredths of a percent, so a lock is cheap here.
+    long: Mutex<HashMap<Vec<u8>, usize>>,
     /// The groups seen with name id i are bits `4 * i * 64..` onwards.
     pairs: &'static [AtomicU64],
-    /// Ids and arena words handed out so far, and the cap on ids that keeps
-    /// the table at most 7/8 full.
+    /// Ids handed out so far, and the cap on them that keeps the table at
+    /// most 7/8 full.
     next_id: Padded<AtomicUsize>,
-    next_word: Padded<AtomicUsize>,
     limit: usize,
 }
 
 impl Names {
-    /// An empty set with `slots` table slots (a power of two) for a file of
-    /// `file_len` bytes.
-    pub fn new(slots: usize, file_len: usize) -> std::io::Result<Self> {
+    /// An empty set with `slots` table slots, a power of two.
+    pub fn new(slots: usize) -> std::io::Result<Self> {
         let limit = slots / 8 * 7;
         Ok(Names {
             table: map::zeroed(SLOT * slots)?,
             mask: slots - 1,
-            // A long name's padded words are fewer than its record's bytes,
-            // so the arena cannot overflow.
-            arena: map::zeroed(file_len / 8 + 1)?,
+            long: Mutex::default(),
             pairs: map::zeroed(4 * limit)?,
             next_id: Padded(AtomicUsize::new(0)),
-            next_word: Padded(AtomicUsize::new(0)),
             limit,
         })
     }
@@ -91,6 +86,16 @@ impl Names {
 
     /// The id of name `n`, whose key is `key`.
     fn id(&self, key: &Key, b: &[u8], n: &Record) -> Result<usize, Fail> {
+        if n.len > INLINE {
+            let name = b[n.start..n.start + n.len].to_vec();
+            let mut long = self.long.lock().unwrap();
+            if let Some(&id) = long.get(&name) {
+                return Ok(id);
+            }
+            let id = self.fresh()?;
+            long.insert(name, id);
+            return Ok(id);
+        }
         let mut i = key[3] as usize & self.mask;
         loop {
             let slot = &self.table[SLOT * i..][..SLOT];
@@ -98,7 +103,7 @@ impl Names {
             if meta == 0 {
                 // Claim the slot first, so that only one worker writes it.
                 match slot[SLOT - 1].compare_exchange(0, FILLING, Acquire, Acquire) {
-                    Ok(_) => return self.fill(slot, key, b, n),
+                    Ok(_) => return self.fill(slot, key, n),
                     Err(now) => meta = now,
                 }
             }
@@ -106,7 +111,8 @@ impl Names {
                 std::hint::spin_loop(); // a few stores away from done
                 meta = slot[SLOT - 1].load(Acquire);
             }
-            if meta as u32 as usize == n.len.min(LONG) && self.holds(slot, key, b, n) {
+            let same = (0..SLOT - 1).all(|k| slot[k].load(Relaxed) == key[k]);
+            if meta as u32 as usize == n.len && same {
                 return Ok((meta >> 32) as usize - 1);
             }
             i = (i + 1) & self.mask;
@@ -115,51 +121,37 @@ impl Names {
 
     /// Writes name `n` into a slot this worker has claimed, then publishes
     /// it: the Release store makes the words visible before the `meta`.
-    fn fill(&self, slot: &[AtomicU64], key: &Key, b: &[u8], n: &Record) -> Result<usize, Fail> {
-        let id = self.next_id.0.fetch_add(1, Relaxed);
-        if id >= self.limit {
-            // Publish a slot no lookup matches, so nobody waits on it forever.
-            slot[0].store(u64::MAX, Relaxed);
-            slot[SLOT - 1].store(LONG as u64, Release);
-            return Err(Fail::Full);
-        }
-        if n.len <= INLINE {
-            key.iter().zip(slot).for_each(|(&w, s)| s.store(w, Relaxed));
-        } else {
-            let at = self.next_word.0.fetch_add(n.len.div_ceil(8), Relaxed);
-            words(b, n)
-                .zip(&self.arena[at..])
-                .for_each(|(w, a)| a.store(w, Relaxed));
-            slot[0].store(n.len as u64, Relaxed);
-            slot[1].store(at as u64, Relaxed);
-        }
-        slot[SLOT - 1].store((id as u64 + 1) << 32 | n.len.min(LONG) as u64, Release);
-        Ok(id)
+    /// Without an id to give, it publishes a slot no lookup matches (its
+    /// length field is too big), so that nobody waits on it forever.
+    fn fill(&self, slot: &[AtomicU64], key: &Key, n: &Record) -> Result<usize, Fail> {
+        let id = self.fresh();
+        let meta = id
+            .as_ref()
+            .map_or(u32::MAX.into(), |&id| (id as u64 + 1) << 32 | n.len as u64);
+        // Only the name words: `meta` must go straight from FILLING to its
+        // final value, or a lookup could see a half-written slot as done.
+        let words = key[..SLOT - 1].iter().zip(slot);
+        words.for_each(|(&w, s)| s.store(w, Relaxed));
+        slot[SLOT - 1].store(meta, Release);
+        id
     }
 
-    /// Whether a published slot whose length field matches holds name `n`.
-    fn holds(&self, slot: &[AtomicU64], key: &Key, b: &[u8], n: &Record) -> bool {
-        if n.len <= INLINE {
-            return (0..3).all(|k| slot[k].load(Relaxed) == key[k]);
-        }
-        let arena = &self.arena[slot[1].load(Relaxed) as usize..];
-        let same = |(w, a): (u64, &AtomicU64)| a.load(Relaxed) == w;
-        slot[0].load(Relaxed) == n.len as u64 && words(b, n).zip(arena).all(same)
+    /// A new id, unless that would make the table too full.
+    fn fresh(&self) -> Result<usize, Fail> {
+        let id = self.next_id.0.fetch_add(1, Relaxed);
+        (id < self.limit).then_some(id).ok_or(Fail::Full)
     }
 }
 
 /// A name's first 24 bytes as three zero-padded words, which for nearly
 /// every name is all of it, then its hash. Fixed-size, so hashing and
-/// comparing need no loop.
+/// comparing need no loop. (Longer names do not use the table.)
 type Key = [u64; 4];
 
 fn key(b: &[u8], n: &Record) -> Key {
     let word = |k: usize| load(b, n.start + 8 * k) & keep(n.len.saturating_sub(8 * k));
     let [w0, w1, w2] = [0, 1, 2].map(word);
-    let mut h = mix(w0 ^ mix(w1 ^ mix(w2 ^ n.len as u64)));
-    if n.len > INLINE {
-        h = words(b, n).skip(3).fold(h, |h, w| mix(h ^ w));
-    }
+    let h = mix(w0 ^ mix(w1 ^ mix(w2 ^ n.len as u64)));
     [w0, w1, w2, h ^ h >> 32]
 }
 
@@ -175,11 +167,4 @@ fn mix(x: u64) -> u64 {
     const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
     let x = x.wrapping_mul(GOLDEN);
     x ^ x >> 29
-}
-
-/// The raw bytes of name `n` as little-endian 8-byte words, the last one
-/// zero-padded.
-fn words<'b>(b: &'b [u8], n: &Record) -> impl Iterator<Item = u64> + 'b {
-    let (start, len) = (n.start, n.len);
-    (0..len.div_ceil(8)).map(move |k| load(b, start + 8 * k) & keep(len - 8 * k))
 }
