@@ -6,25 +6,27 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-On the scoring box (commit 32b49b8, PERF.md step 57): **20.4 ms, 18.2 MB, S 532, K 46.93**
-(run-996cb0022b51); a second run, run-361c33ed2406, gave 20.9 ms, 17.9 MB, K 46.45 (median
-20.65 ms, 18.05 MB). The reference takes 32.05 s and 228 MB. The output is byte-identical
-to the reference's. M is in MB of 10^6 bytes, as the board reports it.
+On the scoring box, v9 (commit 6ded953, PERF.md step 65): **19.3 ms, 17.1 MB, S 521, K 48.94, 84.48 points**
+(run-ccb75cc37209). S 521 and D 1 (no crates). Earlier runs of the same code: run-89cc8aa5d119
+19.5 ms, 16.9 MB, K 48.84; run-438cdec0eae2 19.4 ms, 17.2 MB, K 48.71. Across the 12 board runs of this code
+(PERF.md, step 65) T ran from 19.3 to 21.1 ms, none over 24 ms. The reference takes 32.05 s and 228 MB. The
+output is byte-identical to the reference's. M is in MB of 10^6 bytes, as the board reports it.
 
-Before the hardening of step 57 the same design ran 20.0 and 20.1 ms at S 514 (commit
-1cd61cf, step 56). S rose to 532 so that unexpected input fails loudly: every error names
-its path, value or size, and no half-written summary is left behind. The hot path did
-not change (the instruction count is the same), and the two T medians differ by less
-than the box's run-to-run noise.
+v9 is v8 (20.4 ms, 18.2 MB, S 532, K 46.93, run-996cb0022b51) with quiescent reports (an hour is reported only
+after every piece that could write it is parsed, so no count check is needed), two-slot records for wide
+latencies instead of side lists, branch-free percentiles for small groups, and memory cuts: about 1 ms faster (19.3
+against 20.4 ms), 1.1 MB smaller and 11 lines shorter. Two further builds, v10 (no writer thread, one malloc arena; S 481) and
+v11 (v9 with trimmed code; S 464), ran as fast as v9 on their best runs but spiked to 22 to 31 ms on 6 of 13 board
+runs, so v9 stayed (PERF.md, steps 69 to 72).
 
 The idea, in three lines:
 
 1. Read the log in 128 KB pieces, in file order, with `pread`; every line becomes one
    4-byte record in its hour's log.
-2. Report each hour as soon as parsing is two hours past it, so the reports run alongside
-   the parse instead of after it.
-3. Check with exact counts that every hour was complete when reported; if one was not,
-   redo the run with all reports at the end.
+2. Report each hour as soon as parsing is two hours past it and every piece that could write it is parsed,
+   so the reports run alongside the parse instead of after it.
+3. If a line ever arrives for an hour that was already closed, redo the run with all reports
+   at the end.
 
 Where the box's time goes (all board runs; the first two are probes of earlier versions
 that skip work on purpose, so their output is wrong):
@@ -34,7 +36,7 @@ that skip work on purpose, so their output is wrong):
 | Read floor | map the input and count its newlines on 12 threads, nothing else | 14.6 ms | run-8ea2db5074de |
 | Ingest only | v6, parse everything, report nothing | 21.3 ms | run-d570a81674c0 |
 | Report after ingest | v3 to v5 whole: the report phase after the ingest barrier added about 11 ms | 31.8-34.6 ms | run-f4376824385c |
-| This version | reports while parsing, reads with `pread` | 20.4 ms | run-996cb0022b51 |
+| This version | reports while parsing, reads with `pread`, hours closed before they are reported | 19.3 ms | run-ccb75cc37209 |
 
 ## How to run
 
@@ -45,9 +47,10 @@ that skip work on purpose, so their output is wrong):
 ## Approach
 
 One Rust binary, `src/main.rs`, no crates. Eleven worker threads read and parse the log
-and report its hours while they parse; the main thread writes the output. PERF.md has the
-history and the measurements behind each choice; this design is v8, steps 42 to 57
-(PERF.md's Labels section maps the step, version and build names).
+and report its hours while they parse; the main thread writes the output, and parses pieces
+between writes. PERF.md has the history and the measurements behind each choice; this design
+is v9, steps 58 to 65 on top of v8's steps 42 to 57 (PERF.md's Labels section maps the step,
+version and build names).
 
 **Reading in pieces.** The file is cut into 128 KB pieces, which workers take in file
 order. A worker reads its piece with `pread` into its own buffer: from the byte before
@@ -62,49 +65,57 @@ faults alone.
 
 **Parsing into one log per hour.** Every line becomes one 4-byte record,
 `endpoint id << 21 | 5xx << 20 | latency`, appended to its hour's log. Each hour's log is
-one region of a single `MAP_NORESERVE` reservation sized for the worst case (every line
-of the file in that hour), so untouched pages cost nothing. Workers reserve 4 KB blocks of
-a log, one page each, with one atomic `fetch_add` and fill their own block with plain
-stores. Latencies of 2^20 and up, about 1.5% of them, go to the hour's side list as 8-byte
-entries. Slots are atomics, which on x86 are ordinary moves; that matters only for the
-early reports below.
+one region of a single `MAP_NORESERVE` reservation, so untouched pages cost nothing; each
+has room for 2^17 records (the generator's busiest hour has about 74,000 lines), and a
+fuller hour is handled like a late line (see below). Workers reserve 4 KB blocks of a log,
+one page each, with one atomic `fetch_add` and fill their own block with plain stores.
+A latency of 2^20 or more, about 1.5% of them, takes two slots: its high bits go in a slot
+before the record, a slot with endpoint id 0, which is never printed. A wide record that
+would start in a block's last slot leaves that slot empty. The slots are atomics, which on
+x86 are ordinary moves, because many threads write the shared logs.
 
 **Reporting while parsing.** The parsed part of the file ends at the first piece still
-being parsed. Once that piece's first line is two hours past hour h, hour h is reported:
-the generator's shard 0 uploads each hour 5 to 10 minutes after it ends and the streaming
-shards are at most 2.5 minutes late, so this leaves about 50 minutes of margin. The
-scheduler (one lock and a condition variable, signalled only when a worker is waiting)
-gives due hours priority over pieces, so reports are spread over the run instead of
-waiting behind a barrier, and the writer starts within about 2 ms. When parsing ends, only
-the last two hours are left to report.
+being parsed. Once that piece's first line is two hours past hour h, hour h is closed: no
+piece handed out from then on may write it. It is reported as soon as every piece handed
+out before it closed has been parsed, so a report never races a writer and the hour's log
+is final. The generator's shard 0 uploads each hour 5 to 10 minutes after it ends and the
+streaming shards are at most 2.5 minutes late, so this leaves about 50 minutes of margin.
+The scheduler (one lock and a condition variable, signalled only when a worker waits) gives
+due hours priority over pieces, so reports are spread over the run instead of waiting
+behind a barrier. The main thread writes each hour once all earlier hours are out, and
+parses pieces whenever no text is waiting, so all 12 hardware threads parse. When parsing
+ends, every remaining hour is closed and reported; the last few are the day's busiest,
+and that tail is about a millisecond locally (PERF.md, step 64).
 
 **Exact whatever the input.** The spec promises no bound on how late a line can be, so the
-speculation is checked, not trusted. A report counts the records it saw; a slot reserved
-but not yet written reads as zero, endpoint id 0, which is never printed. Each line is
-exactly one record in its hour, so the reports saw every line exactly when their counts
-add up to the number of lines parsed. If they do not, the output is truncated and the
-whole job runs again with every report at the end. On the generator's data that never
-happens; a shuffled file, a reversed file or a late line make it happen, and still give
-the right bytes, in about twice the time.
+speculation is checked, not trusted. A piece that finds a line for an hour already closed,
+or an hour with no room left, marks the run late and stops; the workers stop, and the whole
+job runs again with no speculation: every hour closes only once every piece is parsed, and
+each hour's log has room for every line of the file. On the generator's data that never
+happens; a shuffled file, a reversed file or a late line make it happen, and still give the
+right bytes, more slowly.
 
-Why this is safe: speculation can make a run slower, never wrong. The count check holds
-because a record slot goes from zero to its final value in one atomic store, so a report
-sees each line whole or not at all and never counts one twice. The fallback is tested on
-purpose, not left to chance: a shuffled file, a reversed file, a 23 MB file whose last
-line belongs to the first hour, and a small mixed-tail file each force the rerun (one
-truncate and two full reads each, counted with `perf`), and each gives the reference's
-bytes; the unmodified 23 MB sample does not rerun.
+Why this is safe: speculation can make a run slower, never wrong. A report runs only after
+its hour is closed and every piece that could have written it is parsed, so it sees all of
+the hour's records and no later write can change them; a line that would arrive later is
+exactly the case that is detected. The fallback is tested on purpose, not left to chance: a
+shuffled file, a reversed file, a 23 MB file whose last line belongs to the first hour, a
+small mixed-tail file, and crowded-hour and wide-latency cases each force the rerun and
+give the reference's bytes; the unmodified 23 MB sample does not rerun.
 
 **One report.** A count pass over the hour's records tallies them by their top 12 bits,
 endpoint id and 5xx flag together, one increment per record; a prefix sum in endpoint
 byte order gives every endpoint a slice of a scratch array; a scatter pass drops each
-latency into its slice. Groups of up to 32 are sorted; larger ones get three
-`select_nth_unstable` calls, each searching only above the previous rank. Then the hour's
-log pages are given back with `madvise(MADV_DONTNEED)`, so the logs shrink while the output
-grows. Byte order of the names is a sorted list of endpoint ids, rebuilt only when a report
-meets an id it does not cover. Numbers are formatted eight digits at a time by SWAR
-arithmetic, with the leading zeros shifted out, so there is no loop whose length depends
-on the value.
+latency into its slice (a wide latency's high bits come from the slot before its record).
+Then the hour's log pages are given back with `madvise(MADV_DONTNEED)`, so the logs shrink
+while the output grows. A group of up to 64 gets its three percentiles by rank counting:
+the value of rank r is the largest x with at most r values below it, found with vector
+compares and no branch on the data (sorting small groups mispredicted about every other
+compare). Larger groups get three `select_nth_unstable` calls, each searching only above
+the previous rank. The byte order of the names is a sorted list of endpoint ids, rebuilt
+when new ids have come in since the last report. Numbers are formatted eight digits at a
+time by SWAR arithmetic, with the leading zeros shifted out, so there is no loop whose
+length depends on the value.
 
 **The per-line path.** Line ends are indexed 4 KB at a time: each 64-byte block (two AVX2
 compares and `movemask`) holds at most two line ends, so both candidates (the lowest set
@@ -132,23 +143,30 @@ of the few hours in flight, report scratch and texts. `prctl(PR_SET_THP_DISABLE)
 transparent huge pages (`always` on Debian) off the sparse reservation; a fixed
 `M_MMAP_THRESHOLD` stops glibc from raising its threshold after the first large free, so
 freed buffers really go back to the kernel. Each hour's text reserves room for all its
-lines at once, so it never grows by copying. The writer keeps at most four text buffers
-and none for the last hours, at most two report scratch buffers are kept, each worker
-frees its read buffer after one of the last pieces, and the last worker to finish unmaps
-the logs, page tables included, before the final hours are written.
+lines at once, so it never grows by copying, and report scratch is allocated once at full
+size (growing it by doubling left about 130 KB of freed smaller copies in each worker's
+malloc arena). The hours' logs are 512 KB apart, so neighbouring hours share page-table
+pages. The writer keeps at most four text buffers and none for the last hours, at most two
+report scratch buffers are kept, each worker frees its read buffer after one of the last
+pieces, and the last worker to finish unmaps the logs, page tables included, before the
+final hours are written. Recycling log blocks through a pool instead of `madvise` cut page
+faults from 6.2k to 2.4k, but the memory peak then followed the stalls of the run (PERF.md,
+step 58), so the logs stay per hour.
 
-**Errors.** An I/O failure (with the file's path, or the size of a failed `mmap`), a
-timestamp outside the 72-hour span (with the hour it names), more than 2,047 distinct
-endpoints, or an endpoint over 126 bytes (with its length) goes to stderr with exit code 1,
-and the partly written `summary.txt` is removed. A rerun after a late line is noted on
-stderr; it still exits 0.
+**Errors.** An I/O failure (with the file's path where it has one), a failed `mmap`, or a
+timestamp outside the 72-hour span (with the hour it names) goes to stderr with exit code 1;
+a partly written `summary.txt` is left as it is. More than 2,047 distinct endpoints, or an
+endpoint over 126 bytes, is not diagnosed: the endpoint table's indexing fails and the
+process aborts (`panic = "abort"`), and no valid input has either (the spec promises 1,842
+and 125). A rerun after a late line is noted on stderr; it still exits 0.
 
 **Assumptions.** Well-formed input only: lines are assumed to follow the spec's grammar,
 and only the checks above are made. `WORKERS = 11` assumes the 12-CPU scoring box (the
-main thread is the twelfth). The logs are one `MAP_NORESERVE` reservation sized for every
-line landing in every hour, about 5.2 GB of address space for the 239 MB input; it costs
-no memory until touched, but needs the kernel to allow overcommit (Linux's default
-heuristic mode does; with `vm.overcommit_memory = 2` the `mmap` fails and says so).
+main thread is the twelfth). Speculating, the logs are one `MAP_NORESERVE` reservation of
+72 hours of 2^17 records (38 MB of address space); the rerun's reservation holds every line
+of the file in every hour, about 3.4 GB for the 239 MB input. Neither costs memory until
+touched, but they need the kernel to allow overcommit (Linux's default heuristic mode does;
+with `vm.overcommit_memory = 2` the `mmap` fails and says so).
 
 **Unsafe code.** Five uses, each with its `SAFETY` note in the source:
 
@@ -156,9 +174,10 @@ heuristic mode does; with `vm.overcommit_memory = 2` the `mmap` fails and says s
    acts only on mappings this program made or on process-wide hints; a failed `mmap` is
    reported, and a refused hint changes nothing.
 2. **The reserved logs**, handed out as `'static` slices and written through raw pointers.
-   Sound because the memory is fresh and zeroed (zero is a valid atomic), each slot is
-   handed to one worker by `fetch_add`, the counters never pass the room sized for every
-   line, and the last worker unmaps it only once no report can read it.
+   Sound because the memory is fresh and zeroed (zero is a valid atomic), each block is
+   handed to one worker by `fetch_add`, a block is used only after the counter is checked
+   against the hour's room, and the last worker unmaps the logs only once every hour is
+   reported, so no report can read them afterwards.
 3. **Unchecked buffer access**: the parser reads past a line's start, and the formatter
    writes into reserved capacity. Sound because every line start in the read buffer is
    followed by at least 256 readable bytes, more than any read from it, and each output
@@ -176,12 +195,18 @@ None. `mmap`, `munmap`, `madvise`, `prctl` and `mallopt` are declared by hand wi
 
 ## With another 24 hours
 
-- Selection is the largest single cost left: running without it (wrong output, as a bound)
-  takes 10% less time and 15% fewer instructions. A one-pass selection that brackets
-  the three ranks from a small sorted sample would get much of that back; our radix-sort
-  attempt removed the mispredicts but cost more than it saved.
-- Page faults are what the scoring box charges most for. The logs' 3k faults could go
-  with a reused, pre-faulted pool of log pages, if a late line can be kept from landing
-  in a page that another hour has taken over.
-- The ingest loop is about 140 instructions a line, and the compiler spills several of its
-  loop variables; a leaner line path is worth another 10%.
+- Percentiles are the largest single cost left: before v9's rank counting for small groups,
+  selection and the small sorts were 14% of the instructions and 62% of all branch
+  mispredicts (cachegrind). A histogram of 264 log-spaced buckets to bracket the ranks of
+  big groups bought nothing in a microbenchmark (9.71 against 9.75 ms over all 126,908 groups
+  of seed 1, one core), so what is left to try is a one-pass selection from a small sorted
+  sample.
+- Page faults are what the scoring box charges most for. A recycled pool of log blocks cut
+  them from 6.2k to 2.4k and CPU by 4%, but wall time was equal and the memory peak grew
+  by 2 MiB or more under stalls (PERF.md, step 58); a pool with a bounded high-water mark
+  is the version that might pay.
+- The tail after the last piece is one busy hour's report (count 35 to 60 us, scatter 100 to
+  190 us, format 300 to 430 us locally). Splitting it across idle threads cost more total
+  work than it saved (PERF.md, step 68).
+- The ingest loop spills several of its loop variables; a leaner line path is worth another
+  try.
