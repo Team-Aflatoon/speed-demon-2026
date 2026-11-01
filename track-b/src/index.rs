@@ -29,8 +29,10 @@ impl Part {
     pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize, cursor: &mut Vec<u32>) {
         self.offsets.clear();
         self.offsets.resize(terms + 1, 0);
-        for &x in streams.iter().copied().flatten() {
-            self.offsets[(x & 0xFFFF) as usize + 1] += 1;
+        for stream in streams {
+            for &x in *stream {
+                self.offsets[(x & 0xFFFF) as usize + 1] += 1;
+            }
         }
         for l in 0..terms {
             self.offsets[l + 1] += self.offsets[l];
@@ -38,10 +40,12 @@ impl Part {
         cursor.clear();
         cursor.extend_from_slice(&self.offsets[..terms]);
         self.docs.resize(self.offsets[terms] as usize, 0);
-        for &x in streams.iter().copied().flatten() {
-            let at = &mut cursor[(x & 0xFFFF) as usize];
-            self.docs[*at as usize] = (x >> 16) as u16;
-            *at += 1;
+        for stream in streams {
+            for &x in *stream {
+                let at = &mut cursor[(x & 0xFFFF) as usize];
+                self.docs[*at as usize] = (x >> 16) as u16;
+                *at += 1;
+            }
         }
         let words = docs.div_ceil(64);
         self.docs_in_segment = docs;
@@ -59,6 +63,18 @@ impl Part {
                 }
             }
         }
+    }
+}
+
+/// Starts loading the entries of the terms of the BOOL query `steps`, whose
+/// cache misses would otherwise stall `Evaluator::run` one after another.
+pub fn prefetch(parts: &[&Part], steps: &[u32]) {
+    for &step in steps {
+        let term = (step & ((1 << TERM_BITS) - 1)) as usize;
+        let offsets = &parts[term % PARTS].offsets;
+        let p = offsets.as_ptr().wrapping_add(term / PARTS);
+        // SAFETY: a prefetch is only a hint; it never faults or changes memory.
+        unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast()) };
     }
 }
 
@@ -127,14 +143,14 @@ impl Evaluator {
         let words = docs.div_ceil(64);
         self.bits.resize(words, 0);
         self.mask.resize(words, 0);
+        let set = |step: u32| Set::of(parts, (step & ((1 << TERM_BITS) - 1)) as usize, words);
         let mut acc = Acc::Empty;
         for &step in steps {
             let op = step >> TERM_BITS;
             if let (Acc::Empty, AND | NOT) = (acc, op) {
                 continue; // nothing to intersect with or subtract from
             }
-            let set = Set::of(parts, (step & ((1 << TERM_BITS) - 1)) as usize, words);
-            acc = self.step(acc, op, set, docs);
+            acc = self.step(acc, op, set(step), docs);
         }
         match acc {
             Acc::Empty => {}
@@ -240,20 +256,36 @@ impl Evaluator {
     }
 }
 
+/// Whether every document of the sorted `list` has a bit in `bits`: its
+/// last is the largest. The loops below index `bits` unchecked after this.
+fn fits(list: &[u16], bits: &[u64]) -> bool {
+    list.last()
+        .is_none_or(|&d| usize::from(d) / 64 < bits.len())
+}
+
 fn set_bits(bits: &mut [u64], list: &[u16]) {
+    assert!(fits(list, bits));
     for &d in list {
-        bits[usize::from(d) / 64] |= 1 << (d % 64);
+        // SAFETY: `d / 64 < bits.len()` for every `d` (checked above).
+        unsafe { *bits.get_unchecked_mut(usize::from(d) / 64) |= 1 << (d % 64) };
     }
 }
 
-/// The documents of `list` whose bit is set (clear, if `not`). Written
-/// branch-free: every document is stored, and kept by advancing the count.
+/// The documents of the sorted `list` whose bit is set (clear, if `not`).
+/// Written branch-free: every document is stored, and kept by advancing the
+/// count.
 fn filter<'a>(list: &[u16], bits: &[u64], not: bool, out: &mut Vec<u16>) -> Acc<'a> {
+    assert!(fits(list, bits));
     out.resize(list.len(), 0);
     let mut n = 0;
     for &d in list {
-        out[n] = d;
-        n += usize::from((bits[usize::from(d) / 64] >> (d % 64) & 1 != 0) != not);
+        // SAFETY: `d / 64 < bits.len()` (checked above), and `n` counts kept
+        // documents, so it is below the `list.len()` slots of `out` here.
+        unsafe {
+            *out.get_unchecked_mut(n) = d;
+            let bit = *bits.get_unchecked(usize::from(d) / 64) >> (d % 64) & 1 != 0;
+            n += usize::from(bit != not);
+        }
     }
     out.truncate(n);
     Acc::List
@@ -306,7 +338,23 @@ fn combine<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<
     Acc::List
 }
 
+/// `a` or `b`. When one list is `GALLOP` times longer, each document of the
+/// short one is sought in it and the runs in between are copied whole;
+/// otherwise a branch-free merge.
 fn union<'a>(a: &[u16], b: &[u16], out: &mut Vec<u16>) -> Acc<'a> {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.len() * GALLOP < long.len() {
+        out.clear();
+        let mut at = 0;
+        for &x in short {
+            let i = seek(long, at, x);
+            out.extend_from_slice(&long[at..i]);
+            out.push(x);
+            at = i + usize::from(long.get(i) == Some(&x));
+        }
+        out.extend_from_slice(&long[at..]);
+        return Acc::List;
+    }
     out.resize(a.len() + b.len(), 0);
     let (mut i, mut j, mut n) = (0, 0, 0);
     while i < a.len() && j < b.len() {
