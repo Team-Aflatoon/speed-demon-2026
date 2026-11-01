@@ -36,12 +36,6 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
-    // PROBE p1: p0 + the workers started (as `run` does) and joined, idle.
-    if std::hint::black_box(true) { // PROBE
-        run::probe_threads(); // PROBE
-        _ = fs::write(format!("{out}/aggregates.txt"), ""); // PROBE
-        return; // PROBE
-    } // PROBE
     let path = format!("{data}/records.csv");
     let file = or_die(fs::File::open(&path), &path);
     let len = or_die(file.metadata(), &path).len() as usize;

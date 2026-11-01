@@ -82,6 +82,11 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
         let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
         let mut local = Local { aggs, pairs };
         wait(&pending);
+        // PROBE p2: c9's start-up only. No chunk read, no phase 2; main then
+        // writes an empty aggregates.txt (every group has 0 records).
+        if std::hint::black_box(true) { // PROBE
+            return; // PROBE
+        } // PROBE
         while let Some(c) = Some(chunk.fetch_add(1, Relaxed)).filter(|&c| c < chunks) {
             let span = read(file, len - c * piece, c * piece, piece, &mut buffer);
             match parser.chunk(&buffer, span, &mut local) {
@@ -118,13 +123,6 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
     let fail = fail.into_inner().unwrap();
     fail.map_or(Ok(total.into_inner().unwrap()), Err)
 }
-
-/// PROBE p1: the workers, started and joined as `run` does, each idle. // PROBE
-pub fn probe_threads() { // PROBE
-    let threads = thread::available_parallelism().map_or(1, usize::from).min(MAX_THREADS); // PROBE
-    let work = |t: usize| _ = std::hint::black_box(t); // PROBE
-    thread::scope(|s| grow(s, 0, threads, &work)); // PROBE
-} // PROBE
 
 /// Waits, yielding rather than spinning, so that a crowded machine can run
 /// the workers still busy, until `left` reaches 0.
