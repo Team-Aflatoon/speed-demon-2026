@@ -54,13 +54,14 @@ pub struct Record {
     note_len: i64,
 }
 
-/// A chunk's separators not yet consumed: their offsets, the quote bytes
-/// before each, how many there are, and where their record starts; and the
-/// batch the records they complete are parsed into.
+/// A chunk's separators not yet consumed: offsets from `base`, the quote
+/// bytes before each, how many there are, and where their record starts;
+/// and the batch the records they complete are parsed into.
 struct Separators {
     at: [u32; ROOM],
     quotes: [u32; ROOM],
     n: usize,
+    base: usize,
     record: usize,
     batch: [Record; BATCH],
 }
@@ -86,6 +87,7 @@ impl Shared<'_> {
             at,
             quotes,
             n: 0,
+            base,
             record: base,
             batch,
         };
@@ -111,22 +113,22 @@ impl Shared<'_> {
             if opens | closes | cr & !ins & !lf_after != 0 {
                 return Err(Fail::Malformed);
             }
-            s.push((comma | lf) & !ins, o as u32, quote, quotes);
+            s.push((comma | lf) & !ins, (o - base) as u32, quote, quotes);
             quotes += quote.count_ones();
             inside = ((ins as i64) >> 63) as u64; // bit 63, broadcast
             sep_before = sep >> 63;
             if s.n >= FLUSH {
-                self.records(b, &mut s, aggs, usize::MAX)?;
+                self.records(b, &mut s, aggs)?;
             }
         }
-        // The final record may end at end of file without a terminator: it
-        // then ends at `end` as if an LF were there.
-        if s.n % 5 == 4 && eof && inside == 0 {
-            (s.at[s.n], s.n) = (end as u32, s.n + 1);
+        self.records(b, &mut s, aggs)?;
+        // The final record may end at end of file without a terminator.
+        if s.n == 4 && eof && inside == 0 {
+            self.parse(b, &mut s, 0, end, 0).ok_or(Fail::Malformed)?;
+            self.join(b, &mut s.batch[..1], aggs)?;
+            (s.n, s.record) = (0, end);
         }
-        self.records(b, &mut s, aggs, if eof { end } else { usize::MAX })?;
-        // (Past `end` only after a final record without a terminator.)
-        let whole = s.n == 0 && s.record >= end;
+        let whole = s.n == 0 && s.record == end;
         whole.then_some(u64::from(quotes)).ok_or(Fail::Malformed)
     }
 
@@ -139,21 +141,15 @@ impl Shared<'_> {
         ok.then_some(q + crlf + 1).ok_or(Fail::Malformed)
     }
 
-    /// Parses, joins and counts the records whose five separators (four
-    /// commas, then an LF, or the end of the file at `eof`) have all been
-    /// seen. Parsing the whole batch before joining any of it lets the
-    /// region-map loads, which mostly miss the cache, overlap.
-    fn records(
-        &self,
-        b: &[u8],
-        s: &mut Separators,
-        aggs: &mut [Agg],
-        eof: usize,
-    ) -> Result<(), Fail> {
+    /// Parses and joins the records whose five separators (four commas,
+    /// then an LF) have all been seen. Parsing the whole batch before
+    /// joining any of it lets the region-map loads, which mostly miss the
+    /// cache, overlap.
+    fn records(&self, b: &[u8], s: &mut Separators, aggs: &mut [Agg]) -> Result<(), Fail> {
         let done = s.n / 5;
         for r in 0..done {
-            let lf = s.at[5 * r + 4] as usize;
-            let parsed = (b[lf] == b'\n' || lf == eof) && self.parse(b, s, 5 * r, lf, r).is_some();
+            let lf = s.base + s.at[5 * r + 4] as usize;
+            let parsed = b[lf] == b'\n' && self.parse(b, s, 5 * r, lf, r).is_some();
             if !parsed {
                 return Err(Fail::Malformed);
             }
@@ -163,19 +159,14 @@ impl Shared<'_> {
         s.at.copy_within(5 * done..s.n, 0);
         s.quotes.copy_within(5 * done..s.n, 0);
         s.n -= 5 * done;
-        for r in &mut s.batch[..done] {
-            r.group = self.regions.group(r.region);
-            let sums = [1, r.id, r.cents, 0, r.name_len, r.note_len];
-            aggs[usize::from(r.group)].add(sums, r.cents, r.cents);
-        }
-        self.names.count(b, &s.batch[..done], aggs)
+        self.join(b, &mut s.batch[..done], aggs)
     }
 
     /// Parses into `s.batch[r]` the record starting at `s.record`, whose
     /// commas are separators `k..k + 4` and whose terminator (or the end of
     /// file) is at `end`.
     fn parse(&self, b: &[u8], s: &mut Separators, k: usize, end: usize, r: usize) -> Option<()> {
-        let [c0, c1, c2, c3] = [0, 1, 2, 3].map(|j| s.at[k + j] as usize);
+        let [c0, c1, c2, c3] = [0, 1, 2, 3].map(|j| s.base + s.at[k + j] as usize);
         if [c0, c1, c2, c3].iter().any(|&c| b[c] != b',') {
             return None;
         }
@@ -189,6 +180,17 @@ impl Shared<'_> {
         (out.start, out.len, out.region) = (start, len, region);
         (out.id, out.cents, out.name_len, out.note_len) = (id, cents, name_len, note_len);
         Some(())
+    }
+
+    /// Joins parsed records to their groups, adds them into `aggs`, and
+    /// counts their names.
+    fn join(&self, b: &[u8], batch: &mut [Record], aggs: &mut [Agg]) -> Result<(), Fail> {
+        for r in batch.iter_mut() {
+            r.group = self.regions.group(r.region);
+            let sums = [1, r.id, r.cents, 0, r.name_len, r.note_len];
+            aggs[usize::from(r.group)].add(sums, r.cents, r.cents);
+        }
+        self.names.count(b, batch, aggs)
     }
 }
 
@@ -253,25 +255,19 @@ fn prefix_xor(mut x: u64) -> u64 {
     x
 }
 
-/// The decimal integer that is exactly `b[start..end]` (one digit or more).
-/// Its length is known, so the digits are checked and converted eight at a
-/// time with no per-digit branch (SWAR): one step for every number the spec
-/// allows.
+/// The decimal integer that is exactly `b[start..end]`. Its length is
+/// known, so up to eight digits are checked and converted in one step.
 #[inline(always)]
-pub fn number(b: &[u8], start: usize, end: usize) -> Option<u64> {
-    let mut value = (end > start).then_some(0u64)?;
-    for p in (start..end).step_by(8) {
-        // Shift the n digits to the top: the bytes after them fall off, and
-        // the vacated low bytes read as leading zeros.
-        let (values, other) = classify(load(b, p));
-        let shift = 64 - 8 * (end - p).min(8);
-        (other << shift == 0).then_some(())?;
-        let scale = 10u64.pow((end - p).min(8) as u32);
-        value = value
-            .checked_mul(scale)?
-            .checked_add(eight_digits(values << shift))?;
+fn number(b: &[u8], start: usize, end: usize) -> Option<u64> {
+    let n = end.checked_sub(start).filter(|&n| n > 0)?;
+    if n > 8 {
+        return uint(b, start).and_then(|(value, stop)| (stop == end).then_some(value));
     }
-    Some(value)
+    // Shift the n digits to the top: the bytes after the field fall off,
+    // and the vacated low bytes read as leading zeros.
+    let (values, other) = classify(load(b, start));
+    let shift = 64 - 8 * n;
+    (other << shift == 0).then(|| eight_digits(values << shift))
 }
 
 /// The amount `-?[0-9]+\.[0-9]{2}` that is exactly `b[start..end]`, in cents.
@@ -290,11 +286,33 @@ pub fn load(b: &[u8], p: usize) -> u64 {
     u64::from_le_bytes(b[p..p + 8].try_into().unwrap())
 }
 
+/// A run of one or more ASCII digits at `start` as `(value, end)`, eight
+/// digits per step with no per-digit branch (SWAR).
+pub fn uint(b: &[u8], start: usize) -> Option<(u64, usize)> {
+    let (mut value, mut p) = (0u64, start);
+    loop {
+        let (w, other) = classify(load(b, p));
+        let n = other.trailing_zeros() as usize / 8;
+        if n > 0 {
+            // Shift the n digits to the top, so the vacated low bytes act as
+            // leading zeros, and convert all eight lanes at once.
+            let digits = eight_digits(w << (64 - 8 * n));
+            value = value
+                .checked_mul(10u64.pow(n as u32))?
+                .checked_add(digits)?;
+        }
+        p += n;
+        if n < 8 {
+            return (p > start).then_some((value, p));
+        }
+    }
+}
+
 /// The bytes of `w` minus '0', and bit 7 set in every byte that is not a
 /// digit. Digits become 0 to 9; any other byte becomes 10 or more (or wraps
 /// to 0xD0 or more), which adding 0x76 lifts to bit 7. Borrows and carries
 /// only move towards later bytes, so bytes up to and including the first
-/// non-digit are classified correctly, which is all `number` relies on.
+/// non-digit are classified correctly, which is all the callers rely on.
 fn classify(w: u64) -> (u64, u64) {
     let values = w.wrapping_sub(ZEROS);
     (values, (values.wrapping_add(TENS) | values) & HIGH)
