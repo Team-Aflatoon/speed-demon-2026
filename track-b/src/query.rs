@@ -307,7 +307,7 @@ impl Table {
         let ids = 1 + words + threads * ID_BLOCK as usize;
         // The binding limit on ids: a posting holds the partition-local term
         // number (id / 64) in 16 bits, so ids stay under 2^22. The id field of
-        // a value (24 bits) and of a BOOL step (30 bits) are looser. 50,000
+        // a value is the same 22 bits (`ID_MASK`); that of a BOOL step (30 bits) is looser. 50,000
         // queries hold at most 400,000 words.
         if ids > MAX_IDS {
             let most = MAX_IDS - 1 - threads * ID_BLOCK as usize;

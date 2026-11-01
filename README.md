@@ -8,27 +8,30 @@ We entered all four tracks. Each one is a standalone Rust program with **no depe
 
 Seed 1, single runs on the organisers' scoring machine; final scoring uses a private holdout seed and five runs. Every row below is a board run that passed the output check on seed 1. Run IDs are listed in each track's `PERF.md`.
 
-**The shipped code** (the commit each track folder holds now; board runs of the final repository state, commit eba990a, plus the earlier run of the same code where there is one):
+**The shipped code** (the final build of each track, with its code commit or version; its board run, plus the earlier runs of the same code where there are any):
 
 | Track | Code commit | Final board run | T | M | S | D | K | Points | Earlier run of this code | Reference | Speedup |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| A · Ingest | d0fa7bb | run-8fc3ec9b48d1 | 21.1 ms | 18.3 MB | 532 | 1 | 46.02 | 83.15 | run-996cb0022b51 20.4 ms, run-361c33ed2406 20.9 ms | 32.05 s | about 1,550x |
-| B · Index | 129b96e | run-9316371871a2 | 186.5 ms | 36.6 MB | 1299 | 1 | 25.51 | 70.33 | run-3ae92ad95108 186.0 ms, run-f30168793c18 192.3 ms | 56.35 s | about 302x |
-| C · Join | fbf7e89 | run-d79219fb688a | 48.5 ms | 12.3 MB | 768 | 1 | 25.38 | 70.22 | run-31b13fc9019b 48.9 ms, run-8721232bf1f2 50.5 ms (5f8b6df, S 767) | 14.44 s | about 298x |
+| A · Ingest | 32b49b8 | run-8fc3ec9b48d1 | 21.1 ms | 18.3 MB | 532 | 1 | 46.02 | 83.15 | run-996cb0022b51 20.4 ms (K 46.93), run-361c33ed2406 20.9 ms | 32.05 s | about 1,520x |
+| B · Index | v5.1 (1f63325) | run-438bfabbceeb | 113.6 ms | 36.3 MB | 1,689 | 1 | 31.43 | 74.87 | none yet | 56.35 s | about 496x |
+| C · Join | v5.2 | run-52c515f71c76 | 32.4 ms | 16.7 MB | 882 | 1 | 28.60 | 72.82 | none yet | 14.44 s | about 446x |
 | D · Traverse | a74853d | run-60e7bb6f9004 | 141.8 ms | 70.5 MB | 618 | 1 | 25.22 | 70.08 | run-79d73088c3c3 143.1 ms, run-053708dfffa2 148.6 ms (13b0490, S 600) | 72.69 s | about 513x |
 
 Points are 50 × log10(K), worked out from the board's K.
 
-**The same algorithms before the last hardening and error-message changes**, for the record. These were measured on earlier commits with fewer lines:
+**Earlier builds**, for the record. A and D below are the same algorithms before the last hardening and error-message changes, measured on earlier commits with fewer lines; B and C are the builds before their second-round redesigns:
 
 | Track | Build | Board runs | T | M | K |
 |---|---|---|---|---|---|
 | A | 1cd61cf, S 514 | run-2491c9d07251, run-237f722dfeb2 | 20.0 and 20.1 ms (median 20.05) | 18.0 MB | 47.72, 47.67 |
-| B | same output code, S 1269 | run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5 | 188.7, 187.6 and 188.6 ms (median 188.6) | 36.2 MB | 25.46 (median) |
-| C | v4.1, S 734 | run-0fc0507654be | 49.1 ms | 12.1 MB | 25.47 |
+| B | v5, S 1,562 | run-407d7d7d6411 | 125.9 ms | 36.1 MB | 30.21 |
+| B | v4.2, S 1,299 | run-9316371871a2, run-3ae92ad95108, run-f30168793c18 | 186.0 to 192.3 ms | 36.1 to 36.6 MB | 25.1 to 25.5 |
+| C | v5.1, S 858 | run-658779ed2eee | 33.8 ms | 16.3 MB | 28.25 |
+| C | v5, S 827 | run-41dfe519e529 | 37.4 ms | 16.9 MB | 26.81 |
+| C | v4.2, S 767 | run-d79219fb688a, run-31b13fc9019b, run-8721232bf1f2 | 48.5 to 50.5 ms | 12.3 to 12.6 MB | 25.15 to 25.38 |
 | D | v4, S 551 | median of five runs; best run-1d538165ea54 | median 142.1 ms (140.4 to 147.9); best 140.4 ms | 70.4 MB | best 25.80 |
 
-The shipped builds have a slightly lower K on A, C and D (B's is within noise): the added code (input checks, error messages naming the offending path or byte, notes on the fallbacks) costs lines, and the T differences between the two tables are within the board noise described below. We ship them because an input we have never seen must fail loudly and say why. Track C's shipped build also carries the race fix described under Correctness.
+The shipped builds of A and D have a slightly lower K than their earlier builds: the added code (input checks, error messages naming the offending path or byte, notes on the fallbacks) costs lines, and the T differences are within the board noise described below. B and C were redesigned after that and are well ahead of their earlier builds (K 25.5 to 31.43 and 25.4 to 28.60). We ship them because an input we have never seen must fail loudly and say why. Track C's shipped build also carries the race fix described under Correctness.
 
 ### Red runs in our board history
 
@@ -52,8 +55,8 @@ A red run is a deliberate wrong-output probe (or, on Track A, two probes that ab
 | Track | Task | Folder | Approach in one line |
 |---|---|---|---|
 | A · Ingest | 3.1M log lines → per-hour, per-endpoint counts, p50/p95/p99 and 5xx rate | [`track-a/`](track-a/) | Eleven workers read 128 KB pieces with `pread`, turn each line into a 4-byte record in its hour's log, and report each hour while parsing; exact counts prove the early reports were safe, otherwise the job reruns |
-| B · Index | 50,000 boolean and phrase queries over a 250 MB corpus | [`track-b/`](track-b/) | Index only the terms that appear in `queries.txt`; phrases are checked during the scan at a rare anchor term (no positions stored), postings are built per 8 MB segment, and one task queue keeps all 12 threads busy |
-| C · Join | Hostile CSV (quotes, embedded newlines, CRLF, BOMs) joined to a lookup table | [`track-c/`](track-c/) | AVX2 bitmask CSV parser (prefix-XOR quote mask) over 64 KiB `pread` pieces, chunk cuts guessed and then verified by quote parity, and one lock-free name table with a shared bitset for the distinct counts |
+| B · Index | 50,000 boolean and phrase queries over a 250 MB corpus | [`track-b/`](track-b/) | Index only the terms that appear in `queries.txt`; phrases are checked during the scan at a rare anchor term (no positions stored), postings are built per 12 MB segment, and one task queue keeps all 12 threads busy |
+| C · Join | Hostile CSV (quotes, embedded newlines, CRLF, BOMs) joined to a lookup table | [`track-c/`](track-c/) | AVX2 bitmask CSV parser (prefix-XOR quote mask) over 64 KiB `pread` pieces, chunk cuts guessed and then verified by quote parity, and a read-mostly lock-free name table; each record appends a private (name, group) pair, and the distinct counts come from an L1-resident bitset after one barrier |
 | D · Traverse | 2,000 shortest-path queries on a 5M-edge weighted digraph | [`track-d/`](track-d/) | Bucketed parallel CSR build without atomics and 4-byte edges, BFS renumbering for cache locality, then bidirectional Dijkstra with a radix heap on 12 threads |
 
 Every track folder holds what the rules ask for: `Dockerfile`, `.speed-demon.toml`, `README.md` (approach, dependencies, next 24 hours), `PERF.md` (the optimisation log, with live-board run IDs) and the source.
@@ -66,7 +69,7 @@ Speed that is wrong scores zero, and the final data is a seed we have never seen
 - **Adversarial, spec-valid inputs.** Hand-written edge cases and hostile files: shuffled, reversed and late-line logs, huge records, records longer than a read buffer, malformed lines the reference also rejects.
 - **Every fallback forced.** A's rerun, B's segment splitting, C's single-chunk reparse and table regrowth, D's 64-bit retry were each triggered on purpose and produced the right bytes.
 - **A holdout-safety audit.** We listed every fixed limit in all four programs and checked it against what the spec guarantees for any seed; Track B had one limit that was only safe in practice (at most 65,536 documents per segment), and it now holds for any valid input.
-- **A concurrency audit.** We wrote down the publication protocol of every shared structure in Tracks A, B and D (A's endpoint table, hour logs and speculative count check; B's lock-free term table and task queue; D's thread team, BFS claim ids and per-thread searches) and argued each one correct. Then we stress-tested them: 5,200 runs of the real images on seeds 1, 7, 101 and 202, plus 3,000 runs of copies with random sleeps and yields injected inside the suspected race windows (2,200 on A, 450 on B, 350 on D). 0 wrong outputs, crashes or hangs. Track C's protocol is covered by the race fix below and 450 stress runs of the fixed build.
+- **A concurrency audit.** We wrote down the publication protocol of every shared structure in Tracks A, B and D (A's endpoint table, hour logs and speculative count check; B's lock-free term table and task queue; D's thread team, BFS claim ids and per-thread searches) and argued each one correct. Then we stress-tested them: 5,200 runs of the real images on seeds 1, 7, 101 and 202, plus 3,000 runs of copies with random sleeps and yields injected inside the suspected race windows (2,200 on A, 450 on B, 350 on D). 0 wrong outputs, crashes or hangs. Track C's v4 protocol is covered by the race fix below and 450 stress runs of the fixed build. The new B and C designs (v5.1 and v5.2) then passed a fresh concurrency review with 2,400 stress runs plus 500 race-injection runs, 0 wrong.
 - **Fail loudly.** We accepted a few dozen extra lines per track (S rose by 18 to 49) so that an input the generator never writes fails with a clear message and exit 1 instead of a panic or a wrong answer; this is the one place we spent K on purpose.
 - **The one real bug our own stress testing caught.** Track C's v4 had a 1-in-100 publication race in its lock-free name table: a slot's hash word briefly overwrote its `meta` word, so another core could take the slot for a published one of a different length and insert the same name twice, which changed one distinct count by one. A 300-run stress test of the submitted image found it, and the fix was one line (write only the three name words). It matters because final scoring needs all five runs correct: at 1 in 100 that is about a 5% chance of a zero. The board never showed it, since each board run is a single run. Details in [`track-c/PERF.md`](track-c/PERF.md).
 - **Judge-style reviews.** We reviewed each track against the official criteria (code quality, technique, optimisation log), fixed what came up, and re-verified before every push.
@@ -77,6 +80,7 @@ Speed that is wrong scores zero, and the final data is a seed we have never seen
 - **Every speed decision settled on the scoring box.** Our laptop and the box disagree (see above): several changes that were 20 to 25% faster locally were no faster there. Local timings only chose candidates; board runs decided.
 - **Box ablation probes.** The board records time and memory even when the output is wrong, so we pushed deliberately incomplete builds (read the file only, parse without the name table, build the graph without the queries). They fail the hash on purpose and are the red runs above. Subtracting their times gave the cost of each phase on the real machine.
 - **Correct head-to-head candidates after that.** Once a question was answered we stopped probing and compared complete, correct builds back to back (for example `pread` against `mmap` in Track A: 24.5 ms down to 20.7 ms).
+- **Second-round redesigns on B and C, each judged head to head on the box:** B 186 → 113.6 ms, C 48.5 → 32.4 ms.
 - **We rejected faster builds when they cost more than they earned.** The formula penalises code size and memory, so a build that gained 2 to 3% in T but added 100 lines or a few MB lost K. Track D's one-parse build (140.3 ms, S 551 to 662) and its page-fault-reduction builds (about 2 to 3% faster, +2.5 MB and S 589 to 609) were dropped for that reason, as were Track C's owner-partitioned names (20 to 25% faster locally, no faster on the box, S 889) and its half-load name table (faster, but about 7 MB more).
 
 ## How it is scored

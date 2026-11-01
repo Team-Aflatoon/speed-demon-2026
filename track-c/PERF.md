@@ -123,7 +123,7 @@ The probes (above) split v4.2's 48.5 ms on the box into: scan 12.7 ms (with proc
 
 **Distinct names in two phases** (`names.rs`), so that the hot path never writes a line another core reads.
 
-- Phase 1, while parsing: every name is interned in one shared lock-free table, and the slot index is the name's id. The table is read-mostly after the first few percent of the file. The record then appends its (id, group) pair, 16 bits, to a bucket in its own worker's arena: bucket `id >> 8`, entry `group << 8 | id & 255`. These are private stores to a few hot lines. Arenas are chains of 256-byte blocks, lazily backed, and the expected share is faulted in at start-up with one `MADV_POPULATE_WRITE`.
+- Phase 1, while parsing: every name is interned in one shared lock-free table, and the slot index is the name's id. The table is read-mostly after the first few percent of the file. The record then appends its (id, group) pair, 16 bits, to a bucket in its own worker's arena: bucket `id >> 8`, entry `group << 8 | id & 255`. These are private stores to a few hot lines. Arenas are chains of 128-byte blocks (a 32-bit link and 62 entries), lazily backed, and the expected share is faulted in at start-up with one `MADV_POPULATE_WRITE`.
 - Phase 2, after one barrier: workers claim buckets. A bucket's pairs from all 12 arenas are counted against an 8 KiB bitset (256 ids x 256 groups) that stays in L1. A new bit is a new distinct pair, and every entry also adds its record and its name's unescaped length to the group. Phase 2 takes about 0.5 ms locally.
 - Unlike row 28's owner-partitioned build, no pair is sent to another worker while parsing: the arenas are private and are read only after the barrier, so no worker waits for another during phase 1.
 
@@ -142,7 +142,7 @@ The probes (above) split v4.2's 48.5 ms on the box into: scan 12.7 ms (with proc
 - Amounts with up to 5 integer digits convert in one SWAR step, with the dot shifted out.
 - Records are handled in windows of 2 KiB. Pass 1 parses fields and prefetches the region-map byte and the name-table line; pass 2 joins, aggregates, interns and appends.
 - Every record must be 4 commas + LF outside quotes with valid digits, and the LFs outside quotes must equal the number of records. A quote misplaced inside an unquoted field is not diagnosed.
-- Numbers of more than 8 digits saturate, so a huge region id is simply unknown, as the reference treats it. v4.2 rejected that case.
+- Numbers of more than 8 digits only take the slow path; a value past u64::MAX saturates at u64::MAX, so a huge region id is simply unknown, as the reference treats it. v4.2 rejected that case.
 
 **Start-up** (`run.rs`). The first threads up claim small tasks: six 512 KiB stretches of the name table to populate, and 32 pieces of regions.csv. Workers wait only for those tasks, not for the last thread to start; late threads just join phase 1. `prctl(PR_SET_THP_DISABLE)` runs first. records.csv is still read with pread in 64 KiB pieces, which the box measured faster than mmap (rows 32 and 33).
 
@@ -187,5 +187,5 @@ The design notes record no failed v5 experiment of their own; the failed tries i
 Not done:
 
 - Instructions are about 634 per record and spread thin: pass 1 about 260, block scan about 68, flatten + pass 2 about 160, slow lookups about 50, phase 2 about 20. Bounds checks are about 20 per record. PCLMULQDQ for the prefix XOR would save about 8 per block but needs a target feature beyond x86-64-v3 (row 22 saw no gain from it).
-- Memory: 256-byte pair blocks leave about 1 MB of partly filled blocks; 128-byte blocks would halve that at the cost of longer chains in phase 2. The region map could be a rank bitmap (about 0.4 MB instead of 1 MB).
+- Memory: the 128-byte pair blocks leave about 0.5 MB of partly filled blocks, half of what 256-byte blocks left. The region map could be a rank bitmap (about 0.4 MB instead of 1 MB).
 - S could drop further: rustfmt explodes every struct literal over 18 characters.

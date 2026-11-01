@@ -18,18 +18,23 @@ Live board, seed 1, single runs on the scoring machine; final scoring uses a pri
 
 | Track | Run | T | M | S | K | Points | Reference | Speedup |
 |---|---|---|---|---|---|---|---|---|
-| A | run-996cb0022b51 | 20.4 ms | 18.2 MB | 532 | 46.93 | 83.57 | 32.05 s | about 1,570x |
-| B | run-3ae92ad95108 | 186.0 ms | 36.1 MB | 1299 | 25.54 | 70.36 | 56.35 s | about 303x |
-| C | run-31b13fc9019b | 48.9 ms | 12.6 MB | 767 | 25.15 | 70.03 | 14.44 s | about 295x |
-| D | run-053708dfffa2 | 148.6 ms | 70.5 MB | 600 | 24.75 | 69.68 | 72.69 s | about 489x |
+| A | run-8fc3ec9b48d1 (also run-996cb0022b51, run-361c33ed2406) | 21.1 ms (20.4 to 21.1) | 18.3 MB | 532 | 46.02 (46.0 to 46.9) | 83.15 | 32.05 s | about 1,520x |
+| B (v5.1) | run-438bfabbceeb | 113.6 ms | 36.3 MB | 1,689 | 31.43 | 74.87 | 56.35 s | about 496x |
+| C (v5.2) | run-52c515f71c76 | 32.4 ms | 16.7 MB | 882 | 28.60 | 72.82 | 14.44 s | about 446x |
+| D | run-60e7bb6f9004 (also run-79d73088c3c3, run-053708dfffa2) | 141.8 ms (141.8 to 148.6) | 70.5 MB | 618 | 24.75 to 25.22 | 69.68 to 70.08 | 72.69 s | about 513x |
 
-**Before the last hardening and error-message changes** (fewer lines, same algorithms):
+Second-round redesigns on B and C, each judged head to head on the box: B 186 → 113.6 ms, C 48.5 → 32.4 ms.
+
+**Earlier builds:**
 
 | Track | Build | T | M | K |
 |---|---|---|---|---|
 | A | S 514, two runs | 20.0 and 20.1 ms | 18.0 MB | 47.72, 47.67 |
-| B | S 1269, median of three | 188.6 ms | 36.2 MB | 25.46 |
-| C | v4.1, S 734 | 49.1 ms | 12.1 MB | 25.47 |
+| B | v5, run-407d7d7d6411 | 125.9 ms | 36.1 MB | 30.21 |
+| B | v4.2 | 186.0 to 192.3 ms | 36.1 to 36.6 MB | 25.1 to 25.5 |
+| C | v5.1, run-658779ed2eee | 33.8 ms | 16.3 MB | 28.25 |
+| C | v5, run-41dfe519e529 | 37.4 ms | 16.9 MB | 26.81 |
+| C | v4.2 | 48.5 to 50.5 ms | 12.3 to 12.6 MB | 25.15 to 25.38 |
 | D | v4, S 551, median of five (140.4 to 147.9); best run | 142.1 ms; 140.4 ms | 70.4 MB | best 25.80 |
 
 D = 1 on every track. Every run ID is in its track's PERF.md. Red runs in our history are all deliberate probes (README, "Red runs").
@@ -127,7 +132,7 @@ The formula penalises code size and memory, so a faster build is not automatical
 | v7 report while parsing | 24.5 ms | run-d96b1571240a |
 | pread instead of mmap | 20.7 ms | run-cbad326faf08 |
 | Before hardening (S 514) | 20.0 ms, 18.0 MB, K 47.72 | run-2491c9d07251 |
-| **Shipped (S 532)** | **20.4 ms, 18.2 MB, K 46.93** | run-996cb0022b51 |
+| **Shipped (S 532)** | **20.4 to 21.1 ms, 18.2 to 18.3 MB, K 46.0 to 46.9** | run-996cb0022b51, run-361c33ed2406, run-8fc3ec9b48d1 |
 
 ---
 
@@ -138,7 +143,7 @@ The formula penalises code size and memory, so a faster build is not automatical
 **Design**
 - The queries are input: index only their terms, in one lock-free hash table
 - A phrase needs no index: it is checked during the scan at its rarest-query term
-- Postings built per 8 MB segment; one task queue (scan, build, answer) with no idle phase boundary
+- Postings built per 12 MB segment; one task queue (scan, build, answer) with no idle phase boundary
 
 **Decisive steps (board)**
 
@@ -147,10 +152,11 @@ The formula penalises code size and memory, so a faster build is not automatical
 | v1 query terms only | 309 ms | 59.7 MB | run-7450e3d4343b |
 | v2-v3 THP off, bitmap stripes | about 303 ms | 39.1 MB | run-43f854129993 |
 | v4 redesign | 184.3 ms | 35.8 MB | run-64a666bd15fb |
-| Before the last changes (S 1269), median of three | 188.6 ms | 36.2 MB | run-6a7f77612f9d and two more |
-| **Shipped (S 1299)** | **186.0 ms** | **36.1 MB** | run-3ae92ad95108 |
+| v4.2 (S 1299) | 186.0 ms | 36.1 MB | run-3ae92ad95108 |
+| v5 branch-free term table, leaner token loop (S 1,562) | 125.9 ms | 36.1 MB | run-407d7d7d6411 |
+| **v5.1, shipped (S 1,689)** | **113.6 ms** | **36.3 MB** | run-438bfabbceeb |
 
-K 25.54 shipped. v4.1/v4.2 made every capacity provable for any valid input.
+K 31.43 shipped, 74.87 points (v4.2: K 25.5). v4.1/v4.2 made every capacity provable for any valid input; v5 and v5.1 are the second-round redesign, with output byte-identical to v4.2's.
 
 ---
 
@@ -161,7 +167,7 @@ Hostile CSV (quotes, embedded newlines, CRLF, BOMs) joined to a lookup table. Re
 **Design**
 - AVX2 bitmasks per 64-byte block; the prefix XOR of the quote mask marks what is inside quotes
 - Chunk cuts are guessed (an LF followed by a digit), then proven by quote parity; if not, one worker reparses the whole file
-- One lock-free name table; a shared bitset gives exact distinct counts
+- v5 onward: names go into a read-mostly lock-free table, each record appends a private (name, group) pair, and exact distinct counts come from an L1-resident bitset after one barrier
 
 **Decisive steps (board)**
 
@@ -171,9 +177,12 @@ Hostile CSV (quotes, embedded newlines, CRLF, BOMs) joined to a lookup table. Re
 | v2 bitmask parser, 24-byte keys | 52.8 ms | 12.1 MB | run-be5f1e4a22bf |
 | pread instead of mmap | 49.3 ms | 14.1 MB | run-2890a0259c6b |
 | v4.1, the race fix (S 734) | 49.1 ms | 12.1 MB | run-0fc0507654be |
-| **Shipped, v4.1 plus error paths (S 767)** | **48.9 ms** | **12.6 MB** | run-31b13fc9019b |
+| v4.2, plus error paths (S 767) | 48.9 ms | 12.6 MB | run-31b13fc9019b |
+| v5 two-phase distinct names (S 827) | 37.4 ms | 16.9 MB | run-41dfe519e529 |
+| v5.1 (S 858) | 33.8 ms | 16.3 MB | run-658779ed2eee |
+| **v5.2, shipped (S 882)** | **32.4 ms** | **16.7 MB** | run-52c515f71c76 |
 
-K 25.15 shipped. A faster-looking owner-partitioned design failed on the box (run-0caa577fd90b) and was reverted.
+K 28.60 shipped, 72.82 points (v4.2: K 25.15). A faster-looking owner-partitioned design failed on the box (run-0caa577fd90b) and was reverted.
 
 ---
 
@@ -195,9 +204,9 @@ K 25.15 shipped. A faster-looking owner-partitioned design failed on the box (ru
 | THP opt-out | | 79.8 MB | run-bf037ba42528 |
 | 32-bit searches, leaner BFS | | 70.8 MB | run-184dcb5b4f5a |
 | v4 before hardening (S 551): median of five; best | 142.1 ms; 140.4 ms | 70.4 MB | run-1d538165ea54 (best) |
-| **Shipped (S 600)** | **148.6 ms** | **70.5 MB** | run-053708dfffa2 |
+| **Shipped (S 618)** | **141.8 to 148.6 ms** | **70.5 MB** | run-60e7bb6f9004, run-79d73088c3c3, run-053708dfffa2 |
 
-K 24.75 shipped (best v4 run: 25.80). Probes and head-to-heads (one parse, pread, smaller buckets, clean-room rework) all kept the v4 algorithm.
+K 24.75 to 25.22 shipped (best v4 run: 25.80). Probes and head-to-heads (one parse, pread, smaller buckets, clean-room rework) all kept the v4 algorithm.
 
 ---
 
@@ -210,6 +219,7 @@ Speed that is wrong scores zero, and the final data is a seed we have never seen
 - Every fallback forced on purpose and checked for the right bytes
 - Holdout-safety audit of every fixed limit; one Track B limit made provably safe
 - Concurrency audit of A, B and D: every shared protocol argued correct, then 5,200 real runs + 3,000 with injected delays, 0 wrong
+- The new B and C designs passed a fresh concurrency review with 2,400 stress runs plus 500 race-injection runs, 0 wrong
 
 | Track | Fallback we forced |
 |---|---|
@@ -225,7 +235,7 @@ Speed that is wrong scores zero, and the final data is a seed we have never seen
 ## Lessons
 
 - Measure on the target machine; a local win is only a hypothesis
-- Remove repeated work before tuning loops (Track B: 39% against 3%)
+- Remove repeated work before tuning loops (Track B: 39% against 3%), and redesign again once the box says where the time goes (B 186 to 113.6 ms, C 48.5 to 32.4 ms)
 - Phase structure and kernel work (faults, barriers, copies) set T, not instruction counts
 - Memory behaves differently on the box too: transparent huge pages cost Track D 93.5 MB instead of 79.8 MB
 - Test deliberately incomplete builds: subtraction beats guessing
@@ -239,7 +249,7 @@ Speed that is wrong scores zero, and the final data is a seed we have never seen
 
 - A: a one-pass selection from a small sorted sample; a pre-faulted pool of log pages; a leaner line path (about 140 instructions a line)
 - B: hide the 6 ms query parse behind the first scan tasks; a direct table for one- and two-byte tokens
-- C: avoid the shared atomic OR (about 7% of CPU); a leaner per-record path, measured on the box
+- C: a leaner per-record path (about 634 instructions a record before v5.2), measured on the box
 - D: find why the counting sort costs 4 to 5 times more on the box; lower the two memory peaks together
 
 Thank you.

@@ -37,8 +37,9 @@ Ids are block-dense: each thread takes 1,024 at a time from a shared counter and
 in order, so an id costs no shared counter per term and each thread leaves at most one block
 partly unused. The table has a slot for every query word (the bucket count is the word count
 over three, rounded up to a power of two, and at least 1,024), so it can never fill up,
-whatever the input; on seed 1 it is 4 MiB. Its memory and the per-id arrays come from
-`mmap(MAP_POPULATE)`, which the kernel maps and zeroes in one go.
+whatever the input; on seed 1 it is 4 MiB. The buckets come from `mmap(MAP_POPULATE)`, which
+the kernel maps and zeroes in one go; the per-id arrays are plain anonymous mappings, faulted in
+only where ids are.
 
 **Term keys and the probe.** A token of up to 16 bytes is its own key: its bytes `| 0x20`
 (which lowercases letters and leaves digits alone), zero padded, so no two tokens share a key.
@@ -67,13 +68,13 @@ a document the program keeps the term id of every token (id 0 for tokens that ar
 term). When the document ends, each phrase anchored at one of its tokens is compared with the
 ids around that token. Positions are never stored and no document is read twice.
 
-**Reading and lexing.** `docs.txt` is read with `pread` into a 128 KB buffer per thread, cut
+**Reading and lexing.** `docs.txt` is read with `pread` into a buffer per thread, 64 KB at a time, cut
 at the last line end, with the partial line carried to the next read. Each 64-byte block
 becomes three bitmasks (token bytes, LFs and TABs) from a few AVX2 compares. Every line starts
 with "id TAB", so a prefix XOR of the LF and TAB bits marks exactly those bytes and the ids
 never become tokens; the XOR is skipped for the 94% of blocks with no LF or TAB. Token starts
-and ends go into one alternating list of bounds (24 positions written unconditionally, then a
-loop for the rest of a dense block). At each LF the lexer counts the tokens before it, so a
+and ends go into one alternating list of bounds (`flatten` writes the positions of the set bits
+eight to a byte, for all 64 positions of a block, with no branches). At each LF the lexer counts the tokens before it, so a
 document's end is a token index and the scan needs no per-token boundary test.
 
 **The token loop** (`Scanner::region`) takes tokens 64 at a time in two passes. Pass A makes
@@ -82,12 +83,15 @@ home bucket, and prefetches that bucket, so the cache misses of rare words overl
 looks the tokens up and records them in runs that end at a batch or a document boundary
 (`Doc::record`), with its counters in locals and unchecked stores behind one capacity assert
 per run. Recording is branch-free: every id is written to `fresh` and kept only if it is a
-BOOL term not yet seen in the document (a bitset over ids), and every token is written to
-`hits` and kept only if it anchors a phrase. The table's buckets and mask are copied into a
-`Lookup` value, so the loop keeps them in registers. A document's `ids`, `fresh` and `hits`
+BOOL term not yet seen in the document (a `u8` stamp per id, which holds the number of the last
+document that saw it; the stamps are cleared only when the 255 numbers run out). Every token's
+id goes into `ids` with the term's `ANCHOR` bit, and at the end of the document `anchors()`
+reads that bit eight ids at a time to find the tokens that anchor a phrase, so there is no
+separate list of hits. The table's buckets and mask are copied into a
+`Lookup` value, so the loop keeps them in registers. A document's `ids` and `fresh`
 arrays grow to the longest document, not to the size of a read.
 
-**Postings.** The corpus is cut into segments of about 8 MB (some 8,000 documents), and
+**Postings.** The corpus is cut into segments of about 12 MB, and
 documents are numbered from 0 within a segment as `u16`. At the end of each document the scan
 writes its distinct BOOL terms as `doc << 16 | id / 64` into one of 64 streams, chosen by
 `id % 64`. One build task per stream counting-sorts it into a sorted list per term and adds a
@@ -113,9 +117,9 @@ are double buffered by segment parity, so threads go on scanning the next segmen
 last one is built and answered, and no thread idles at a phase boundary.
 
 **Start-up.** While the workers parse the queries and fill the table, the main thread plans
-the segments (line starts found with a few small reads). `queries.txt` is read into a buffer
-with its padding already reserved, so there is no regrowth copy; the per-term use count lives in
-the term's value word, so there is no shared per-id frequency array for the threads to fight
+the segments (line starts found with a few small reads). `queries.txt` is mapped read-only
+(`MAP_POPULATE`, over a zeroed page that supplies the padding), so there is no copy into a
+buffer; the per-term use count lives in the term's value word, so there is no shared per-id frequency array for the threads to fight
 over. A worker's scratch is not freed at exit, because each unmap would flush every core's TLB
 and the process is about to end.
 
@@ -174,9 +178,8 @@ binary statically so that a run never pays for the dynamic loader.
 
 ## With another 24 hours
 
-- The start-up before the scan can begin is about 4.7 ms of wall time locally: four barriers, a
-  table filled by all threads, and the inserts' cache misses (prefetching ahead made no
-  difference). Letting the first scan tasks read and lex the corpus (which needs no table)
+- The start-up before the scan can begin is about 4.7 ms of wall time locally: two barriers, a table filled by
+  all threads, and the inserts' cache misses (prefetching ahead made no difference). Letting the first scan tasks read and lex the corpus (which needs no table)
   while the table is filled would hide most of it.
 - Lookup and record are about 25-29% of the CPU time, eval about 15%, finish (emission and
   phrase checks) about 10% and the lexer 9-13%; no single piece is large any more, so the

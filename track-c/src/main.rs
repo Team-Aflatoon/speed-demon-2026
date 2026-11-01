@@ -1,6 +1,6 @@
 //! Speed Demon 2026, Track C (Join): parses the hostile /data/records.csv,
 //! joins it to /data/regions.csv and writes /out/aggregates.txt.
-//! NOTES.md explains the design; the spec is specs/c-join.md.
+//! README.md and PERF.md explain the design; the spec is specs/c-join.md.
 //!
 //! Usage: `track-c [DATA_DIR [OUT_DIR]]`, by default `/data` and `/out`.
 //! Errors go to stderr, with exit status 1. So do notes on the two
