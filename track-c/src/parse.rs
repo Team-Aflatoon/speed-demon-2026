@@ -29,6 +29,7 @@ pub const PAD: usize = 128;
 /// Bytes scanned per window; a multiple of 64.
 const WINDOW: usize = 2048;
 const BLOCKS: usize = WINDOW / 64;
+const _: () = assert!(BLOCKS < 64, "a window's blocks index arrays of 64");
 /// Separators held at once: up to 4 left from the window before, a window's
 /// worth, and room for `flatten` to write a whole 64 past the count.
 const SEPS: usize = WINDOW + 8;
@@ -85,8 +86,8 @@ pub type Span = (usize, usize, bool);
 /// records of the window.
 pub struct Parser {
     seps: [u32; SEPS],
-    quote_mask: [u64; BLOCKS + 1],
-    quotes_before: [u32; BLOCKS + 1],
+    quote_mask: [u64; 64],
+    quotes_before: [u32; 64],
     records: [Record; RECORDS],
 }
 
@@ -140,25 +141,27 @@ impl Parser {
                 (self.seps[n], n, lfs) = (end as u32, n + 1, lfs + 1);
             }
             let done = n / 5;
-            for r in 0..done {
-                let s: &[u32; 5] = self.seps[5 * r..5 * r + 5].try_into().unwrap();
+            let seps = self.seps[..5 * done].chunks_exact(5);
+            for (s, f) in seps.zip(&mut self.records[..done]) {
+                let s: &[u32; 5] = s.try_into().unwrap();
                 let lf = s[4] as usize;
                 // SAFETY: separators are before the chunk's end (or at it).
                 if unsafe { byte(b, lf) } != b'\n' && lf != end {
                     return Err(Fail::Malformed(record));
                 }
-                let (k, bit) = ((lf - window) / 64, (lf - window) % 64);
+                // `k` is at most `BLOCKS`; `% 64` only spares a bounds check.
+                let (k, bit) = ((lf - window) / 64 % 64, (lf - window) % 64);
                 let below = (self.quote_mask[k] & !(u64::MAX << bit)).count_ones();
                 let quotes_at = self.quotes_before[k] + below;
-                let f = &mut self.records[r];
                 let ok = fields(f, sh, b, record, s, quotes_at - quotes_at_record);
                 ok.ok_or(Fail::Malformed(record))?;
-                crate::prefetch(&sh.regions.map[f.region as usize]);
+                crate::prefetch(sh.regions.map, f.region as usize);
                 sh.table.prefetch(&f.key);
                 (record, quotes_at_record) = (lf + 1, quotes_at);
             }
             for f in &self.records[..done] {
-                let group = sh.regions.map[f.region as usize].load(Relaxed);
+                // SAFETY: `fields` clamped the region id to the map's last index.
+                let group = unsafe { sh.regions.map.get_unchecked(f.region as usize) }.load(Relaxed);
                 let a = &mut out.aggs[usize::from(group)];
                 (a[0], a[1], a[2]) = (a[0] + f.id, a[1] + f.cents, a[2] + f.text);
                 (a[3], a[4]) = (a[3].min(f.cents), a[4].max(f.cents));
@@ -201,10 +204,8 @@ fn fields(f: &mut Record, sh: &Shared, b: &[u8], at: usize, s: &[u32; 5], q: u32
     // chunk's end; `c0 + 1` and `c1 + 1` are at most `c2`, and `lf - 1` is
     // at least `at`. These are the only bytes read below.
     let byte = |p| unsafe { byte(b, p) };
-    let bom = usize::from(unsafe { bom_at(b, at) });
     let cr = usize::from((byte(lf - 1) == b'\r') & (byte(lf) == b'\n'));
-    // A BOM directly after a terminator is not data (spec 2.1).
-    let (id, region, cents) = numbers(b, at + 3 * bom, [c0, c2, c3], lf - cr)?;
+    let (id, region, cents) = numbers(b, at, [c0, c2, c3], lf - cr)?;
     let (name_quoted, note_quoted) = (i64::from(byte(c0 + 1) == b'"'), i64::from(byte(c1 + 1) == b'"'));
     // Name and note together; only the quotes, delimiting or escaping, are
     // not value bytes, and an escape is two of them for one value byte.
@@ -308,7 +309,9 @@ unsafe fn bom_at(b: &[u8], p: usize) -> bool {
 /// `b[c2 + 1..c3]` and `b[c3 + 1..end]`. In the common case (ids of up to 8
 /// digits, amounts of up to 5 before the dot: everything 2.2 writes) the
 /// three are checked and converted together, as the lanes of one AVX2
-/// register; anything else takes the slow `number` and `cents`.
+/// register; anything else takes the slow `number` and `cents`. `id` is
+/// the record's start: a BOM there (one record in 5,000) fails the digit
+/// check, and the slow path skips it.
 #[inline(always)]
 fn numbers(b: &[u8], id: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<(u64, u64, i64)> {
     // SAFETY: `c3 + 1` is at most `end`, within the chunk; `end - 3` is
@@ -316,7 +319,8 @@ fn numbers(b: &[u8], id: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<
     let negative = unsafe { byte(b, c3 + 1) } == b'-';
     let whole = end.wrapping_sub(c3 + 4 + usize::from(negative)); // digits before the dot
     let (n_id, n_region) = (c0.wrapping_sub(id), c3.wrapping_sub(c2 + 1));
-    let common = (1..=8).contains(&n_id) & (1..=8).contains(&n_region) & (1..=5).contains(&whole);
+    // Both lengths in 1..=8 at once: `n - 1` wraps below 0 to a huge value.
+    let common = (n_id.wrapping_sub(1) | n_region.wrapping_sub(1)) < 8 && whole.wrapping_sub(1) < 5;
     if !common || unsafe { byte(b, end - 3) } != b'.' {
         return slow(b, id, [c0, c2, c3], end);
     }
@@ -337,10 +341,13 @@ fn numbers(b: &[u8], id: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<
     let before = !(u64::MAX << (8 * (6 - whole)));
     let undotted = (w & 0xFF_FFFF_FFFF) << 8 | w & 0xFFFF << 48;
     let amount = undotted & !before | ZEROS & before;
-    let [id, region] = [id, c2 + 1].map(|p| unsafe { load(b, p) });
-    let lanes = [fit(id, n_id), fit(region, n_region), amount, ZEROS];
-    let ([id, region, cents, _], sign) = (digits(lanes)?, 1 - 2 * i64::from(negative));
-    Some((id, region, sign * cents as i64))
+    let [id_word, region_word] = [id, c2 + 1].map(|p| unsafe { load(b, p) });
+    let lanes = [fit(id_word, n_id), fit(region_word, n_region), amount, ZEROS];
+    // A non-digit, a BOM before the id among them, takes the slow path.
+    let Some([id_value, region, cents, _]) = digits(lanes) else {
+        return slow(b, id, [c0, c2, c3], end);
+    };
+    Some((id_value, region, (1 - 2 * i64::from(negative)) * cents as i64))
 }
 
 /// Four words of eight ASCII digits each (the first in the lowest byte) to
@@ -372,7 +379,10 @@ fn digits(lanes: [u64; 4]) -> Option<[u64; 4]> {
 /// hot loop keeps its registers.
 #[cold]
 #[inline(never)]
-fn slow(b: &[u8], id: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<(u64, u64, i64)> {
+fn slow(b: &[u8], at: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<(u64, u64, i64)> {
+    // A BOM directly after a terminator is not data (spec 2.1).
+    // SAFETY: `at` is the record's start, within the chunk.
+    let id = at + 3 * usize::from(unsafe { bom_at(b, at) });
     let region = number(b.get(c2 + 1..c3)?)?;
     Some((number(b.get(id..c0)?)?, region, cents(b, c3 + 1, end)?))
 }
