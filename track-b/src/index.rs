@@ -10,13 +10,7 @@ use crate::query::{AND, NONE, NOT, OR, TERM_BITS};
 use std::arch::x86_64::*;
 
 pub const PARTS: usize = 64;
-const DENSE: usize = 64;
-
-/// The words of a bitmap of `docs` documents, whole blocks of four (the
-/// unit of `count_and_sum`); the bits past `docs` stay clear.
-fn words(docs: usize) -> usize {
-    docs.div_ceil(256) * 4
-}
+const DENSE: usize = 16;
 
 #[derive(Default)]
 pub struct Part {
@@ -39,7 +33,8 @@ impl Part {
     /// `terms` (the scan emits only term ids below `Table::ids`, and
     /// `terms * PARTS >= Table::ids`).
     pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize, cursor: &mut Vec<u32>) {
-        self.offsets = vec![0; terms + 1];
+        self.offsets.clear();
+        self.offsets.resize(terms + 1, 0);
         let counts = &mut self.offsets[1..];
         // The streams were written by other threads: the count runs 256 bytes
         // ahead of itself with prefetches, so their lines arrive in time.
@@ -77,9 +72,12 @@ impl Part {
         }
         // SAFETY: every slot below `total` was written above.
         unsafe { self.docs.set_len(total) };
-        let words = words(docs);
+        let words = docs.div_ceil(64);
         self.docs_in_segment = docs;
-        (self.dense, self.present) = (vec![NONE; terms], vec![0; terms.div_ceil(64)]);
+        self.dense.clear();
+        self.dense.resize(terms, NONE);
+        self.present.clear();
+        self.present.resize(terms.div_ceil(64), 0);
         self.bits.clear();
         for l in 0..terms {
             let (from, to) = (self.offsets[l] as usize, self.offsets[l + 1] as usize);
@@ -94,29 +92,17 @@ impl Part {
     }
 }
 
-/// Starts loading the entries of the terms of the BOOL query `steps` (its
-/// list's bounds and bitmap index), whose cache misses would otherwise stall
-/// `Evaluator::run` one after another; `prefetch_lists` follows them a few
-/// queries later.
+/// Starts loading the entries of the terms of the BOOL query `steps`, whose
+/// cache misses would otherwise stall `Evaluator::run` one after another.
 pub fn prefetch(parts: &[&Part], steps: &[u32]) {
     for &step in steps {
         let term = (step & ((1 << TERM_BITS) - 1)) as usize;
-        let (part, l) = (parts[term % PARTS], term / PARTS);
-        crate::prefetch(part.offsets.as_ptr().wrapping_add(l));
-        crate::prefetch(part.dense.as_ptr().wrapping_add(l));
-    }
-}
-
-/// Starts loading the first line of the list and of the bitmap of each term
-/// of `steps`, whose entries `prefetch` loaded earlier.
-pub fn prefetch_lists(parts: &[&Part], steps: &[u32]) {
-    for &step in steps {
-        let term = (step & ((1 << TERM_BITS) - 1)) as usize;
-        let (part, l) = (parts[term % PARTS], term / PARTS);
-        crate::prefetch(part.docs.as_ptr().wrapping_add(part.offsets[l] as usize));
-        if part.dense[l] != NONE {
-            crate::prefetch(part.bits.as_ptr().wrapping_add(part.dense[l] as usize));
-        }
+        crate::prefetch(
+            parts[term % PARTS]
+                .offsets
+                .as_ptr()
+                .wrapping_add(term / PARTS),
+        );
     }
 }
 
@@ -129,28 +115,15 @@ enum Set<'a> {
 }
 
 impl<'a> Set<'a> {
-    /// The set of `term` (below `Table::ids`, so that `l` is below the
-    /// `terms` the parts were built for) in the `PARTS` parts of a segment.
     fn of(parts: &'a [&'a Part], term: usize, words: usize) -> Set<'a> {
-        debug_assert!(parts.len() == PARTS && term / PARTS < parts[term % PARTS].dense.len());
-        // SAFETY: `Part::build` makes `offsets` (ascending, ending at
-        // `docs.len()`) one longer than `dense`, and gives every term whose
-        // list holds more than 1/`DENSE` of the documents a bitmap of `words`
-        // words at `dense[l]`; `l` is below `dense.len()` (see above).
-        unsafe {
-            let (part, l) = (*parts.get_unchecked(term % PARTS), term / PARTS);
-            let (from, to) = (
-                *part.offsets.get_unchecked(l),
-                *part.offsets.get_unchecked(l + 1),
-            );
-            let list = part.docs.get_unchecked(from as usize..to as usize);
-            match list.len() {
-                0 => Set::Empty,
-                n if n * DENSE <= part.docs_in_segment => Set::List(list),
-                _ => {
-                    let at = *part.dense.get_unchecked(l) as usize;
-                    Set::Dense(list, part.bits.get_unchecked(at..at + words))
-                }
+        let (part, l) = (parts[term % PARTS], term / PARTS);
+        let list = &part.docs[part.offsets[l] as usize..part.offsets[l + 1] as usize];
+        match list.len() {
+            0 => Set::Empty,
+            n if n * DENSE <= part.docs_in_segment => Set::List(list),
+            _ => {
+                let at = part.dense[l] as usize;
+                Set::Dense(list, &part.bits[at..at + words])
             }
         }
     }
@@ -186,24 +159,34 @@ pub struct Evaluator {
 
 impl Evaluator {
     /// Adds the documents of segment `parts` (numbered from `base`, `docs` of
-    /// them) that match the BOOL query `steps` to the answer `to`.
-    pub fn run(&mut self, parts: &[&Part], steps: &[u32], docs: usize, base: u32, to: &mut Answer) {
-        let words = words(docs);
+    /// them) that match the BOOL query `steps` to `answer`.
+    pub fn run(
+        &mut self,
+        parts: &[&Part],
+        steps: &[u32],
+        docs: usize,
+        base: u32,
+        answer: &mut Answer,
+    ) {
+        let words = docs.div_ceil(64);
         self.bits.resize(words, 0);
         self.mask.resize(words, 0);
         let term = |step: u32| (step & ((1 << TERM_BITS) - 1)) as usize;
         let present = |&step: &u32| {
             let (part, l) = (parts[term(step) % PARTS], term(step) / PARTS);
-            // SAFETY: `present` has a bit for every `l` (see `Set::of`).
-            unsafe { *part.present.get_unchecked(l / 64) >> (l % 64) & 1 != 0 }
+            part.present[l / 64] >> (l % 64) & 1 != 0
         };
         // The query matches nothing here if a term ANDed after the last OR
         // is absent (the first step counts as an OR), or if every term that
         // can add documents (the ORed ones) is absent.
-        let op = |s: &u32| s >> TERM_BITS;
-        let last_or = steps.iter().rposition(|s| op(s) == OR).unwrap_or(0);
-        let and_absent = steps[last_or..].iter().any(|s| op(s) == AND && !present(s));
-        if and_absent || !steps.iter().any(|s| op(s) == OR && present(s)) {
+        let last_or = steps
+            .iter()
+            .rposition(|&s| s >> TERM_BITS == OR)
+            .unwrap_or(0);
+        let and_absent = steps[last_or..]
+            .iter()
+            .any(|s| s >> TERM_BITS == AND && !present(s));
+        if and_absent || !steps.iter().any(|s| s >> TERM_BITS == OR && present(s)) {
             return;
         }
         let set = |step: u32| Set::of(parts, term(step), words);
@@ -217,9 +200,9 @@ impl Evaluator {
         }
         match acc {
             Acc::Empty => {}
-            Acc::Term(set) => to.add_list(set.list(), base),
-            Acc::List => to.add_list(&self.list, base),
-            Acc::Bits => to.add_bits(&self.bits, base),
+            Acc::Term(set) => answer.add_list(set.list(), base),
+            Acc::List => answer.add_list(&self.list, base),
+            Acc::Bits => answer.add_bits(&self.bits, base),
         }
     }
 
@@ -530,91 +513,97 @@ impl Answer {
 
     /// Appends the output line (spec 4).
     pub fn write(&self, out: &mut Vec<u8>) {
-        // At most 12 numbers of up to 20 digits, each with a space or the LF.
-        let (mut line, mut at) = ([0u8; 12 * 21], 0);
-        let ten = self.ten[..self.kept as usize].iter().map(|&i| i.into());
-        for v in [u64::from(self.count), self.sum].into_iter().chain(ten) {
-            at = put(&mut line, at, v);
-            line[at] = b' ';
-            at += 1;
+        put(out, u64::from(self.count));
+        out.push(b' ');
+        put(out, self.sum);
+        for &id in &self.ten[..self.kept as usize] {
+            out.push(b' ');
+            put(out, u64::from(id));
         }
-        line[at - 1] = b'\n';
-        out.extend_from_slice(&line[..at]);
+        out.push(b'\n');
     }
 }
 
-/// The number of set bits of `bits` (whole blocks of four words) and the
-/// sum of their positions, four words at a time. Per byte, nibble tables give
-/// the count of its bits and the sum of their positions within the byte; a
-/// byte's offset in its word (8 times its index) weighs its count, and the
-/// word's index weighs the word's count.
+/// The number of set bits of `bits` and the sum of their positions, four
+/// words at a time. Per byte, nibble tables give the count of its bits and
+/// the sum of their positions within the byte; a byte's offset in its word
+/// (8 times its index) weighs its count, and the word's index weighs the
+/// word's count.
 fn count_and_sum(bits: &[u64]) -> (u64, u64) {
     // Bits set in a nibble, and the sum of their positions.
     const COUNT: [i8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
     const SUM: [i8; 16] = [0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6];
+    let (blocks, rest) = bits.as_chunks::<4>();
     // SAFETY: AVX2 is required by the crate; the loads read whole blocks.
-    unsafe {
+    let (mut count, mut sum) = unsafe {
         let table = |t: [i8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
-        let (count_t, sum_t, nibbles) = (table(COUNT), table(SUM), _mm256_set1_epi8(0x0F));
+        let (count_t, sum_t) = (table(COUNT), table(SUM));
+        let nibbles = _mm256_set1_epi8(0x0F);
         let offsets = _mm256_set1_epi64x(0x3830_2820_1810_0800); // 8 * byte index
         let [mut counts, mut sums, mut weighted] = [_mm256_setzero_si256(); 3];
         let mut index = _mm256_setr_epi64x(0, 1, 2, 3);
-        for block in bits.as_chunks::<4>().0 {
+        for block in blocks {
             let v = _mm256_loadu_si256(block.as_ptr().cast());
-            let lo = _mm256_and_si256(v, nibbles);
-            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibbles);
-            let c_hi = _mm256_shuffle_epi8(count_t, hi);
-            let c = _mm256_add_epi8(_mm256_shuffle_epi8(count_t, lo), c_hi);
+            let (lo, hi) = (
+                _mm256_and_si256(v, nibbles),
+                _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibbles),
+            );
+            let (c_lo, c_hi) = (
+                _mm256_shuffle_epi8(count_t, lo),
+                _mm256_shuffle_epi8(count_t, hi),
+            );
+            let c = _mm256_add_epi8(c_lo, c_hi);
             // Within a byte: the low nibble's positions, the high one's plus 4 each.
             let s = _mm256_add_epi8(
-                _mm256_shuffle_epi8(sum_t, lo),
-                _mm256_shuffle_epi8(sum_t, hi),
+                _mm256_add_epi8(
+                    _mm256_shuffle_epi8(sum_t, lo),
+                    _mm256_shuffle_epi8(sum_t, hi),
+                ),
+                _mm256_slli_epi16::<2>(c_hi),
             );
-            let s = _mm256_add_epi8(s, _mm256_slli_epi16::<2>(c_hi));
             let word_counts = _mm256_sad_epu8(c, _mm256_setzero_si256());
             counts = _mm256_add_epi64(counts, word_counts);
             weighted = _mm256_add_epi64(weighted, _mm256_mul_epu32(word_counts, index));
             // Byte offsets times counts, in pairs, plus the sums within bytes
             // (at most 888 a pair), added up per 32 bits.
-            let pairs = _mm256_maddubs_epi16(c, offsets);
-            let pairs = _mm256_add_epi16(pairs, _mm256_maddubs_epi16(s, _mm256_set1_epi8(1)));
+            let pairs = _mm256_add_epi16(
+                _mm256_maddubs_epi16(c, offsets),
+                _mm256_maddubs_epi16(s, _mm256_set1_epi8(1)),
+            );
             sums = _mm256_add_epi32(sums, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
             index = _mm256_add_epi64(index, _mm256_set1_epi64x(4));
         }
-        let lanes = |v: __m256i| {
-            let lanes: [u64; 4] = std::mem::transmute(v);
-            lanes.iter().sum::<u64>()
-        };
-        // The 32-bit sums, two to a lane, added as 64-bit lanes would carry.
-        let (high, low) = (_mm256_srli_epi64::<32>(sums), _mm256_slli_epi64::<32>(sums));
-        let sums = _mm256_add_epi64(high, _mm256_srli_epi64::<32>(low));
-        (lanes(counts), lanes(sums) + 64 * lanes(weighted))
+        let lanes =
+            |v: __m256i| -> u64 { std::mem::transmute::<__m256i, [u64; 4]>(v).iter().sum() };
+        let sums: u64 = std::mem::transmute::<__m256i, [u32; 8]>(sums)
+            .iter()
+            .map(|&s| u64::from(s))
+            .sum();
+        (lanes(counts), sums + 64 * lanes(weighted))
+    };
+    for (i, &w) in rest.iter().enumerate() {
+        let i = (4 * blocks.len() + i) as u64;
+        let mut rest = w;
+        count += u64::from(w.count_ones());
+        while rest != 0 {
+            sum += 64 * i + u64::from(rest.trailing_zeros());
+            rest &= rest - 1;
+        }
     }
+    (count, sum)
 }
 
-/// Writes the decimal digits of `v` to `line` from `at`, two at a time,
-/// without the formatting machinery; returns where they end.
-fn put(line: &mut [u8], at: usize, mut v: u64) -> usize {
-    /// `PAIRS[2i..2i + 2]`: the two digits of i.
-    const PAIRS: [u8; 200] = {
-        let (mut t, mut i) = ([0; 200], 0);
-        while i < 100 {
-            (t[2 * i], t[2 * i + 1]) = (b'0' + i as u8 / 10, b'0' + i as u8 % 10);
-            i += 1;
+/// Decimal digits of `v`, without the formatting machinery.
+fn put(out: &mut Vec<u8>, mut v: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
         }
-        t
-    };
-    let (mut digits, mut from) = ([0u8; 20], 20);
-    while v >= 10 {
-        let pair = 2 * (v % 100) as usize;
-        (from, v) = (from - 2, v / 100);
-        digits[from..from + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
     }
-    // A last digit (the first pair taken is never one with a leading zero).
-    if v > 0 || from == 20 {
-        from -= 1;
-        digits[from] = b'0' + v as u8;
-    }
-    line[at..at + 20 - from].copy_from_slice(&digits[from..]);
-    at + 20 - from
+    out.extend_from_slice(&digits[at..]);
 }
