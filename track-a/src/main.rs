@@ -17,16 +17,19 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::{cell::UnsafeCell, fs::File, ops::Range, os::unix::fs::FileExt, ptr, slice, thread};
 
 /// Hours in the log: the spec fixes the span at 2026-10-30T18:00Z to 2026-11-02T18:00Z.
+/// The span's start is also written into `hour_row` and `stamp`: change all three together.
 const HOURS: usize = 72;
 /// A record has 11 bits for the endpoint id. Ids start at 1: a zero record is a slot
 /// that was reserved but not (or not yet) written. The spec promises 1,842 endpoints.
 const IDS: usize = 1 << 11;
 /// Latencies below this are kept in the record, larger ones in the hour's side list.
-const MARK: u32 = 1 << 20;
-/// A record is `id << ID_SHIFT | 5xx << 20 | latency`: the latency (below MARK) fills
-/// bits 0 to 19, the 5xx flag bit 20 and the id (below IDS) bits 21 to 31.
+const INLINE_LATENCY_LIMIT: u32 = 1 << ERROR_SHIFT;
+/// A record is `id << ID_SHIFT | 5xx << ERROR_SHIFT | latency`: the latency (below
+/// INLINE_LATENCY_LIMIT) fills bits 0 to 19, the 5xx flag bit 20 and the id (below IDS)
+/// bits 21 to 31.
+const ERROR_SHIFT: u32 = 20;
 const ID_SHIFT: u32 = 21;
-const _: () = assert!(MARK == 1 << 20 && (IDS as u64) << ID_SHIFT == 1 << 32);
+const _: () = assert!(ID_SHIFT == ERROR_SHIFT + 1 && (IDS as u64) << ID_SHIFT == 1 << 32);
 /// Open-addressing slots of the endpoint table: a power of two, under a quarter full.
 const SLOTS: usize = 1 << 13;
 /// Records a worker reserves at a time in an hour's log: 4 KB, one page per worker.
@@ -67,21 +70,24 @@ fn main() {
     // large free, and freed texts and scratch would stay in its heaps.
     // SAFETY: tunes the allocator before any thread exists; harmless if refused.
     unsafe { mallopt(M_MMAP_THRESHOLD, 128 << 10) };
-    if let Err(e) = run() {
+    // `ingest [data_dir] [out_dir]`, defaulting to the harness's /data and /out.
+    let mut args = std::env::args().skip(1);
+    let input = format!("{}/requests.log", args.next().as_deref().unwrap_or("/data"));
+    let out = format!("{}/summary.txt", args.next().as_deref().unwrap_or("/out"));
+    if let Err(e) = run(&input, &out) {
         eprintln!("ingest: {e}");
+        // No summary is left behind on failure: a half-written one must not pass for a
+        // whole one.
+        _ = std::fs::remove_file(&out);
         std::process::exit(1);
     }
 }
 
-/// `ingest [data_dir] [out_dir]`, defaulting to the harness's /data and /out.
-fn run() -> io::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    let input = File::open(format!("{data_dir}/requests.log"))?;
-    let mut out = File::create(format!("{out_dir}/summary.txt"))?;
+fn run(input: &str, out: &str) -> io::Result<()> {
+    let input = File::open(input).map_err(|e| context(e, input))?;
+    let mut out = File::create(out).map_err(|e| context(e, out))?;
     if !Job::new(&input, true)?.run(&mut out)? {
-        // A line came after its hour was reported: start over, reporting at the end.
+        eprintln!("ingest: a line came after its hour was reported; redoing the run");
         out.set_len(0)?;
         out.rewind()?;
         Job::new(&input, false)?.run(&mut out)?;
@@ -89,16 +95,25 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
+/// `e` with `what` (a path, say) in front of its message, keeping its kind.
+fn context(e: io::Error, what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(e.kind(), format!("{what}: {e}"))
+}
+
 /// Reserves room for `len` atomics `T`, zeroed; pages cost nothing until first touched.
-/// The slice is `'static` only in name: it lives until the last worker unmaps it, at the
-/// end of `work`, and nothing uses it after that.
+///
+/// The slice is `'static` only in name. Its one holder is a `Job` (`logs`, `sides`),
+/// and the last of that job's workers unmaps it at the end of `work`, before `run`
+/// returns; after that only the hours' counters are read, never the slice. A `Job`
+/// that never runs leaves it mapped until the process exits.
 fn reserve<T>(len: usize) -> io::Result<&'static [T]> {
     let (bytes, flags) = (len * size_of::<T>(), MAP_PRIVATE_ANONYMOUS_NORESERVE);
     // SAFETY: asks for a fresh mapping at an address of the kernel's choosing, so no
     // existing memory is affected; failure is reported as MAP_FAILED (-1).
     let p = unsafe { mmap(ptr::null_mut(), bytes, PROT_READ_WRITE, flags, -1, 0) };
     if p as isize == -1 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(context(e, format!("mmap of {bytes} bytes")));
     }
     // SAFETY: fresh memory, zeroed, and zero bytes are a valid atomic integer. It stays
     // mapped until the last worker unmaps it (see `work`), after which nothing uses it.
@@ -116,8 +131,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Default)]
 #[repr(align(64))]
 struct Hour {
-    /// Log slots reserved (BLOCK at a time, so a worker appends to its own block), and
-    /// side entries taken.
+    /// Log slots reserved, BLOCK at a time so a worker appends to its own block (a slot
+    /// reserved is not yet written: it reads as zero until then), and side entries taken.
     used: AtomicUsize,
     big: AtomicUsize,
 }
@@ -143,7 +158,7 @@ enum Task {
 /// Per hour, a worker's open block: next slot and end.
 type Open = [(usize, usize); HOURS];
 /// Some lines to parse: (bytes, start of the first line, end of the last).
-type Piece = (*const u8, usize, usize);
+type Lines = (*const u8, usize, usize);
 
 /// Everything the workers share.
 #[derive(Default)]
@@ -155,7 +170,7 @@ struct Job<'a> {
     rows: Vec<AtomicUsize>,
     speculate: bool,
     /// The logs and side lists, `room` entries per hour: records with the endpoint id
-    /// in bits 21 and up, the 5xx flag in bit 20 and a latency below MARK; side entries
+    /// from bit ID_SHIFT up, the 5xx flag in bit ERROR_SHIFT and a latency below INLINE_LATENCY_LIMIT; side entries
     /// with the same in the high word and the latency in the low one. They are atomics
     /// (plain moves on x86) because an early report may read a block still being filled:
     /// it sees zeros there, and the counts catch that.
@@ -320,7 +335,7 @@ impl<'a> Job<'a> {
     /// Reads piece `i`, the lines that start in [i * PIECE, (i + 1) * PIECE), into `buf`:
     /// from the byte before it to the end of its last line, then SLACK zero bytes. Also
     /// notes the hour of its first line for the plan (one outside the span stays unknown).
-    fn read(&self, i: usize, buf: &mut Vec<u8>) -> io::Result<Piece> {
+    fn read(&self, i: usize, buf: &mut Vec<u8>) -> io::Result<Lines> {
         let at = (i * PIECE).saturating_sub(1);
         let end = self.len.min((i + 1) * PIECE + MAX_LINE);
         let input = self.input.expect("set by `new`");
@@ -344,17 +359,27 @@ impl<'a> Job<'a> {
         Ok((buf.as_ptr(), from, to))
     }
 
-    /// The output lines of one hour, appended to `text`; `sorted` is scratch space.
+    /// The output lines of one hour, appended to `text`; `sorted` is scratch space. In
+    /// five stages:
+    /// 1. count pass: requests and 5xx per endpoint, and the lines seen, for the check;
+    /// 2. a slice of `sorted` per endpoint, in output order (a prefix sum);
+    /// 3. scatter pass: every latency into its endpoint's slice;
+    /// 4. the hour's log pages given back;
+    /// 5. per endpoint, three selections for the percentiles and its output line.
     fn report(&self, hour: usize, sorted: &mut Vec<u32>, mut text: Vec<u8>) -> Vec<u8> {
         let (h, at) = (&self.hours[hour], hour * self.room);
         let log = &self.logs[at..at + h.used.load(Relaxed)];
         let side = &self.sides[at..at + h.big.load(Relaxed)];
-        // Count pass, by endpoint id and 5xx flag together (the record's top 12 bits); then
-        // per endpoint, requests in the low half and 5xx responses in the high half. A slot
-        // not written (yet) counts as id 0, which is never printed. Both kinds are read as
+        // Count pass, by endpoint id and 5xx flag together (the record's top 12 bits), so
+        // `tally[2 * id]` holds the endpoint's non-5xx responses and `tally[2 * id + 1]` its
+        // 5xx ones; then per endpoint, requests in the low half and 5xx responses in the
+        // high half. A slot not written (yet) counts as id 0, which is never printed. Both kinds are read as
         // (endpoint id and 5xx bits, latency).
         let records = || {
-            let small = log.iter().map(|r| r.load(Relaxed)).map(|r| (r, r % MARK));
+            let small = log
+                .iter()
+                .map(|r| r.load(Relaxed))
+                .map(|r| (r, r % INLINE_LATENCY_LIMIT));
             small.chain(
                 side.iter()
                     .map(|e| e.load(Relaxed))
@@ -362,7 +387,7 @@ impl<'a> Job<'a> {
             )
         };
         let mut tally = [0u32; 2 * IDS];
-        records().for_each(|(r, _)| tally[(r >> 20) as usize] += 1);
+        records().for_each(|(r, _)| tally[(r >> ERROR_SHIFT) as usize] += 1);
         let counts: [u64; IDS] = std::array::from_fn(|id| {
             let (ok, errors) = (tally[2 * id] as u64, tally[2 * id + 1] as u64);
             (ok + errors) | (errors << 32)
@@ -377,7 +402,12 @@ impl<'a> Job<'a> {
         }
         sorted.resize(sorted.len().max(total as usize), 0);
         // Scatter pass: every latency into its endpoint's slice. A record written after
-        // the count pass (the hour was not complete) may find no room; the counts catch it.
+        // the count pass (the hour was not complete) was not counted, so its endpoint's
+        // slice is one short: the latency lands in the next endpoint's slice, overwriting
+        // one of its values, or in space that is never printed. Either way this hour's
+        // text is wrong, and that is harmless only because the record's line is missing
+        // from `reported`, so the count check in `run` throws the text away and redoes
+        // the run.
         records().for_each(|(r, latency)| {
             let next = &mut next[(r >> ID_SHIFT) as usize];
             if let Some(slot) = sorted.get_mut(*next as usize) {
@@ -426,7 +456,7 @@ impl<'a> Job<'a> {
     /// # Safety
     /// `from` must start a line, `to` must end one, and the SLACK bytes after every line
     /// start in between must be readable.
-    unsafe fn parse(&self, open: &mut Open, (p, from, to): Piece) -> io::Result<usize> {
+    unsafe fn parse(&self, open: &mut Open, (p, from, to): Lines) -> io::Result<usize> {
         // The current hour, as a cache: shards write in time order, so it rarely changes.
         // `key` holds its `YYYY-MM-DDTHH`, compared as the first 13 of 16 loaded bytes.
         let (mut key, mut row, (mut n, mut end), mut lines) = (_mm_setzero_si128(), 0, open[0], 0);
@@ -468,10 +498,13 @@ impl<'a> Job<'a> {
                 // the 27-byte timestamp and its space), and ends before the status.
                 let name = start + 29 + spaces(p.add(start + 28)).trailing_zeros() as usize;
                 let id = ENDPOINTS.id(p.add(name), status - 1 - name)?;
-                let record = (id << ID_SHIFT) | (error << 20);
+                let record = (id << ID_SHIFT) | (error << ERROR_SHIFT);
                 // SAFETY (both stores): `used` and `big` never pass the hour's room (see
                 // `Job::new`), and hand each slot to one worker.
-                if latency < MARK {
+                // The count check rests on this: a slot goes from zero to its final value in
+                // one atomic store, never through a partial value, so a report sees each line
+                // either whole or not at all (as id 0) and never counts one twice.
+                if latency < INLINE_LATENCY_LIMIT {
                     if n == end {
                         n = hour.used.fetch_add(BLOCK, Relaxed);
                         end = n + BLOCK;
@@ -618,7 +651,10 @@ fn hour_row(t: &[u8]) -> io::Result<usize> {
     let row = usize::try_from((day - 30) * 24 + num(11..13) - 18);
     match (num(0..4), num(5..7), row) {
         (2026, 10 | 11, Ok(row)) if row < HOURS => Ok(row),
-        _ => Err(io::Error::other("a timestamp outside the 72-hour span")),
+        _ => Err(context(
+            io::Error::other("hour outside the span"),
+            t.escape_ascii(),
+        )),
     }
 }
 
@@ -736,8 +772,13 @@ impl Endpoints {
             i += 1;
         }
         // Room for the name and the space after it, before the length byte.
-        if *count == IDS - 1 || len > 126 {
-            return Err(io::Error::other("over 2,047 endpoints or 126 bytes"));
+        if *count == IDS - 1 {
+            return Err(io::Error::other(format!("over {} endpoints", IDS - 1)));
+        }
+        if len > 126 {
+            return Err(io::Error::other(format!(
+                "a {len}-byte endpoint (over 126)"
+            )));
         }
         *count += 1;
         let name = &mut *self.names[*count].get();

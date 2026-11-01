@@ -4,6 +4,31 @@ Team Aflatoon: Dhruv Sharma (@Spiritsfuse), Anushika Chauhan (@Anushika06), Prat
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
 
+## Result
+
+On the scoring box (commit 1cd61cf): **20.0 ms, 18.0 MB, S 514, K 47.72**
+(run-2491c9d07251); a second run, run-237f722dfeb2, gave 20.1 ms, 17.8 MB, K 47.67. The
+reference takes 32.05 s and 228 MB. The output is byte-identical to the reference's.
+
+The idea, in three lines:
+
+1. Read the log in 128 KB pieces, in file order, with `pread`; every line becomes one
+   4-byte record in its hour's log.
+2. Report each hour as soon as parsing is two hours past it, so the reports run alongside
+   the parse instead of after it.
+3. Check with exact counts that every hour was complete when reported; if one was not,
+   redo the run with all reports at the end.
+
+Where the box's time goes (all board runs; the first two are probes of earlier versions
+that skip work on purpose, so their output is wrong):
+
+| Run | What it does | Box T | Run ID |
+|---|---|---|---|
+| Read floor | map the input and count its newlines on 12 threads, nothing else | 14.6 ms | run-8ea2db5074de |
+| Ingest only | v6, parse everything, report nothing | 21.3 ms | run-d570a81674c0 |
+| Report after ingest | v3 to v5 whole: the report phase after the ingest barrier added about 11 ms | 31.8-34.6 ms | run-f4376824385c |
+| This version | reports while parsing, reads with `pread` | 20.0 ms | run-2491c9d07251 |
+
 ## Approach
 
 One Rust binary, `src/main.rs`, no crates. Eleven worker threads read and parse the log
@@ -16,7 +41,10 @@ the piece (a line starts after a newline, so that byte decides where the piece's
 line starts) to the end of the last line that starts in it, followed by 256 zero bytes so
 the parser may read a little past any line without a bounds check. The buffer, with its
 hyperthread sibling's, stays in the core's L2. We read rather than map the file: on the
-scoring box the page faults of a mapping cost 3.8 ms more than the copy (PERF.md, v8).
+scoring box this build ran 3.8 ms faster than the same program mapping the input (PERF.md,
+v8). The two differ in piece size too (1 MB mapped, 128 KB read), so that gain is the
+mapping's page faults together with whatever the smaller, L2-sized pieces bring, not
+faults alone.
 
 **Parsing into one log per hour.** Every line becomes one 4-byte record,
 `endpoint id << 21 | 5xx << 20 | latency`, appended to its hour's log. Each hour's log is
@@ -45,6 +73,14 @@ whole job runs again with every report at the end. On the generator's data that 
 happens; a shuffled file, a reversed file or a late line make it happen, and still give
 the right bytes, in about twice the time.
 
+Why this is safe: speculation can make a run slower, never wrong. The count check holds
+because a record slot goes from zero to its final value in one atomic store, so a report
+sees each line whole or not at all and never counts one twice. The fallback is tested on
+purpose, not left to chance: a shuffled file, a reversed file, a 23 MB file whose last
+line belongs to the first hour, and a small mixed-tail file each force the rerun (one
+truncate and two full reads each, counted with `perf`), and each gives the reference's
+bytes; the unmodified 23 MB sample does not rerun.
+
 **One report.** A count pass over the hour's records tallies them by their top 12 bits,
 endpoint id and 5xx flag together, one increment per record; a prefix sum in endpoint
 byte order gives every endpoint a slice of a scratch array; a scatter pass drops each
@@ -62,10 +98,11 @@ bit, and the lowest once that is cleared) are stored and the count advances by t
 popcount, with no branch per block. The hour is cached as the first 13 bytes of the
 timestamp and checked with one 16-byte compare; its row is worked out from the date only
 when it changes (the span crosses one month end, October's 31st, so no calendar is
-needed), and the output's hour stamp is made from the row. The latency is parsed right to left from the newline with no loop:
-one SSE compare finds the space before it, its digits are masked in and summed by three
-multiply-add steps, and the status digit before that space gives the 5xx flag. One more
-16-byte compare finds the space after the method, where the endpoint starts.
+needed), and the output's hour stamp is made from the row. The latency is parsed right to
+left from the newline with no loop: one SSE compare finds the space before it, its digits
+are masked in and summed by three multiply-add steps, and the status digit before that
+space gives the 5xx flag. One more 16-byte compare finds the space after the method,
+where the endpoint starts.
 
 **Endpoints.** One table, shared by all workers and kept in a `static` so the hot loop
 addresses it directly: open addressing over 8,192 slots on a hash of the name's first and
@@ -86,17 +123,37 @@ and none for the last hours, at most two report scratch buffers are kept, each w
 frees its read buffer after one of the last pieces, and the last worker to finish unmaps
 the logs, page tables included, before the final hours are written.
 
-**Errors.** An I/O failure, a timestamp outside the 72-hour span, or more than 2,047
-distinct endpoints (or one over 126 bytes) goes to stderr with exit code 1.
+**Errors.** An I/O failure (with the file's path, or the size of a failed `mmap`), a
+timestamp outside the 72-hour span (with the hour it names), more than 2,047 distinct
+endpoints, or an endpoint over 126 bytes (with its length) goes to stderr with exit code 1,
+and the partly written `summary.txt` is removed. A rerun after a late line is noted on
+stderr; it still exits 0.
 
-**Unsafe code.** It is used for: the system calls; the reserved logs (handed out as
-slices, written through raw pointers, unmapped at the end); the parser's raw reads of
-the read buffer, which skip bounds checks because every line is followed by at least
-256 readable bytes; the SIMD intrinsics (AVX2, BMI2 and SSE4.1 come from
-`target-cpu=x86-64-v3` in `.cargo/config.toml`); the endpoint table, whose names sit in
-`UnsafeCell`s behind an `unsafe impl Sync` (each is written once, under a lock, before
-its id is published); and the output writer, which formats into reserved capacity. Each
-`unsafe` block or function says why it is sound.
+**Assumptions.** Well-formed input only: lines are assumed to follow the spec's grammar,
+and only the checks above are made. `WORKERS = 11` assumes the 12-CPU scoring box (the
+main thread is the twelfth). The logs are one `MAP_NORESERVE` reservation sized for every
+line landing in every hour, about 5.2 GB of address space for the 239 MB input; it costs
+no memory until touched, but needs the kernel to allow overcommit (Linux's default
+heuristic mode does; with `vm.overcommit_memory = 2` the `mmap` fails and says so).
+
+**Unsafe code.** Five uses, each with its `SAFETY` note in the source:
+
+1. **System calls** (`mmap`, `madvise`, `munmap`, `prctl`, `mallopt`). Sound because each
+   acts only on mappings this program made or on process-wide hints; a failed `mmap` is
+   reported, and a refused hint changes nothing.
+2. **The reserved logs**, handed out as `'static` slices and written through raw pointers.
+   Sound because the memory is fresh and zeroed (zero is a valid atomic), each slot is
+   handed to one worker by `fetch_add`, the counters never pass the room sized for every
+   line, and the last worker unmaps it only once no report can read it.
+3. **Unchecked buffer access**: the parser reads past a line's start, and the formatter
+   writes into reserved capacity. Sound because every line start in the read buffer is
+   followed by at least 256 readable bytes, more than any read from it, and each output
+   line reserves 256 bytes and uses at most 220.
+4. **SIMD intrinsics** (AVX2, BMI2, SSE4.1). Sound because `target-cpu=x86-64-v3` in
+   `.cargo/config.toml` enables them for the whole crate, and the box's CPU has them.
+5. **The endpoint table**: names in `UnsafeCell`s behind an `unsafe impl Sync`. Sound
+   because each name is written once, under the insert lock, before its id is published
+   with a Release store, and readers reach a name only through an id loaded with Acquire.
 
 ## Dependencies
 
