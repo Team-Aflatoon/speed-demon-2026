@@ -12,6 +12,8 @@ Before that hardening, step 56 (commit 1cd61cf) ran 20.0 and 20.1 ms at S 514; S
 so that unexpected input fails loudly (errors with their path, value or size, no
 half-written output), on an unchanged hot path. Decisive steps (all board runs):
 
+Final repository state (commit eba990a; since 32b49b8 only comments and docs changed, S 532): run-8fc3ec9b48d1, 21.1 ms, 18.3 MB, K 46.02. Three runs of this code: 20.4, 20.9 and 21.1 ms, median 20.9 ms.
+
 1. v1 Rust rewrite (mmap, 12 workers): 46.1 ms, 47.5 MB (run-a288ae43d4e8).
 2. v2 per-hour 4-byte logs + counting sort, THP off: 33.0 ms, 25.8 MB (run-078b64667d1c);
    v3-v5 cut instructions ~19% locally and did not move the box (31.8-34.6 ms).

@@ -5,6 +5,8 @@
 **Final: v4.2 as submitted (step 15).** Board, median of its two runs: 189.2 ms, 36.1 MB, K 25.33
 (run-3ae92ad95108, run-f30168793c18); the reference takes 56.35 s and 2,200 MB.
 
+Final repository state (commit eba990a; since 701dd4f only error paths, comments and docs changed, output identical, S 1299): run-9316371871a2, 186.5 ms, 36.6 MB, K 25.51. Three runs of this code: 186.0, 186.5 and 192.3 ms, median 186.5 ms.
+
 | Step | Board T | M | Run |
 |---|---|---|---|
 | v1: index only the query terms; a throwaway index per 4,096 documents, every query answered per batch | 309 ms | 59.7 MB | run-7450e3d4343b |

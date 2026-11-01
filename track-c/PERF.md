@@ -4,6 +4,8 @@
 
 Final: **v4.2 as submitted** (commit 5f8b6df, row 36). Board 48.9 ms, 12.6 MB, K 25.15, 70.03 points (run-31b13fc9019b) and 50.5 ms, 12.3 MB, K 24.85, 69.77 points (run-8721232bf1f2): median 49.7 ms. S 767. The reference is 14.44 s and 367 MB. v4.2 is v4.1 (row 35: the race fix, 49.1 ms, S 734) plus error paths only. S rose by 33 lines so that input the generator never writes fails loudly: the byte offset of the first grammar error, the byte offset of a bad regions.csv line, a note on stderr for each fallback, and a cap on the table retries.
 
+Final repository state (commit eba990a; code fbf7e89 = 5f8b6df plus the removal of a partial output on a failed write, S 768): run-d79219fb688a, 48.5 ms, 12.3 MB, K 25.38. Runs of this error-path code: 48.9, 50.5 and 48.5 ms, median 48.9 ms.
+
 **A race in v4, found by a stress test and fixed in one line.** v4 as first submitted (row 33, run-1e5d2353fd9f) printed a wrong output in about 1 run of 100: one group's distinct-name count off by one. A 300-run stress test of the submitted image found it; final scoring needs all five runs correct, so it was about a 5% chance of a zero. `Names::fill` wrote all four words of the name's key into its table slot, and the fourth word, the hash, landed on the slot's `meta` for a moment before the Release store of its real value; a lookup on another core could take that value for a published slot of another length, probe on, and insert the same name a second time. The fix writes only the three name words (row 35). The board never showed it: each board run is a single run.
 
 Decisive steps, all board runs:

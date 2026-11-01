@@ -8,14 +8,14 @@ We entered all four tracks. Each one is a standalone Rust program with **no depe
 
 Seed 1, single runs on the organisers' scoring machine; final scoring uses a private holdout seed and five runs. Every row below is a board run that passed the output check on seed 1. Run IDs are listed in each track's `PERF.md`.
 
-**The shipped code** (the commit each track folder holds now):
+**The shipped code** (the commit each track folder holds now; board runs of the final repository state, commit eba990a, plus the earlier run of the same code where there is one):
 
-| Track | Commit | Board run | T | M | S | D | K | Points | Reference | Speedup |
-|---|---|---|---|---|---|---|---|---|---|---|
-| A · Ingest | 32b49b8 | run-996cb0022b51 | 20.4 ms | 18.2 MB | 532 | 1 | 46.93 | 83.57 | 32.05 s | about 1,570x |
-| B · Index | 701dd4f | run-3ae92ad95108 | 186.0 ms | 36.1 MB | 1299 | 1 | 25.54 | 70.36 | 56.35 s | about 303x |
-| C · Join | 5f8b6df | run-31b13fc9019b | 48.9 ms | 12.6 MB | 767 | 1 | 25.15 | 70.03 | 14.44 s | about 295x |
-| D · Traverse | 13b0490 | run-053708dfffa2 | 148.6 ms | 70.5 MB | 600 | 1 | 24.75 | 69.68 | 72.69 s | about 489x |
+| Track | Code commit | Final board run | T | M | S | D | K | Points | Earlier run of this code | Reference | Speedup |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A · Ingest | d0fa7bb | run-8fc3ec9b48d1 | 21.1 ms | 18.3 MB | 532 | 1 | 46.02 | 83.15 | run-996cb0022b51 20.4 ms, run-361c33ed2406 20.9 ms | 32.05 s | about 1,550x |
+| B · Index | 129b96e | run-9316371871a2 | 186.5 ms | 36.6 MB | 1299 | 1 | 25.51 | 70.33 | run-3ae92ad95108 186.0 ms, run-f30168793c18 192.3 ms | 56.35 s | about 302x |
+| C · Join | fbf7e89 | run-d79219fb688a | 48.5 ms | 12.3 MB | 768 | 1 | 25.38 | 70.22 | run-31b13fc9019b 48.9 ms, run-8721232bf1f2 50.5 ms (5f8b6df, S 767) | 14.44 s | about 298x |
+| D · Traverse | a74853d | run-60e7bb6f9004 | 141.8 ms | 70.5 MB | 618 | 1 | 25.22 | 70.08 | run-79d73088c3c3 143.1 ms, run-053708dfffa2 148.6 ms (13b0490, S 600) | 72.69 s | about 513x |
 
 Points are 50 × log10(K), worked out from the board's K.
 

@@ -27,6 +27,8 @@
   used reruns.
 - **Lesson:** a local CPU win is a hypothesis until a board run confirms it.
 
+Final repository state (commit eba990a; code a74853d = 13b0490 plus the step-20 polish, S 618): run-60e7bb6f9004, 141.8 ms, 70.5 MB, K 25.22. Runs of the hardened code: 143.1, 148.6 and 141.8 ms, median 143.1 ms.
+
 Rows marked "(local)" were measured on an i7-14650HX, cpuset 0-11, under the harness's
 sandbox flags, with `bench/bench.sh` or an equivalent fresh-container run unless the row
 says otherwise. Memory units: the board reports M in MB, meaning 10^6 bytes of cgroup
