@@ -14,7 +14,7 @@
 //! and name-table slot each record needs, the second uses them, by which
 //! time most of those cache misses have overlapped.
 
-use crate::names::{key, Budget, Key, Pairs};
+use crate::names::{Budget, Key, Pairs};
 use crate::run::Shared;
 use std::arch::x86_64 as simd;
 use std::sync::atomic::Ordering::Relaxed;
@@ -34,11 +34,8 @@ const BLOCKS: usize = WINDOW / 64;
 const SEPS: usize = WINDOW + 8;
 /// The most records one window completes (each takes five separators).
 const RECORDS: usize = WINDOW / 5 + 2;
-/// SWAR constants: '0' in every byte, 0x80 - 10 in every byte, and bit 7 of
-/// every byte (see `classify`).
+/// '0' in every byte of a word.
 const ZEROS: u64 = 0x3030_3030_3030_3030;
-const TENS: u64 = 0x7676_7676_7676_7676;
-const HIGH: u64 = 0x8080_8080_8080_8080;
 
 /// Why a run could not count the file, worst last.
 #[derive(Clone, Copy, Debug)]
@@ -121,7 +118,6 @@ impl Parser {
     pub fn chunk(&mut self, sh: &Shared, b: &[u8], span: Span, out: &mut Local) -> Res<u64> {
         let (start, end, eof) = span;
         let (mut n, mut record, mut quotes_at_record) = (0, start, 0);
-        let last_region = sh.regions.map.len() as u64 - 1;
         // In-quotes state (all ones or zero) at the end of the last block,
         // quotes so far, and the LFs outside quotes, which must number
         // exactly the records.
@@ -147,14 +143,15 @@ impl Parser {
             for r in 0..done {
                 let s: &[u32; 5] = self.seps[5 * r..5 * r + 5].try_into().unwrap();
                 let lf = s[4] as usize;
-                if b[lf] != b'\n' && lf != end {
+                // SAFETY: separators are before the chunk's end (or at it).
+                if unsafe { byte(b, lf) } != b'\n' && lf != end {
                     return Err(Fail::Malformed(record));
                 }
                 let (k, bit) = ((lf - window) / 64, (lf - window) % 64);
                 let below = (self.quote_mask[k] & !(u64::MAX << bit)).count_ones();
                 let quotes_at = self.quotes_before[k] + below;
                 let f = &mut self.records[r];
-                let ok = fields(f, b, record, s, quotes_at - quotes_at_record, last_region);
+                let ok = fields(f, sh, b, record, s, quotes_at - quotes_at_record);
                 ok.ok_or(Fail::Malformed(record))?;
                 crate::prefetch(&sh.regions.map[f.region as usize]);
                 sh.table.prefetch(&f.key);
@@ -165,7 +162,8 @@ impl Parser {
                 let a = &mut out.aggs[usize::from(group)];
                 (a[0], a[1], a[2]) = (a[0] + f.id, a[1] + f.cents, a[2] + f.text);
                 (a[3], a[4]) = (a[3].min(f.cents), a[4].max(f.cents));
-                let id = sh.table.find(&f.key, &b[f.name as usize..], &mut out.budget)?;
+                let name = &b[f.name as usize..];
+                let id = sh.table.find(&f.key, name, &mut out.budget)?;
                 out.pairs.push(id, group);
             }
             self.seps.copy_within(5 * done..n, 0);
@@ -180,35 +178,42 @@ impl Parser {
 
 /// Where the first record starts, after the BOM-prefixed header line.
 pub fn header(b: &[u8]) -> Option<usize> {
-    let p = 3 * usize::from(bom_at(b, 0));
+    if b.len() < HEADER.len() + 8 {
+        return None;
+    }
+    // SAFETY: just checked.
+    let p = 3 * usize::from(unsafe { bom_at(b, 0) });
     let q = p + HEADER.len();
     let crlf = usize::from(b[q] == b'\r');
     (b[p..q] == *HEADER && b[q + crlf] == b'\n').then_some(q + crlf + 1)
 }
 
 /// Parses into `f` the record starting at `at` whose separators (four
-/// commas, then the terminator or the end of file) are at `s`, with `quotes`
-/// quote bytes in it; `last` is the region map's last index. The text fields
+/// commas, then the terminator or the end of file) are at `s`, with `q`
+/// quote bytes in it. The text fields
 /// need no parsing: a field's raw bytes are between its separators (and its
 /// quotes, if it is quoted), and its unescaped length is its width, less its
 /// delimiters, less one per `""`.
 #[inline(always)]
-fn fields(f: &mut Record, b: &[u8], at: usize, s: &[u32; 5], quotes: u32, last: u64) -> Option<()> {
+fn fields(f: &mut Record, sh: &Shared, b: &[u8], at: usize, s: &[u32; 5], q: u32) -> Option<()> {
     let [c0, c1, c2, c3, lf] = s.map(|c| c as usize);
+    // SAFETY (both): the record starts at `at` and ends at `lf`, at most the
+    // chunk's end; `c0 + 1` and `c1 + 1` are at most `c2`, and `lf - 1` is
+    // at least `at`. These are the only bytes read below.
+    let byte = |p| unsafe { byte(b, p) };
+    let bom = usize::from(unsafe { bom_at(b, at) });
+    let cr = usize::from((byte(lf - 1) == b'\r') & (byte(lf) == b'\n'));
     // A BOM directly after a terminator is not data (spec 2.1).
-    let id = number(b, at + 3 * usize::from(bom_at(b, at)), c0)?;
-    let region = number(b, c2 + 1, c3)?;
-    let cr = usize::from((b[lf - 1] == b'\r') & (b[lf] == b'\n'));
-    let cents = cents(b, c3 + 1, lf - cr)?;
-    let name_quoted = i64::from(b[c0 + 1] == b'"');
-    let note_quoted = i64::from(b[c1 + 1] == b'"');
+    let (id, region, cents) = numbers(b, at + 3 * bom, [c0, c2, c3], lf - cr)?;
+    let (name_quoted, note_quoted) = (i64::from(byte(c0 + 1) == b'"'), i64::from(byte(c1 + 1) == b'"'));
     // Name and note together; only the quotes, delimiting or escaping, are
     // not value bytes, and an escape is two of them for one value byte.
-    let text = c2 as i64 - c0 as i64 - 2 - name_quoted - note_quoted - i64::from(quotes / 2);
+    let text = c2 as i64 - c0 as i64 - 2 - name_quoted - note_quoted - i64::from(q / 2);
     let name = c0 + 1 + name_quoted as usize;
     let len = (c1 - name).checked_sub(name_quoted as usize)?;
     // Every id past the map's end shares its trailing 0 (`_UNMATCHED`).
-    (f.key, f.name, f.region) = (key(b, name, len), name as u32, region.min(last) as u32);
+    let region = region.min(sh.regions.map.len() as u64 - 1) as u32;
+    (f.key, f.name, f.region) = (sh.table.key(b, name, len), name as u32, region);
     (f.id, f.cents, f.text) = (id as i64, cents, text);
     Some(())
 }
@@ -217,8 +222,10 @@ fn fields(f: &mut Record, b: &[u8], at: usize, s: &[u32; 5], quotes: u32, last: 
 /// stands for byte `o + i`.
 #[inline(always)]
 fn masks(b: &[u8], o: usize) -> [u64; 3] {
-    let block = b[o..o + 64].as_ptr().cast::<simd::__m256i>();
-    // SAFETY: `block` points to 64 readable bytes. The intrinsics need AVX2,
+    debug_assert!(o + 64 <= b.len());
+    let block = b.as_ptr().wrapping_add(o).cast::<simd::__m256i>();
+    // SAFETY: `block` points to 64 readable bytes: blocks start before the
+    // chunk's end, which `PAD` bytes follow. The intrinsics need AVX2,
     // which the whole crate is compiled for (`-C target-cpu=x86-64-v3` in
     // .cargo/config.toml; main.rs refuses to build without it).
     unsafe {
@@ -262,40 +269,117 @@ fn flatten(seps: &mut [u32; SEPS], n: usize, mut mask: u64, base: u32) -> usize 
     n + count
 }
 
-/// Little-endian load of the 8 bytes at `p`.
+/// Little-endian load of the 8 bytes at `p`, unchecked: about one in
+/// twenty of the hot loop's instructions was this bounds check.
+///
+/// # Safety
+/// `p + 8 <= b.len()`. Every caller loads within a chunk's buffer at most
+/// 24 bytes past the end of a field or name (`Table::key`), so at most 32
+/// past the chunk's end, and every buffer has `PAD` (128) bytes after it.
 #[inline(always)]
-pub fn load(b: &[u8], p: usize) -> u64 {
-    assert!(p + 8 <= b.len());
-    // SAFETY: the 8 bytes at `p` are in `b`, as just checked. One compare
-    // instead of the slice and conversion checks of the safe form.
+pub unsafe fn load(b: &[u8], p: usize) -> u64 {
+    debug_assert!(p + 8 <= b.len());
+    // SAFETY: the caller's promise.
     unsafe { b.as_ptr().add(p).cast::<u64>().read_unaligned() }
 }
 
-fn bom_at(b: &[u8], p: usize) -> bool {
-    load(b, p) & 0xFF_FFFF == BOM
-}
-
-/// The decimal integer that is exactly `b[start..end]`. Its length is
-/// known, so up to eight digits are checked and converted in one step.
+/// The byte at `p`, unchecked like `load`.
+///
+/// # Safety
+/// `p < b.len()`: every caller's `p` is within a record of the chunk, or
+/// its terminator, so at most the chunk's end, which `PAD` bytes follow.
 #[inline(always)]
-fn number(b: &[u8], start: usize, end: usize) -> Option<u64> {
-    let n = end.checked_sub(start).filter(|&n| n > 0)?;
-    if n > 8 {
-        return long_number(&b[start..end]);
-    }
-    // Shift the n digits to the top: the bytes after the field fall off, and
-    // the vacated low bytes read as leading zeros.
-    let (values, other) = classify(load(b, start));
-    let shift = 64 - 8 * n;
-    (other << shift == 0).then(|| eight_digits(values << shift))
+unsafe fn byte(b: &[u8], p: usize) -> u8 {
+    debug_assert!(p < b.len());
+    // SAFETY: the caller's promise.
+    unsafe { *b.get_unchecked(p) }
 }
 
-/// A number of more than eight digits. 2.1 sets no limit, so this
-/// saturates at `u64::MAX`: such a region id is simply unknown, while an id
-/// or amount that large cannot be summed in 64 bits anyway (2.2 keeps ids
-/// below 4 x 10^7 and amounts below 10^5).
+/// Whether a BOM starts at `p`.
+///
+/// # Safety
+/// As for `load`: `p` is a record start (or 0), at most the chunk's end.
+unsafe fn bom_at(b: &[u8], p: usize) -> bool {
+    // SAFETY: the caller's promise.
+    unsafe { load(b, p) & 0xFF_FFFF == BOM }
+}
+
+/// A record's id, region id and amount in cents: the fields `b[id..c0]`,
+/// `b[c2 + 1..c3]` and `b[c3 + 1..end]`. In the common case (ids of up to 8
+/// digits, amounts of up to 5 before the dot: everything 2.2 writes) the
+/// three are checked and converted together, as the lanes of one AVX2
+/// register; anything else takes the slow `number` and `cents`.
+#[inline(always)]
+fn numbers(b: &[u8], id: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<(u64, u64, i64)> {
+    // SAFETY: `c3 + 1` is at most `end`, within the chunk; `end - 3` is
+    // read only when the amount has at least four bytes.
+    let negative = unsafe { byte(b, c3 + 1) } == b'-';
+    let whole = end.wrapping_sub(c3 + 4 + usize::from(negative)); // digits before the dot
+    let (n_id, n_region) = (c0.wrapping_sub(id), c3.wrapping_sub(c2 + 1));
+    let common = (1..=8).contains(&n_id) & (1..=8).contains(&n_region) & (1..=5).contains(&whole);
+    if !common || unsafe { byte(b, end - 3) } != b'.' {
+        return slow(b, id, [c0, c2, c3], end);
+    }
+    // Each number right-aligned in a word: its n digits at the top (the
+    // bytes after the field fall off), and '0's below them.
+    // SAFETY (`bzhi`, the low `shift` bits of '0's): BMI2 is part of
+    // x86-64-v3, which the whole crate is compiled for.
+    let fit = |w: u64, n: usize| {
+        let shift = 64 - 8 * n as u32;
+        w << shift | unsafe { simd::_bzhi_u64(ZEROS, shift) }
+    };
+    // The amount's last 8 bytes with the dot shifted out: `whole` digits,
+    // then the two after the dot, at the top.
+    // SAFETY (the three loads): `end - 8` is at least 0, as a record is at
+    // least 10 bytes before its LF; `id` and `c2 + 1` start fields that end
+    // before `end`, within the chunk.
+    let w = unsafe { load(b, end - 8) };
+    let before = !(u64::MAX << (8 * (6 - whole)));
+    let undotted = (w & 0xFF_FFFF_FFFF) << 8 | w & 0xFFFF << 48;
+    let amount = undotted & !before | ZEROS & before;
+    let [id, region] = [id, c2 + 1].map(|p| unsafe { load(b, p) });
+    let lanes = [fit(id, n_id), fit(region, n_region), amount, ZEROS];
+    let ([id, region, cents, _], sign) = (digits(lanes)?, 1 - 2 * i64::from(negative));
+    Some((id, region, sign * cents as i64))
+}
+
+/// Four words of eight ASCII digits each (the first in the lowest byte) to
+/// their values, or `None` if any byte is not a digit. Adjacent digits
+/// combine into pairs, the pairs into fours, the fours into eight.
+#[inline(always)]
+fn digits(lanes: [u64; 4]) -> Option<[u64; 4]> {
+    // SAFETY: plain AVX2 arithmetic on a local array; the whole crate is
+    // compiled for AVX2 (see `masks`).
+    unsafe {
+        let v = simd::_mm256_loadu_si256(lanes.as_ptr().cast());
+        let d = simd::_mm256_sub_epi8(v, simd::_mm256_set1_epi8(b'0' as i8));
+        let ok = simd::_mm256_cmpeq_epi8(simd::_mm256_min_epu8(d, simd::_mm256_set1_epi8(9)), d);
+        let pairs = simd::_mm256_maddubs_epi16(d, simd::_mm256_set1_epi16(10 | 1 << 8));
+        let fours = simd::_mm256_madd_epi16(pairs, simd::_mm256_set1_epi32(100 | 1 << 16));
+        let high = simd::_mm256_mul_epu32(fours, simd::_mm256_set1_epi64x(10_000));
+        let value = simd::_mm256_add_epi64(high, simd::_mm256_srli_epi64::<32>(fours));
+        let mut out = [0u64; 4];
+        simd::_mm256_storeu_si256(out.as_mut_ptr().cast(), value);
+        (simd::_mm256_movemask_epi8(ok) == -1).then_some(out)
+    }
+}
+
+/// The decimal integer that is exactly `digits` (not empty). 2.1 sets no
+/// limit on its length, so this saturates at `u64::MAX`: such a region id is
+/// simply unknown, while an id or amount that large cannot be summed in 64
+/// bits anyway (2.2 keeps ids below 4 x 10^7 and amounts below 10^5).
+/// `numbers` for any other fields, one at a time; out of line, so that the
+/// hot loop keeps its registers.
 #[cold]
-fn long_number(digits: &[u8]) -> Option<u64> {
+#[inline(never)]
+fn slow(b: &[u8], id: usize, [c0, c2, c3]: [usize; 3], end: usize) -> Option<(u64, u64, i64)> {
+    let region = number(b.get(c2 + 1..c3)?)?;
+    Some((number(b.get(id..c0)?)?, region, cents(b, c3 + 1, end)?))
+}
+
+#[cold]
+fn number(digits: &[u8]) -> Option<u64> {
+    let digits = (!digits.is_empty()).then_some(digits)?;
     digits.iter().try_fold(0u64, |v, &d| {
         let d = d.checked_sub(b'0').filter(|&d| d < 10)?;
         Some(v.saturating_mul(10).saturating_add(u64::from(d)))
@@ -303,45 +387,14 @@ fn long_number(digits: &[u8]) -> Option<u64> {
 }
 
 /// The amount `-?[0-9]+\.[0-9]{2}` that is exactly `b[start..end]`, in
-/// cents. Up to five integer digits (every amount 2.2 allows) take one SWAR
-/// step: the dot is shifted out of the word that ends at `end`, and the
-/// bytes before the field are replaced by '0's.
-#[inline(always)]
+/// cents (see `numbers` for the common case).
+#[cold]
 fn cents(b: &[u8], start: usize, end: usize) -> Option<i64> {
     let negative = b[start] == b'-';
     let digits = end.checked_sub(start + usize::from(negative) + 3)?;
-    let cents = if (1..=5).contains(&digits) {
-        let w = load(b, end - 8); // a record is at least 10 bytes before its LF
-        let undotted = (w & 0xFF_FFFF_FFFF) << 8 | w & 0xFFFF << 48;
-        let before = (1u64 << (8 * (6 - digits))) - 1;
-        let (values, other) = classify(undotted & !before | ZEROS & before);
-        (other == 0 && w >> 40 & 0xFF == u64::from(b'.')).then(|| eight_digits(values))?
-    } else {
-        let whole = number(b, end - 3 - digits, end - 3)?;
-        let fraction = number(b, end - 2, end)?;
-        (b[end - 3] == b'.').then_some(whole.checked_mul(100)?.checked_add(fraction)?)?
-    };
+    let whole = number(&b[end - 3 - digits..end - 3])?;
+    let fraction = number(&b[end - 2..end])?;
+    let cents = (b[end - 3] == b'.').then_some(whole.checked_mul(100)?.checked_add(fraction)?)?;
     let cents = i64::try_from(cents).ok()?;
     Some(if negative { -cents } else { cents })
-}
-
-/// The bytes of `w` minus '0', and bit 7 set in every byte that is not a
-/// digit. Digits become 0 to 9; any other byte becomes 10 or more (or wraps
-/// to 0xD0 or more), which adding 0x76 lifts to bit 7. Borrows and carries
-/// only move towards later bytes, so bytes up to and including the first
-/// non-digit are classified correctly, which is all the callers rely on.
-#[inline(always)]
-fn classify(w: u64) -> (u64, u64) {
-    let values = w.wrapping_sub(ZEROS);
-    (values, (values.wrapping_add(TENS) | values) & HIGH)
-}
-
-/// Eight digit values (0..=9, the first in the lowest byte) to an integer:
-/// adjacent digits combine into pairs, the pairs into fours, the fours into
-/// eight, two lanes per multiply.
-#[inline(always)]
-fn eight_digits(v: u64) -> u64 {
-    let v = v.wrapping_mul(10).wrapping_add(v >> 8) & 0x00FF_00FF_00FF_00FF;
-    let v = v.wrapping_mul(1 + (100 << 16)) >> 16 & 0x0000_FFFF_0000_FFFF;
-    v.wrapping_mul(1 + (10_000 << 32)) >> 32
 }
