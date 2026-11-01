@@ -70,7 +70,7 @@ and marked "(computed)".
 | 18 (board) | v4 (commit 173a349), S 551, K 25.64: rerun, the median | run-bc431b72ba59 | 0.1421 | 70.4 | 70.45 |
 | 18 (board) | v4 (commit 173a349), S 551, K 25.67: rerun | run-93e2691801f2 | 0.1412 | 71.2 | 70.47 |
 | **final** (board) | **v4, the submission** (commit 173a349), S 551, K 25.80: best run | run-1d538165ea54 | **0.1404** | **70.4** | **70.58** |
-| 19 | Operator hardening, no change on valid input: errors are reported as `track-d: ...` with the path and exit status 1 (empty file, missing final newline, bad header, n above 2^26 or m above 2^32 - 1, node id not below n, edge count unlike the header, weight above 2^32 - 1, bad query line with its number, unreadable or unwritable files); the id check rides the counting pass. Optional `[data] [out]` arguments, a static binary, an offline build. S 551 to 600 | | CPU within noise of v4 (median 1219 vs 1202 ms, interleaved, heavy load) | 68 MiB (local) | |
+| 19 | Operator hardening, no change on valid input: errors are reported as `track-d: ...` with the path and exit status 1 (empty file, missing final newline, bad header, n above 2^26 or m above 2^32 - 1, node id not below n, edge count unlike the header, weight above 2^32 - 1, bad query line with its number, unreadable or unwritable files); the id check rides the counting pass. Optional `[data] [out]` arguments, a static binary, an offline build. S 551 to 600 | run-053708dfffa2 | 0.1486 | 70.5 | 69.68 |
 
 Over the five board runs of the v4 code: median 142.1 ms, middle-3 mean 143.2 ms, mean
 143.6 ms, M 70.4-71.2 MB.

@@ -65,7 +65,7 @@ Labels: v1 to v4.1 are the builds submitted as the track's entry; c1 to c11 are 
 | 33 | **v4 as submitted** (c11): the pread version with 64 KiB pieces, a 128-byte zero pad and 1 KiB of read slack. Board 49.2 and 49.3 ms, 12.5 and 12.4 MB, K 25.29 and 25.32; a third run 51.4 ms (run-6fbf421cc19e). Racy, as found later (row 35). | run-8fe71efe0f84, run-1e5d2353fd9f | 0.0492, 0.0493 | 12.5, 12.4 | 70.15; 70.17 |
 | 34 | Failed: a simplification pass (23 code lines fewer) shipped together with the race fix: 58.9 ms. Reverted. | run-1d81a262b26c | 0.0589 | | – |
 | 35 | **v4.1 (final):** v4 plus the one-line race fix. 49.4 ms, 12.3 MB, K 25.29; the shipped build 49.1 ms, 12.1 MB, S 734, K 25.47. | run-0f99c23b4b3e, run-0fc0507654be | 0.0494, 0.0491 | 12.3, 12.1 | 70.15; final 70.30 |
-| 36 | Since v4.1, not yet on the board: notes on stderr for both fallbacks, the byte offset of the first grammar error, regions.csv errors naming the byte offset of their line, a cap on the table retries, one error message when several workers fail at once. Error paths and comments only (the hot loop's grammar check now names its mask `bad`, the same computation); S 767 (static_axes), up from 734. | | | | |
+| 36 | Since v4.1: notes on stderr for both fallbacks, the byte offset of the first grammar error, regions.csv errors naming the byte offset of their line, a cap on the table retries, one error message when several workers fail at once. Error paths and comments only (the hot loop's grammar check now names its mask `bad`, the same computation); S 767 (static_axes), up from 734. | run-31b13fc9019b | 0.0489 | 12.6 | 70.03 |
 
 Notes on the longer rows:
 

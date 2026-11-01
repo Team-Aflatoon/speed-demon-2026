@@ -4,6 +4,51 @@ Our entry for [Speed Demon 2026](https://speeddemon.dev), the 72-hour performanc
 
 We entered all four tracks. Each one is a standalone Rust program with **no dependencies** beyond the standard library, built offline from its own folder. Our presentation is in [`docs/PRESENTATION.md`](docs/PRESENTATION.md).
 
+## Results on the live board
+
+Seed 1, single runs on the organisers' scoring machine; final scoring uses a private holdout seed and five runs. Every row below is a board run that passed the output check on seed 1. Run IDs are listed in each track's `PERF.md`.
+
+**The shipped code** (the commit each track folder holds now):
+
+| Track | Commit | Board run | T | M | S | D | K | Points | Reference | Speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A · Ingest | 32b49b8 | run-996cb0022b51 | 20.4 ms | 18.2 MB | 532 | 1 | 46.93 | 83.57 | 32.05 s | about 1,570x |
+| B · Index | 701dd4f | run-3ae92ad95108 | 186.0 ms | 36.1 MB | 1299 | 1 | 25.54 | 70.36 | 56.35 s | about 303x |
+| C · Join | 5f8b6df | run-31b13fc9019b | 48.9 ms | 12.6 MB | 767 | 1 | 25.15 | 70.03 | 14.44 s | about 295x |
+| D · Traverse | 13b0490 | run-053708dfffa2 | 148.6 ms | 70.5 MB | 600 | 1 | 24.75 | 69.68 | 72.69 s | about 489x |
+
+Points are 50 × log10(K), worked out from the board's K.
+
+**The same algorithms before the last hardening and error-message changes**, for the record. These were measured on earlier commits with fewer lines:
+
+| Track | Build | Board runs | T | M | K |
+|---|---|---|---|---|---|
+| A | 1cd61cf, S 514 | run-2491c9d07251, run-237f722dfeb2 | 20.0 and 20.1 ms (median 20.05) | 18.0 MB | 47.72, 47.67 |
+| B | same output code, S 1269 | run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5 | 188.7, 187.6 and 188.6 ms (median 188.6) | 36.2 MB | 25.46 (median) |
+| C | v4.1, S 734 | run-0fc0507654be | 49.1 ms | 12.1 MB | 25.47 |
+| D | v4, S 551 | median of five runs; best run-1d538165ea54 | median 142.1 ms (140.4 to 147.9); best 140.4 ms | 70.4 MB | best 25.80 |
+
+The shipped builds have a slightly lower K on A, C and D (B's is within noise): the added code (input checks, error messages naming the offending path or byte, notes on the fallbacks) costs lines, and the T differences between the two tables are within the board noise described below. We ship them because an input we have never seen must fail loudly and say why. Track C's shipped build also carries the race fix described under Correctness.
+
+### Red runs in our board history
+
+A red run is a deliberate wrong-output probe (or, on Track A, two probes that aborted at start because they read command-line arguments), never a failure of a submitted build.
+
+| Track | Red runs | What they were |
+|---|---|---|
+| A | run-8ea2db5074de, run-d570a81674c0; aborted at start: run-f70b36471354, run-f71c8ec82249 | read-floor and ingest-only probes; the two aborted ones were read-floor probes that took their mode from argv |
+| B | none | every Track B board run is a correct build |
+| C | run-1f26df4f9d6d, run-eec975c57826, run-30db742f2dea, run-16449b27e8f7, run-c09fe1629bb8 | probes c2, c4, c3, c1, c5: scan only, plus flattening, plus field parsing, everything but names, and the same on 6 threads |
+| D | run-94d4d2fef344, run-e96c9c86ab33, run-148c3b623aad, run-9efbc7bcc92f, run-8db29a146c98 | prefix probes d0, d3, d4, d2, d1: start-up, one parse, second parse and scatter, first CSR, whole build with no queries |
+
+### Reading the numbers: the box, the laptop and board noise
+
+- **The box is slower than our laptop, by a different factor for each kind of work.** About 1.45x on Track D, about 1.6x on Track C, and 1.9x on Track A's v7 (24.5 ms on the box against a 13.1 ms local median). Scan-bound work transfers (Track C's block scan: 1.1x); per-record work costs 2 to 3 times more on the box (2.5 GHz, turbo off, smaller caches). Sources: [A](track-a/PERF.md), [C](track-c/PERF.md), [D](track-d/PERF.md).
+- **Board noise.** Repeated runs of one build differed by at most 3.5% on Track A (excluding one outlier set aside in its PERF), and by 5% on Track D's final code (140.4 to 147.9 ms over five runs). Early, loaded runs spread more: up to 17% on Track D's v1 (156.0, 166.5 and 181.9 ms). Differences of a few percent between two builds are therefore not evidence either way; we decided on reruns and on head-to-head pairs.
+- **Which numbers are which.** Board figures carry a run ID. Anything labelled "local" in the READMEs and PERF files was measured on our laptop and only chose candidates.
+
+## What each track does
+
 | Track | Task | Folder | Approach in one line |
 |---|---|---|---|
 | A · Ingest | 3.1M log lines → per-hour, per-endpoint counts, p50/p95/p99 and 5xx rate | [`track-a/`](track-a/) | Eleven workers read 128 KB pieces with `pread`, turn each line into a 4-byte record in its hour's log, and report each hour while parsing; exact counts prove the early reports were safe, otherwise the job reruns |
@@ -13,54 +58,62 @@ We entered all four tracks. Each one is a standalone Rust program with **no depe
 
 Every track folder holds what the rules ask for: `Dockerfile`, `.speed-demon.toml`, `README.md` (approach, dependencies, next 24 hours), `PERF.md` (the optimisation log, with live-board run IDs) and the source.
 
-## Results on the live board
+## Correctness
 
-Live board, seed 1, single run; final scoring uses a private holdout seed and five runs. The board runs on the organisers' scoring machine, so these are real scoring-box numbers. Each row is the submitted build, verified correct.
+Speed that is wrong scores zero, and the final data is a seed we have never seen.
 
-| Track | Best board run | T | M | S | D | K | Points |
-|---|---|---|---|---|---|---|---|
-| A · Ingest | run-97875b283660 | 20.2 ms | 17.9 MB | 530 | 1 | 47.33 | 83.76 |
-| B · Index | run-d4d593bc34cf | 189.6 ms | 36.6 MB | 1317 | 1 | 25.25 | 70.11 |
-| C · Join | run-1e5d2353fd9f | 49.3 ms | 12.4 MB | 729 | 1 | 25.32 | 70.17 |
-| D · Traverse | run-1d538165ea54 | 140.4 ms | 70.4 MB | 551 | 1 | 25.80 | 70.58 |
-
-Against the organisers' reference programs:
-
-| Track | Reference time | Our time | Speedup |
-|---|---|---|---|
-| A | 32.05 s | 20.2 ms | about 1,590x |
-| B | 56.35 s | 189.6 ms | about 297x |
-| C | 14.44 s | 49.3 ms | about 293x |
-| D | 72.69 s | 140.4 ms | about 518x |
-
-Later runs of the current code, for the record: A run-722c4fd2fd96 (20.2 ms, 18.3 MB, K 47.03; the current source is S 537 after a review fix that changes no behaviour), B run-e86006cfe15d (192.4 ms), C run-a35a3da640f6 (49.1 ms, K 25.29), D run-bc431b72ba59 (142.1 ms). Board runs vary by a few percent from run to run. Each track's `PERF.md` lists every step with its run ID.
+- **Unseen seeds.** Full-size seeds beyond the public one, tiny and sample seeds, and the spec's own worked examples.
+- **Adversarial, spec-valid inputs.** Hand-written edge cases and hostile files: shuffled, reversed and late-line logs, huge records, records longer than a read buffer, malformed lines the reference also rejects.
+- **Every fallback forced.** A's rerun, B's segment splitting, C's single-chunk reparse and table regrowth, D's 64-bit retry were each triggered on purpose and produced the right bytes.
+- **A holdout-safety audit.** We listed every fixed limit in all four programs and checked it against what the spec guarantees for any seed; the two Track B limits that were only safe in practice were made safe for any valid input.
+- **A concurrency audit.** 8,895 runs with injected delays in the threaded paths: 0 wrong outputs.
+- **The one real bug our own stress testing caught.** Track C's v4 had a 1-in-100 publication race in its lock-free name table: a slot's hash word briefly overwrote its `meta` word, so another core could take the slot for a published one of a different length and insert the same name twice, which changed one distinct count by one. A 300-run stress test of the submitted image found it, and the fix was one line (write only the three name words). It matters because final scoring needs all five runs correct: at 1 in 100 that is about a 5% chance of a zero. The board never showed it, since each board run is a single run. Details in [`track-c/PERF.md`](track-c/PERF.md).
+- **Judge-style reviews.** We reviewed each track against the official criteria (code quality, technique, optimisation log), fixed what came up, and re-verified before every push.
 
 ## How we worked
 
 - **Rust with zero dependencies.** Standard library plus a few hand-declared libc calls, so D = 1 and the code stays short.
-- **Every change measured on the scoring box itself.** Our laptop and the box disagree: several changes that were 20 to 25% faster locally were no faster there (turbo off at 2.5 GHz, smaller caches, and memory-bound work suffers most). Local timings only chose candidates.
-- **Box ablation probes.** The board records time and memory even when the output is wrong, so we pushed deliberately incomplete builds (read the file only, parse without the name table, build the graph without the queries). They fail the hash on purpose and are the red runs in our board history. Subtracting their times gave the cost of each phase on the real machine, and each one is documented in its track's `PERF.md`.
+- **Every speed decision settled on the scoring box.** Our laptop and the box disagree (see above): several changes that were 20 to 25% faster locally were no faster there. Local timings only chose candidates; board runs decided.
+- **Box ablation probes.** The board records time and memory even when the output is wrong, so we pushed deliberately incomplete builds (read the file only, parse without the name table, build the graph without the queries). They fail the hash on purpose and are the red runs above. Subtracting their times gave the cost of each phase on the real machine.
 - **Correct head-to-head candidates after that.** Once a question was answered we stopped probing and compared complete, correct builds back to back (for example `pread` against `mmap` in Track A: 24.5 ms down to 20.7 ms).
-- **Correctness on many unseen seeds.** Full-size seeds beyond the public one, tiny and sample seeds, hand-written edge cases from the spec, and adversarial files (shuffled, reversed, late lines, huge records). Every fallback path (A's rerun, B's segment splitting, C's single-chunk reparse and table regrowth, D's 64-bit retry) was forced on purpose and produced the right bytes.
-- **A holdout-safety audit.** We listed every fixed limit in all four programs and checked it against what the spec guarantees for any seed; the two Track B limits that were only safe in practice were made safe for any valid input.
-- **Judge-style reviews.** We reviewed each track against the official criteria (code quality, technique, optimisation log), fixed what came up, and re-verified before every push.
+- **We rejected faster builds when they cost more than they earned.** The formula penalises code size and memory, so a build that gained 2 to 3% in T but added 100 lines or a few MB lost K. Track D's one-parse build (140.3 ms, S 551 to 662) and its page-fault-reduction builds (about 2 to 3% faster, +2.5 MB and S 589 to 609) were dropped for that reason, as were Track C's owner-partitioned names (20 to 25% faster locally, no faster on the box, S 889) and its half-load name table (faster, but about 7 MB more).
 
 ## How it is scored
 
 K = (T_ref/T)^0.50 × min(M_ref/M, 50)^0.20 × min(S_ref/S, 1)^0.15 × (D_ref/D)^0.15. Wall time dominates and is uncapped. Memory pays up to 50× less than the reference. Source lines and dependencies can only cost. That shaped every decision here: zero crates (D = 1), no needless copies of the input (Tracks A, B and C read it in cache-sized pieces with `pread`; Track D memory-maps it), and short code.
 
-## Reproducing our numbers
+## How to verify a change
 
-`check.py` is the organisers' checker from the starter template. `bench/bench.sh` is our stricter local stand-in for the scoring harness: the same sandbox flags, cores 0-11, a warmed page cache, and the run's cgroup `memory.peak`, over five runs with a sha256 check.
+`check.py` is the organisers' checker from the starter template. `bench/bench.sh` is our stricter local stand-in for the scoring harness: the same sandbox flags, cores 0-11, a warmed page cache, and the run's cgroup `memory.peak`, with a sha256 check of the output. `bench.sh` holds the seed-1 hashes; pass `EXPECT_SHA` for any other seed.
 
 ```sh
-# datasets come from the public generators (seed 1 is the board's dataset)
+# 1. Generate the data with the public generators (seed 1 is the board's dataset)
 git clone https://github.com/hackathon-raptors/speed-demon-2026 ../sd-official
-python3 ../sd-official/generators/a_ingest.py --seed 1 --scale full --out data/a
-# load data/<track> into the docker volume `sd-data`, then:
+python3 ../sd-official/generators/a_ingest.py --seed 1 --scale full --out data/a   # likewise b, c, d
+
+# 2. Load it into the docker volume `sd-data`: subdirs a..d for seed 1, s7-a..s7-d for seed 7
+docker run --rm -v "$PWD/data:/src:ro" -v sd-data:/data \
+  debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad \
+  sh -c 'mkdir -p /data/a && cp /src/a/* /data/a/'      # repeat with b, c, d; for seed 7 copy a seed-7 tree to /data/s7-a ...
+
+# 3. Correctness against the organisers' checker
+python3 check.py a --data data/a
+
+# 4. Timing, memory.peak and output sha, five runs, seed 1
 bash bench/bench.sh a 5
-python3 bench/static_axes.py track-a   # S and D exactly as the harness counts them
+
+# 5. A second seed: take the sha of the reference output for that seed
+EXPECT_SHA=<sha> bash bench/bench.sh a 3 s7-a
+
+# 6. S and D exactly as the harness counts them (needs ../sd-official and its tools image)
+python3 bench/static_axes.py track-a
+
+# 7. The live board: our runs and each track's top five, then the overall standing
+python3 bench/board.py
+python3 bench/overall.py
 ```
+
+Replace `a` with `b`, `c` or `d` for the other tracks.
 
 ## Team
 
