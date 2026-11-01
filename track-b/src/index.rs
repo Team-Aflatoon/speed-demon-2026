@@ -6,7 +6,7 @@
 //! sorted list; a term in more than 1/`DENSE` of the segment's documents also
 //! has a bitmap, which turns AND and NOT against it into bit tests.
 
-use crate::query::{AND, NONE, NOT, OR, TERM_BITS};
+use crate::query::{Table, AND, NONE, NOT, OR, TERM_BITS};
 
 pub const PARTS: usize = 64;
 const DENSE: usize = 16;
@@ -20,7 +20,9 @@ pub struct Part {
     /// Where a dense term's bitmap starts in `bits`, or `NONE`.
     dense: Vec<u32>,
     bits: Vec<u64>,
-    docs_in_segment: usize,
+    /// The partition's hot terms (local number, column in the scan's rows),
+    /// chosen from segment 0: there they were dense.
+    hot: Vec<(usize, usize)>,
 }
 
 impl Part {
@@ -44,7 +46,6 @@ impl Part {
             *at += 1;
         }
         let words = docs.div_ceil(64);
-        self.docs_in_segment = docs;
         self.dense.clear();
         self.dense.resize(terms, NONE);
         self.bits.clear();
@@ -60,6 +61,30 @@ impl Part {
             }
         }
     }
+
+    /// Makes this partition's dense terms of segment 0 hot (partition `p`).
+    pub fn choose_hot(&mut self, table: &Table, p: usize) {
+        for l in (0..self.dense.len()).filter(|&l| self.dense[l] != NONE) {
+            if let Some(column) = table.make_hot((l * PARTS + p) as u32) {
+                self.hot.push((l, column));
+            }
+        }
+    }
+
+    /// Adds the hot terms' bitmaps from the chunks' hot rows (`(rows, first
+    /// block)`, rows `width` words wide) of a segment of `docs` documents.
+    pub fn add_hot(&mut self, rows: &[(&[u64], usize)], width: usize, docs: usize) {
+        for &(l, column) in &self.hot {
+            let at = self.bits.len();
+            self.bits.resize(at + docs.div_ceil(64), 0);
+            self.dense[l] = at as u32;
+            for &(rows, base) in rows {
+                for (r, row) in rows.chunks(width).enumerate() {
+                    self.bits[at + base + r] |= row[column];
+                }
+            }
+        }
+    }
 }
 
 /// The documents of one term in one segment.
@@ -67,27 +92,28 @@ impl Part {
 enum Set<'a> {
     Empty,
     List(&'a [u16]),
-    Dense(&'a [u16], &'a [u64]),
+    /// A bitmap, for a term in more than 1/`DENSE` of the documents or a hot
+    /// term; it has no list.
+    Dense(&'a [u64]),
 }
 
 impl<'a> Set<'a> {
     fn of(parts: &'a [&'a Part], term: usize, words: usize) -> Set<'a> {
         let (part, l) = (parts[term % PARTS], term / PARTS);
         let list = &part.docs[part.offsets[l] as usize..part.offsets[l + 1] as usize];
-        match list.len() {
-            0 => Set::Empty,
-            n if n * DENSE <= part.docs_in_segment => Set::List(list),
-            _ => {
-                let at = part.dense[l] as usize;
-                Set::Dense(list, &part.bits[at..at + words])
-            }
+        match part.dense[l] as usize {
+            _ if part.dense[l] == NONE && list.is_empty() => Set::Empty,
+            _ if part.dense[l] == NONE => Set::List(list),
+            at => Set::Dense(&part.bits[at..at + words]),
         }
     }
 
+    /// The list of a `List` set; empty for the others (`step` never takes the
+    /// list of a dense set).
     fn list(self) -> &'a [u16] {
         match self {
-            Set::Empty => &[],
-            Set::List(list) | Set::Dense(list, _) => list,
+            Set::List(list) => list,
+            _ => &[],
         }
     }
 }
@@ -138,6 +164,7 @@ impl Evaluator {
         }
         match acc {
             Acc::Empty => {}
+            Acc::Term(Set::Dense(bits)) => answer.add_bits(bits, base),
             Acc::Term(set) => answer.add_list(set.list(), base),
             Acc::List => answer.add_list(&self.list, base),
             Acc::Bits => answer.add_bits(&self.bits, base),
@@ -170,17 +197,17 @@ impl Evaluator {
         };
         let next = match (op, set, r) {
             // Two dense sets: one pass over the words.
-            (AND | NOT, Set::Dense(_, b), Set::Dense(_, a)) => {
+            (AND | NOT, Set::Dense(b), Set::Dense(a)) => {
                 let not = if op == NOT { !0 } else { 0 };
                 for (o, (&a, &b)) in self.bits.iter_mut().zip(a.iter().zip(b)) {
                     *o = a & (b ^ not);
                 }
                 Acc::Bits
             }
-            (AND | NOT, Set::Dense(_, b), _) => filter(list, b, op == NOT, &mut self.out),
+            (AND | NOT, Set::Dense(b), _) => filter(list, b, op == NOT, &mut self.out),
             // A dense set and a list: test the list against the bitmap.
-            (AND, Set::List(b), Set::Dense(_, a)) => filter(b, a, false, &mut self.out),
-            (NOT, Set::List(_), Set::Dense(_, a)) => {
+            (AND, Set::List(b), Set::Dense(a)) => filter(b, a, false, &mut self.out),
+            (NOT, Set::List(_), Set::Dense(a)) => {
                 self.bits.copy_from_slice(a);
                 self.list = mine;
                 return self.bits_op(NOT, set);
@@ -188,13 +215,15 @@ impl Evaluator {
             (AND | NOT, Set::List(b), _) => {
                 combine(list, b, op == NOT, &mut self.mask, &mut self.out)
             }
-            _ if (list.len() + set.list().len()) * DENSE <= docs => {
-                union(list, set.list(), &mut self.out)
+            (OR, Set::List(b), Set::Empty | Set::List(_))
+                if (list.len() + b.len()) * DENSE <= docs =>
+            {
+                union(list, b, &mut self.out)
             }
             // A large OR: spread both sides into the bitmap.
             _ => {
                 match r {
-                    Set::Dense(_, a) => self.bits.copy_from_slice(a),
+                    Set::Dense(a) => self.bits.copy_from_slice(a),
                     _ => {
                         self.bits.fill(0);
                         set_bits(&mut self.bits, list);
@@ -217,7 +246,7 @@ impl Evaluator {
     /// `bits = bits op set`; AND with a list gives a list.
     fn bits_op<'a>(&mut self, op: u32, set: Set<'a>) -> Acc<'a> {
         match (op, set) {
-            (_, Set::Dense(_, b)) => self.bits.iter_mut().zip(b).for_each(|(a, &b)| {
+            (_, Set::Dense(b)) => self.bits.iter_mut().zip(b).for_each(|(a, &b)| {
                 *a = match op {
                     AND => *a & b,
                     OR => *a | b,

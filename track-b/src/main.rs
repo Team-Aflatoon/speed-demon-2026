@@ -306,7 +306,7 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 let seg = &sh.segments[s];
                 let at = |c: usize| (seg.start + c as u64 * CHUNK_BYTES).min(seg.end);
                 let out = &mut *sh.chunks[s % 2][c].write().unwrap();
-                scanner.scan(sh.file, (at(c), at(c + 1)), seg.first, out);
+                scanner.scan(sh.file, (at(c), at(c + 1)), seg.first, s >= 2, out);
                 &sh.scanned[s]
             }
             Task::Build(s, p) => {
@@ -314,7 +314,7 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 if s >= 1 {
                     wait(&sh.evaluated[s - 1], parsed.len()); // the eval of s - 1 read `parts`
                 }
-                build(sh, s, p, terms, &mut cursor);
+                build(sh, table, s, p, terms, &mut cursor);
                 &sh.built[s]
             }
             Task::Eval(s, r) => {
@@ -349,15 +349,27 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
 
 /// Build task `p` of segment `s`: partition `p`'s postings, or (`p == PARTS`)
 /// the segment's phrase matches folded into the phrase answers, in document order.
-fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
+/// Segment 0 also chooses the hot terms, whose bits later segments (from 2:
+/// segment 1 is scanned while 0 is built) get from the scan's rows.
+fn build(sh: &Shared, table: &Table, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
     let chunks = &sh.chunks[s % 2][..sh.segments[s].chunks];
     let chunks: Vec<_> = chunks.iter().map(|c| c.read().unwrap()).collect();
     let docs = check_ids(&sh.segments, s, &chunks);
     sh.docs[s].store(docs, Relaxed);
     if p < PARTS {
         let streams: Vec<&[u32]> = chunks.iter().map(|c| &c.streams[p][..]).collect();
+        let rows: Vec<_> = chunks
+            .iter()
+            .map(|c| (&c.hot_rows[..], c.hot_base as usize))
+            .collect();
         let mut part = sh.parts[p].write().unwrap();
-        return part.build(&streams, terms, docs as usize, cursor);
+        part.build(&streams, terms, docs as usize, cursor);
+        match s {
+            0 => part.choose_hot(table, p),
+            1 => {}
+            _ => part.add_hot(&rows, table.hot_width(), docs as usize),
+        }
+        return;
     }
     for &(phrase, doc) in chunks.iter().flat_map(|c| &c.matches) {
         let (range, i) = (phrase >> RANGE_SHIFT, phrase & ((1 << RANGE_SHIFT) - 1));
