@@ -82,11 +82,6 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
         let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
         let mut local = Local { aggs, pairs };
         wait(&pending);
-        // PROBE p2: c9's start-up only. No chunk read, no phase 2; main then
-        // writes an empty aggregates.txt (every group has 0 records).
-        if std::hint::black_box(true) { // PROBE
-            return; // PROBE
-        } // PROBE
         while let Some(c) = Some(chunk.fetch_add(1, Relaxed)).filter(|&c| c < chunks) {
             let span = read(file, len - c * piece, c * piece, piece, &mut buffer);
             match parser.chunk(&buffer, span, &mut local) {
