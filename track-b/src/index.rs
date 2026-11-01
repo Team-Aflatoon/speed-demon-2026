@@ -12,6 +12,12 @@ use std::arch::x86_64::*;
 pub const PARTS: usize = 64;
 const DENSE: usize = 16;
 
+/// The words of a bitmap of `docs` documents, whole blocks of four (the
+/// unit of `count_and_sum`); the bits past `docs` stay clear.
+fn words(docs: usize) -> usize {
+    docs.div_ceil(256) * 4
+}
+
 #[derive(Default)]
 pub struct Part {
     /// Term `id` (with `id % PARTS` this partition) has the documents
@@ -33,8 +39,7 @@ impl Part {
     /// `terms` (the scan emits only term ids below `Table::ids`, and
     /// `terms * PARTS >= Table::ids`).
     pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize, cursor: &mut Vec<u32>) {
-        self.offsets.clear();
-        self.offsets.resize(terms + 1, 0);
+        self.offsets = vec![0; terms + 1];
         let counts = &mut self.offsets[1..];
         // The streams were written by other threads: the count runs 256 bytes
         // ahead of itself with prefetches, so their lines arrive in time.
@@ -72,12 +77,9 @@ impl Part {
         }
         // SAFETY: every slot below `total` was written above.
         unsafe { self.docs.set_len(total) };
-        let words = docs.div_ceil(64);
+        let words = words(docs);
         self.docs_in_segment = docs;
-        self.dense.clear();
-        self.dense.resize(terms, NONE);
-        self.present.clear();
-        self.present.resize(terms.div_ceil(64), 0);
+        (self.dense, self.present) = (vec![NONE; terms], vec![0; terms.div_ceil(64)]);
         self.bits.clear();
         for l in 0..terms {
             let (from, to) = (self.offsets[l] as usize, self.offsets[l + 1] as usize);
@@ -97,12 +99,8 @@ impl Part {
 pub fn prefetch(parts: &[&Part], steps: &[u32]) {
     for &step in steps {
         let term = (step & ((1 << TERM_BITS) - 1)) as usize;
-        crate::prefetch(
-            parts[term % PARTS]
-                .offsets
-                .as_ptr()
-                .wrapping_add(term / PARTS),
-        );
+        let offsets = &parts[term % PARTS].offsets;
+        crate::prefetch(offsets.as_ptr().wrapping_add(term / PARTS));
     }
 }
 
@@ -159,16 +157,9 @@ pub struct Evaluator {
 
 impl Evaluator {
     /// Adds the documents of segment `parts` (numbered from `base`, `docs` of
-    /// them) that match the BOOL query `steps` to `answer`.
-    pub fn run(
-        &mut self,
-        parts: &[&Part],
-        steps: &[u32],
-        docs: usize,
-        base: u32,
-        answer: &mut Answer,
-    ) {
-        let words = docs.div_ceil(64);
+    /// them) that match the BOOL query `steps` to the answer `to`.
+    pub fn run(&mut self, parts: &[&Part], steps: &[u32], docs: usize, base: u32, to: &mut Answer) {
+        let words = words(docs);
         self.bits.resize(words, 0);
         self.mask.resize(words, 0);
         let term = |step: u32| (step & ((1 << TERM_BITS) - 1)) as usize;
@@ -179,14 +170,10 @@ impl Evaluator {
         // The query matches nothing here if a term ANDed after the last OR
         // is absent (the first step counts as an OR), or if every term that
         // can add documents (the ORed ones) is absent.
-        let last_or = steps
-            .iter()
-            .rposition(|&s| s >> TERM_BITS == OR)
-            .unwrap_or(0);
-        let and_absent = steps[last_or..]
-            .iter()
-            .any(|s| s >> TERM_BITS == AND && !present(s));
-        if and_absent || !steps.iter().any(|s| s >> TERM_BITS == OR && present(s)) {
+        let op = |s: &u32| s >> TERM_BITS;
+        let last_or = steps.iter().rposition(|s| op(s) == OR).unwrap_or(0);
+        let and_absent = steps[last_or..].iter().any(|s| op(s) == AND && !present(s));
+        if and_absent || !steps.iter().any(|s| op(s) == OR && present(s)) {
             return;
         }
         let set = |step: u32| Set::of(parts, term(step), words);
@@ -200,9 +187,9 @@ impl Evaluator {
         }
         match acc {
             Acc::Empty => {}
-            Acc::Term(set) => answer.add_list(set.list(), base),
-            Acc::List => answer.add_list(&self.list, base),
-            Acc::Bits => answer.add_bits(&self.bits, base),
+            Acc::Term(set) => to.add_list(set.list(), base),
+            Acc::List => to.add_list(&self.list, base),
+            Acc::Bits => to.add_bits(&self.bits, base),
         }
     }
 
@@ -513,97 +500,91 @@ impl Answer {
 
     /// Appends the output line (spec 4).
     pub fn write(&self, out: &mut Vec<u8>) {
-        put(out, u64::from(self.count));
-        out.push(b' ');
-        put(out, self.sum);
-        for &id in &self.ten[..self.kept as usize] {
-            out.push(b' ');
-            put(out, u64::from(id));
+        // At most 12 numbers of up to 20 digits, each with a space or the LF.
+        let (mut line, mut at) = ([0u8; 12 * 21], 0);
+        let ten = self.ten[..self.kept as usize].iter().map(|&i| i.into());
+        for v in [u64::from(self.count), self.sum].into_iter().chain(ten) {
+            at = put(&mut line, at, v);
+            line[at] = b' ';
+            at += 1;
         }
-        out.push(b'\n');
+        line[at - 1] = b'\n';
+        out.extend_from_slice(&line[..at]);
     }
 }
 
-/// The number of set bits of `bits` and the sum of their positions, four
-/// words at a time. Per byte, nibble tables give the count of its bits and
-/// the sum of their positions within the byte; a byte's offset in its word
-/// (8 times its index) weighs its count, and the word's index weighs the
-/// word's count.
+/// The number of set bits of `bits` (whole blocks of four words) and the
+/// sum of their positions, four words at a time. Per byte, nibble tables give
+/// the count of its bits and the sum of their positions within the byte; a
+/// byte's offset in its word (8 times its index) weighs its count, and the
+/// word's index weighs the word's count.
 fn count_and_sum(bits: &[u64]) -> (u64, u64) {
     // Bits set in a nibble, and the sum of their positions.
     const COUNT: [i8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
     const SUM: [i8; 16] = [0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6];
-    let (blocks, rest) = bits.as_chunks::<4>();
     // SAFETY: AVX2 is required by the crate; the loads read whole blocks.
-    let (mut count, mut sum) = unsafe {
+    unsafe {
         let table = |t: [i8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
-        let (count_t, sum_t) = (table(COUNT), table(SUM));
-        let nibbles = _mm256_set1_epi8(0x0F);
+        let (count_t, sum_t, nibbles) = (table(COUNT), table(SUM), _mm256_set1_epi8(0x0F));
         let offsets = _mm256_set1_epi64x(0x3830_2820_1810_0800); // 8 * byte index
         let [mut counts, mut sums, mut weighted] = [_mm256_setzero_si256(); 3];
         let mut index = _mm256_setr_epi64x(0, 1, 2, 3);
-        for block in blocks {
+        for block in bits.as_chunks::<4>().0 {
             let v = _mm256_loadu_si256(block.as_ptr().cast());
-            let (lo, hi) = (
-                _mm256_and_si256(v, nibbles),
-                _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibbles),
-            );
-            let (c_lo, c_hi) = (
-                _mm256_shuffle_epi8(count_t, lo),
-                _mm256_shuffle_epi8(count_t, hi),
-            );
-            let c = _mm256_add_epi8(c_lo, c_hi);
+            let lo = _mm256_and_si256(v, nibbles);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibbles);
+            let c_hi = _mm256_shuffle_epi8(count_t, hi);
+            let c = _mm256_add_epi8(_mm256_shuffle_epi8(count_t, lo), c_hi);
             // Within a byte: the low nibble's positions, the high one's plus 4 each.
             let s = _mm256_add_epi8(
-                _mm256_add_epi8(
-                    _mm256_shuffle_epi8(sum_t, lo),
-                    _mm256_shuffle_epi8(sum_t, hi),
-                ),
-                _mm256_slli_epi16::<2>(c_hi),
+                _mm256_shuffle_epi8(sum_t, lo),
+                _mm256_shuffle_epi8(sum_t, hi),
             );
+            let s = _mm256_add_epi8(s, _mm256_slli_epi16::<2>(c_hi));
             let word_counts = _mm256_sad_epu8(c, _mm256_setzero_si256());
             counts = _mm256_add_epi64(counts, word_counts);
             weighted = _mm256_add_epi64(weighted, _mm256_mul_epu32(word_counts, index));
             // Byte offsets times counts, in pairs, plus the sums within bytes
             // (at most 888 a pair), added up per 32 bits.
-            let pairs = _mm256_add_epi16(
-                _mm256_maddubs_epi16(c, offsets),
-                _mm256_maddubs_epi16(s, _mm256_set1_epi8(1)),
-            );
+            let pairs = _mm256_maddubs_epi16(c, offsets);
+            let pairs = _mm256_add_epi16(pairs, _mm256_maddubs_epi16(s, _mm256_set1_epi8(1)));
             sums = _mm256_add_epi32(sums, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
             index = _mm256_add_epi64(index, _mm256_set1_epi64x(4));
         }
-        let lanes =
-            |v: __m256i| -> u64 { std::mem::transmute::<__m256i, [u64; 4]>(v).iter().sum() };
-        let sums: u64 = std::mem::transmute::<__m256i, [u32; 8]>(sums)
-            .iter()
-            .map(|&s| u64::from(s))
-            .sum();
-        (lanes(counts), sums + 64 * lanes(weighted))
-    };
-    for (i, &w) in rest.iter().enumerate() {
-        let i = (4 * blocks.len() + i) as u64;
-        let mut rest = w;
-        count += u64::from(w.count_ones());
-        while rest != 0 {
-            sum += 64 * i + u64::from(rest.trailing_zeros());
-            rest &= rest - 1;
-        }
+        let lanes = |v: __m256i| {
+            let lanes: [u64; 4] = std::mem::transmute(v);
+            lanes.iter().sum::<u64>()
+        };
+        // The 32-bit sums, two to a lane, added as 64-bit lanes would carry.
+        let (high, low) = (_mm256_srli_epi64::<32>(sums), _mm256_slli_epi64::<32>(sums));
+        let sums = _mm256_add_epi64(high, _mm256_srli_epi64::<32>(low));
+        (lanes(counts), lanes(sums) + 64 * lanes(weighted))
     }
-    (count, sum)
 }
 
-/// Decimal digits of `v`, without the formatting machinery.
-fn put(out: &mut Vec<u8>, mut v: u64) {
-    let mut digits = [0u8; 20];
-    let mut at = digits.len();
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
+/// Writes the decimal digits of `v` to `line` from `at`, two at a time,
+/// without the formatting machinery; returns where they end.
+fn put(line: &mut [u8], at: usize, mut v: u64) -> usize {
+    /// `PAIRS[2i..2i + 2]`: the two digits of i.
+    const PAIRS: [u8; 200] = {
+        let (mut t, mut i) = ([0; 200], 0);
+        while i < 100 {
+            (t[2 * i], t[2 * i + 1]) = (b'0' + i as u8 / 10, b'0' + i as u8 % 10);
+            i += 1;
         }
+        t
+    };
+    let (mut digits, mut from) = ([0u8; 20], 20);
+    while v >= 10 {
+        let pair = 2 * (v % 100) as usize;
+        (from, v) = (from - 2, v / 100);
+        digits[from..from + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
     }
-    out.extend_from_slice(&digits[at..]);
+    // A last digit (the first pair taken is never one with a leading zero).
+    if v > 0 || from == 20 {
+        from -= 1;
+        digits[from] = b'0' + v as u8;
+    }
+    line[at..at + 20 - from].copy_from_slice(&digits[from..]);
+    at + 20 - from
 }
