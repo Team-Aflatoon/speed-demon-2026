@@ -62,9 +62,9 @@ struct Record {
 pub type Span = (usize, usize);
 
 /// What the record loops read: the name table, the chunk's buffer, and per
-/// 64-byte block of the chunk the quotes before it and its quote mask, with
-/// where the chunk starts in the buffer (see `quotes_before`).
-type Ctx<'a> = (&'a Table, &'a [u8], (&'a [[u64; 2]], usize));
+/// 64-byte block of the buffer the quotes in the chunk before it and its
+/// quote mask (see `quotes_before`).
+type Ctx<'a> = (&'a Table, &'a [u8], &'a [[u64; 2]]);
 
 /// Where a record starts, and the quotes in the chunk before it.
 type At = (usize, u64);
@@ -99,7 +99,9 @@ impl<'a> Parser<'a> {
     /// file (after the header, for the first), read into a buffer and
     /// followed there by `PAD` zero bytes, but for an LF just past a last
     /// record that has no terminator (`run::read` adds it, and this scans
-    /// that one byte more). It must start at a record start. Returns the
+    /// that one byte more). It must start at a record start, and the bytes
+    /// before it in its first 64-byte block of the buffer must be zeros,
+    /// which `scan` then takes along (`run::read` zeroes them). Returns the
     /// number of quote bytes in it, which `run` uses to check the chunk cuts.
     ///
     /// Every record must hold exactly four commas outside quotes, with valid
@@ -114,19 +116,18 @@ impl<'a> Parser<'a> {
         if b[end] == b'\n' && b[end - 1] == b'\r' {
             return Err(end - 1);
         }
-        let blocks = (end - start) / 64 + 2;
-        self.quotes.resize(self.quotes.len().max(blocks), [0; 2]);
+        self.quotes.resize(self.quotes.len().max(end / 64 + 2), [0; 2]);
         let (mut at, mut carry) = ((start, 0), 0);
         self.state = [0; 2];
-        for window in (start..end).step_by(WINDOW) {
+        for window in (start & !63..end).step_by(WINDOW) {
             let last = (window + WINDOW).min(end);
             // SAFETY: main checked that the CPU has PCLMULQDQ.
-            let (n, records) = unsafe { self.scan(b, [start, window, last + usize::from(last == end)], carry) };
+            let (n, records) = unsafe { self.scan(b, [window, last + usize::from(last == end)], carry) };
             // Five separators a record, and at most four commas of the next.
             carry = n.checked_sub(5 * records).filter(|&c| c < 5).ok_or(at.0)?;
             let (table, map) = self.tables;
             for seps in self.seps[..5 * records].chunks(5 * BATCH) {
-                let c = (table, b, (&self.quotes[..], start));
+                let c = (table, b, &self.quotes[..]);
                 let batch = &mut self.batch[..seps.len() / 5];
                 at = parse(c, map, seps, batch, at)?;
                 join(c, map, batch, out);
@@ -145,8 +146,8 @@ impl<'a> Parser<'a> {
     /// # Safety
     /// The CPU must have PCLMULQDQ (see `prefix_xor`).
     #[target_feature(enable = "pclmulqdq")]
-    unsafe fn scan(&mut self, b: &[u8], [start, window, last]: [usize; 3], mut n: usize) -> (usize, usize) {
-        let (first, mut records, state) = ((window - start) / 64, 0, &mut self.state);
+    unsafe fn scan(&mut self, b: &[u8], [window, last]: [usize; 2], mut n: usize) -> (usize, usize) {
+        let (first, mut records, state) = (window / 64, 0, &mut self.state);
         let blocks = (last - window).div_ceil(64);
         for (k, quotes) in self.quotes[first..first + blocks].iter_mut().enumerate() {
             let o = window + 64 * k;
@@ -164,13 +165,12 @@ impl<'a> Parser<'a> {
 
 /// The quote bytes in the chunk before offset `p` of the buffer, for a `p`
 /// in a block `scan` has been through.
-fn quotes_before((quotes, start): (&[[u64; 2]], usize), p: usize) -> u64 {
-    let i = p - start;
-    debug_assert!(i / 64 < quotes.len());
+fn quotes_before(quotes: &[[u64; 2]], p: usize) -> u64 {
+    debug_assert!(p / 64 < quotes.len());
     // SAFETY: as above; and BMI2 is part of x86-64-v3, which the whole crate
     // is compiled for (see `masks`).
-    let [before, mask] = *unsafe { quotes.get_unchecked(i / 64) };
-    before + u64::from(unsafe { _bzhi_u64(mask, (i % 64) as u32) }.count_ones())
+    let [before, mask] = *unsafe { quotes.get_unchecked(p / 64) };
+    before + u64::from(unsafe { _bzhi_u64(mask, (p % 64) as u32) }.count_ones())
 }
 
 /// Parses the records whose separators are `seps`, five each, into `out`,
@@ -319,7 +319,7 @@ fn prefix_xor(x: u64) -> u64 {
 
 /// Appends the offsets of the set bits of `mask`, the separators of the
 /// block at `o`, to `seps[n..]`, and returns the new count. Most blocks hold
-/// at most eight (a record has five in about 61 bytes), so eight are written
+/// at most seven (a record has five in about 61 bytes), so seven are written
 /// unconditionally (junk past the count, which later appends overwrite) and
 /// only more take the loop. `n` is at most four more than the bytes scanned
 /// before this block in the window, so the writes stay below `WINDOW + 128`.

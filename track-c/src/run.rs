@@ -170,6 +170,8 @@ fn read(file: &File, rest: usize, from: usize, piece: usize, buffer: &mut Vec<u8
         if let Some(end) = cut(b, nominal).or((want == rest).then_some(want)) {
             let start = start.unwrap_or(end).min(end);
             buffer[end..end + PAD].fill(0);
+            // Nor are the bytes before the chunk in its first 64-byte block.
+            buffer[start & !63..start].fill(0);
             // An LF after a last record with no terminator (see `Parser::chunk`).
             if end == rest && end > start && buffer[end - 1] != b'\n' {
                 buffer[end] = b'\n';

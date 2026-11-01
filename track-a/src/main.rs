@@ -68,13 +68,10 @@ fn main() {
     // PR_SET_THP_DISABLE (41): transparent huge pages (`always` on stock Debian) would back
     // the sparse logs with mostly empty 2 MB pages, all charged to the memory peak.
     // M_MMAP_THRESHOLD (-3) fixed at 128 KB: glibc would otherwise raise it after the
-    // first large free, and freed texts and scratch would stay in its heaps. M_ARENA_MAX
-    // (-8) at 1: a malloc arena per thread kept about 130 KB resident each, for the few
-    // small allocations a report makes.
+    // first large free, and freed texts and scratch would stay in its heaps.
     unsafe {
         prctl(41, 1, 0, 0, 0);
         mallopt(-3, 128 << 10);
-        mallopt(-8, 1);
     }
     // `ingest [data_dir] [out_dir]`, defaulting to the harness's /data and /out.
     let mut args = std::env::args().skip(1);
