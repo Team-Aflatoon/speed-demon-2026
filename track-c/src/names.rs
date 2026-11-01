@@ -11,9 +11,9 @@
 //!
 //! Phase 2, once every worker is done: the workers claim buckets, and each
 //! bucket's pairs from all workers are counted against an 8 KiB bitset of
-//! 256 ids x 256 groups that stays in L1: each group's bits set at the end
-//! are its distinct names. Every pair also adds one record and its name's
-//! unescaped length to its group, in one add.
+//! 256 ids x 256 groups that stays in L1. A pair is new exactly when its bit
+//! flips, which gives `names_distinct`; every pair also adds one record and
+//! its name's unescaped length to its group, in one add.
 
 use crate::parse::load;
 use std::arch::x86_64::{_bzhi_u64, _mm_crc32_u64};
@@ -162,36 +162,26 @@ impl Table {
             let short = self.homes[2] / 2;
             return match len {
                 _ if same(3) && same(0) && same(1) && same(2) => short + (at - 2 * short) / 4,
-                ..=INLINE => self.probe::<4>(k, 0),
+                ..=INLINE => self.probe::<4>(k, false),
                 _ => self.huge(&b[..len]),
             };
         }
+        // The four slots of the home line at once. A slot only matches once
+        // published, and the Acquire load of its `meta` makes the word
+        // written before it (in `probe`) visible.
+        let [w, meta] = k.slot::<2>();
         // SAFETY: `key` masks `at` to a line start within the short slots.
-        match unsafe { self.line(at, k.slot()) } {
-            (hit @ 0..4, _) => at / 2 + hit,
-            (_, full) => self.probe::<2>(k, usize::from(full)),
-        }
-    }
-
-    /// Looks for the short name whose slot is `[w, meta]` in the line of
-    /// short slots at word `at`, all four slots at once: returns its slot in
-    /// the line, or 4; and whether the line holds four published names, so
-    /// that it is full for good. A slot only matches once published, and the
-    /// Acquire load of its `meta` makes the word written before it (in
-    /// `probe`) visible. The first slot whose `meta` matches is almost
-    /// surely the name's: its first word decides, and in the rare other case
-    /// `probe` does.
-    ///
-    /// # Safety
-    /// `at` must be a line start within the short slots.
-    #[inline(always)]
-    unsafe fn line(&self, at: usize, [w, meta]: [u64; 2]) -> (usize, bool) {
-        // SAFETY: the caller's promise.
         let l = unsafe { self.words.get_unchecked(at..at + 8) };
         let metas = [0, 1, 2, 3].map(|j| l[2 * j + 1].load(Acquire));
+        // The first slot whose `meta` matches is almost surely the name's:
+        // its first word decides, and in the rare other case `probe` does.
         let hit = (0..4).rev().fold(4, |hit, j| if metas[j] == meta { j } else { hit });
-        let found = hit < 4 && l[2 * (hit & 3)].load(Relaxed) == w;
-        (if found { hit } else { 4 }, metas.iter().all(|&m| m.wrapping_add(1) > 1))
+        if hit < 4 && l[2 * (hit & 3)].load(Relaxed) == w {
+            return at / 2 + hit;
+        }
+        // A line of four published names, none of them this one, is full for
+        // good: the probe can start at the next line.
+        self.probe::<2>(k, metas.iter().all(|&m| m.wrapping_add(1) > 1))
     }
 
     /// The id of a name of more than `INLINE` bytes, given as `name`.
@@ -214,10 +204,9 @@ impl Table {
     /// Probes the `W`-word slots for the name with key `k`, inserting it in
     /// the first empty slot if it is not there; returns its id. Long slots
     /// are probed linearly from the home slot; short ones by lines, the home
-    /// line, then lines `step` (odd, so every line comes up in turn) apart,
+    /// line (unless `skip`: it is full), then lines `step` (odd, so every line comes up in turn) apart,
     /// not the next one: linear probing by lines would pile names up in runs
-    /// of full lines. The first `full` lines are known to be full of other
-    /// names, and further full lines are passed a whole line at a time.
+    /// of full lines.
     ///
     /// A worker inserts by claiming an empty slot's `meta` (0 to `FILLING`)
     /// with a CAS, so only it writes the slot; nothing else ever writes
@@ -225,25 +214,13 @@ impl Table {
     /// full: every lookup of a name follows the same sequence, so a name in
     /// the table is always within the `PROBES` its insertion visited.
     #[cold]
-    fn probe<const W: usize>(&self, k: &Key, mut full: usize) -> usize {
+    fn probe<const W: usize>(&self, k: &Key, skip: bool) -> usize {
         let (base, want) = (W / 4 * self.homes[2], k.slot::<W>());
         let (mask, words) = (self.ids()[W / 4] - 1, &self.words[base..]);
         let mix = (k.w[0] ^ k.w[1] ^ k.w[2]).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let step = (mix >> 40 | 1) as usize;
-        let home = (k.at as usize - base) / W;
-        while full > 0 && full < PROBES / 4 {
-            let at = 2 * ((home + 4 * step * full) & mask);
-            // SAFETY: `at` is a line start (`home` is one, and `mask` keeps
-            // the low two bits) within the short slots (only short names
-            // have full lines).
-            match unsafe { self.line(at, k.slot()) } {
-                (hit @ 0..4, _) => return at / 2 + hit,
-                (_, true) => full += 1,
-                (_, false) => break,
-            }
-        }
-        let mut i = (home + 4 * step * full) & mask;
-        for _ in 4 * full..PROBES {
+        let mut i = ((k.at as usize - base) / W + if skip { 4 * step } else { 0 }) & mask;
+        for _ in 0..PROBES {
             let slot = &words[W * i..W * i + W];
             let mut meta = slot[W - 1].load(Acquire);
             if meta == 0 {
@@ -300,16 +277,13 @@ impl Table {
         for pairs in all {
             pairs.each(bucket, |e| {
                 let (e, group) = (usize::from(e), usize::from(e >> 8));
-                bits[e / 64] |= 1 << (e % 64);
-                out[1][group] += lens[e % BUCKET];
+                let (word, bit) = (&mut bits[e / 64], 1 << (e % 64));
+                // Two arrays, not one of pairs, so that the adds stay scalar.
+                out[0][group] += u64::from(*word & bit == 0);
+                (out[1][group], *word) = (out[1][group] + lens[e % BUCKET], *word | bit);
             });
         }
-        // A group's distinct names are the bits set in its 256, which this
-        // clears again.
-        for (words, distinct) in bits.chunks_exact_mut(BUCKET / 64).zip(&mut out[0]) {
-            *distinct += words.iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
-            words.fill(0);
-        }
+        bits.fill(0);
     }
 }
 
