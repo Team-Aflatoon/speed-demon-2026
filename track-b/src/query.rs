@@ -32,6 +32,7 @@ const OVERFLOW: u32 = 1 << 29;
 pub const AND: u32 = 0;
 pub const OR: u32 = 1;
 pub const NOT: u32 = 2;
+const OPS: [&[u8]; 3] = [b"AND", b"OR", b"NOT"]; // in the order of their values
 /// A BOOL step is `op << TERM_BITS | term`: the term id in bits 0..30, the
 /// operator in bits 30 and 31.
 pub const TERM_BITS: u32 = 30;
@@ -58,18 +59,14 @@ struct Key(u64, u64);
 /// `SLOT[m]`: the slot whose key matches, from the bits `m` of matching key
 /// words (bits 2j and 2j + 1 for slot j), or 3 (the bucket's miss value).
 static SLOT: [u8; 64] = {
-    let mut t = [3; 64];
-    let mut m = 0;
-    while m < 64 {
-        let mut j = 0;
-        while j < 3 {
-            if m >> (2 * j) & 3 == 3 {
-                t[m] = j as u8;
-                break;
-            }
-            j += 1;
+    let (mut t, mut i) = ([3; 64], 0);
+    while i < 192 {
+        // Slots 2, 1, 0 in turn, so the lowest one that matches is set last.
+        let (m, j) = (i % 64, 2 - i / 64);
+        if m >> (2 * j) & 3 == 3 {
+            t[m] = j as u8;
         }
-        m += 1;
+        i += 1;
     }
     t
 };
@@ -108,10 +105,8 @@ unsafe fn lowered(p: *const u8, len: usize) -> __m128i {
     unsafe {
         let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         let mask = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), iota);
-        _mm_and_si128(
-            _mm_or_si128(_mm_loadu_si128(p.cast()), _mm_set1_epi8(0x20)),
-            mask,
-        )
+        let v = _mm_or_si128(_mm_loadu_si128(p.cast()), _mm_set1_epi8(0x20));
+        _mm_and_si128(v, mask)
     }
 }
 
@@ -132,12 +127,7 @@ impl Key {
     #[inline(always)]
     fn of(v: __m128i) -> Key {
         // SAFETY: SSE4.1 is part of x86-64-v3, which the crate requires.
-        unsafe {
-            Key(
-                _mm_cvtsi128_si64(v) as u64,
-                _mm_extract_epi64::<1>(v) as u64,
-            )
-        }
+        unsafe { Key(_mm_cvtsi128_si64(v) as _, _mm_extract_epi64::<1>(v) as _) }
     }
 
     /// CRC-32C of the first 12 bytes of the key (the CRC of `lo` from the
@@ -245,14 +235,12 @@ pub struct Table {
 ///
 /// SAFETY: `T` must be valid as zero bytes, and need no more than page alignment.
 unsafe fn zeroed<T>(n: usize, populate: bool) -> &'static [T] {
-    const PROT_READ_WRITE: i32 = 0x3;
-    const MAP_PRIVATE_ANONYMOUS: i32 = 0x22;
-    const MAP_POPULATE: i32 = 0x8000;
     let len = (n * std::mem::size_of::<T>()).max(1);
-    let flags = MAP_PRIVATE_ANONYMOUS | if populate { MAP_POPULATE } else { 0 };
-    // SAFETY: an anonymous mapping at an address of the kernel's choosing
-    // touches no memory of ours.
-    let p = unsafe { crate::mmap(std::ptr::null_mut(), len, PROT_READ_WRITE, flags, -1, 0) };
+    // MAP_PRIVATE | MAP_ANONYMOUS, and MAP_POPULATE.
+    let flags = 0x22 | if populate { 0x8000 } else { 0 };
+    // SAFETY: an anonymous mapping (PROT_READ | PROT_WRITE) at an address of
+    // the kernel's choosing touches no memory of ours.
+    let p = unsafe { crate::mmap(std::ptr::null_mut(), len, 0x3, flags, -1, 0) };
     assert!(p as isize != -1, "cannot map {len} bytes for the table");
     // SAFETY: the mapping is `len` bytes, page aligned, zeroed, used for
     // nothing else and never unmapped; the caller vouches for `T`.
@@ -278,17 +266,15 @@ impl Table {
         // SAFETY: zero bytes are valid atomic integers, which is all a
         // `Bucket` holds; it needs 64-byte alignment, less than a page.
         // The buckets are touched all over; the per-id arrays only where ids are.
-        let (buckets, text_at, heads, bools) = unsafe {
-            let per_id = (zeroed(ids, false), zeroed(ids, false), zeroed(ids, false));
-            (zeroed(n, true), per_id.0, per_id.1, per_id.2)
-        };
-        Table {
-            buckets,
-            mask: n - 1,
-            next_block: AtomicU32::new(1),
-            text_at,
-            heads,
-            bools,
+        unsafe {
+            Table {
+                text_at: zeroed(ids, false),
+                heads: zeroed(ids, false),
+                bools: zeroed(ids, false),
+                buckets: zeroed(n, true),
+                mask: n - 1,
+                next_block: AtomicU32::new(1),
+            }
         }
     }
 
@@ -305,24 +291,14 @@ impl Table {
     /// A stamp per term id for the scan's `Doc::finish`: 0 for BOOL terms,
     /// `NEVER` for every other id (0, phrase-only terms, unused ids).
     pub fn stamps(&self) -> Vec<u8> {
-        let bools = &self.bools[..self.ids()];
-        // SAFETY: the parse is over (a barrier orders every insert before the
-        // scan), so no thread writes these bytes any more.
-        let bools: &[u8] =
-            unsafe { std::slice::from_raw_parts(bools.as_ptr().cast(), bools.len()) };
-        bools.iter().map(|&b| NEVER * (1 - b)).collect()
+        let bools = self.bools[..self.ids()].iter();
+        bools.map(|b| NEVER * (1 - b.load(Relaxed))).collect()
     }
 
     /// One past the last id of the last block taken: a bound on the term ids
     /// (larger than the number of terms by the unused ends of blocks).
     pub fn ids(&self) -> usize {
         self.next_block.load(Relaxed) as usize
-    }
-
-    /// The bucket where the search for `key` starts.
-    #[inline(always)]
-    fn home(&self, key: Key) -> usize {
-        key.hash() & self.mask
     }
 
     /// The scan's view of the table.
@@ -340,22 +316,19 @@ impl Table {
     /// with the term's in `queries.txt` (`text`).
     #[cold]
     #[inline(never)]
-    fn find_slow(&self, key: Key, token: &[u8], text: &[u8]) -> u32 {
+    fn find_slow(&self, mut key: Key, token: &[u8], text: &[u8]) -> u32 {
         let long = token.len() > SHORT;
-        let key = if long {
-            Key::new(token, 0, token.len())
-        } else {
-            key
-        };
-        let mut b = self.home(key);
+        if long {
+            key = Key::new(token, 0, token.len());
+        }
+        let mut b = key.hash() & self.mask; // the home bucket
         for _ in 0..self.buckets.len() {
             let bucket = &self.buckets[b];
             for j in 0..3 {
-                let lo = bucket.keys[2 * j].load(Relaxed);
-                let hi = bucket.keys[2 * j + 1].load(Relaxed);
                 let v = bucket.vals[j].load(Relaxed);
+                let same = |i: usize, k: u64| bucket.keys[2 * j + i].load(Relaxed) == k;
                 let tail = || self.tail_eq(token, v & ID_MASK, text);
-                if lo == key.0 && hi == key.1 && (!long || tail()) {
+                if same(0, key.0) && same(1, key.1) && (!long || tail()) {
                     return v;
                 }
             }
@@ -372,7 +345,7 @@ impl Table {
     /// the thread's unused ids.
     fn insert(&self, text: &[u8], at: usize, len: usize, ids: &mut Range<u32>) -> (u32, usize) {
         let key = Key::new(text, at, len);
-        let mut b = self.home(key);
+        let mut b = key.hash() & self.mask; // the home bucket
         for _ in 0..self.buckets.len() {
             let bucket = &self.buckets[b];
             for j in 0..3 {
@@ -404,9 +377,8 @@ impl Table {
                         }
                     };
                     let id = v & ID_MASK;
-                    if bucket.keys[2 * j + 1].load(Relaxed) == key.1
-                        && (len <= SHORT || self.tail_eq(&text[at..at + len], id, text))
-                    {
+                    let tail = || self.tail_eq(&text[at..at + len], id, text);
+                    if bucket.keys[2 * j + 1].load(Relaxed) == key.1 && (len <= SHORT || tail()) {
                         if v >> USES_SHIFT & 0x7F < USES_CAP {
                             bucket.vals[j].fetch_add(1 << USES_SHIFT, Relaxed);
                         }
@@ -415,9 +387,7 @@ impl Table {
                 }
             }
             // All three slots hold other terms: this term lives further on.
-            if bucket.vals[3].load(Relaxed) & OVERFLOW == 0 {
-                bucket.vals[3].fetch_or(OVERFLOW, Relaxed);
-            }
+            self.flag(4 * b + 3, OVERFLOW);
             b = (b + 1) & self.mask;
         }
         unreachable!("a table with a slot for every word has a free slot")
@@ -499,10 +469,8 @@ impl Parsed {
         // An empty range has no lines (splitting it would give one empty one).
         for line in lines.split(|&b| b == b'\n').take_while(|_| from < to) {
             if p.line(line, text).is_none() {
-                fail(&format!(
-                    "malformed query: {:?}",
-                    String::from_utf8_lossy(line)
-                ));
+                let line = String::from_utf8_lossy(line);
+                fail(&format!("malformed query: {line:?}"));
             }
         }
         p
@@ -524,13 +492,10 @@ impl Parsed {
             loop {
                 word(words.next()?, 0)?;
                 self.steps.push(op << TERM_BITS);
-                op = match words.next() {
+                match words.next() {
                     None => break,
-                    Some(b"AND") => AND,
-                    Some(b"OR") => OR,
-                    Some(b"NOT") => NOT,
-                    Some(_) => return None,
-                };
+                    Some(o) => op = OPS.iter().position(|&k| k == o)? as u32,
+                }
             }
             self.ends.push(self.steps.len() as u32);
         } else {
@@ -597,10 +562,10 @@ impl Parsed {
 /// `queries.txt`, fill the shared term table, choose the phrase anchors.
 pub struct Setup<'a> {
     /// `queries.txt` and `QUERY_PAD` zero bytes.
-    text: &'a [u8],
+    pub text: &'a [u8],
     /// Thread `i` parses the lines in `text[ranges[i]..ranges[i + 1]]`.
     ranges: Vec<usize>,
-    barrier: Barrier,
+    pub barrier: Barrier,
     table: OnceLock<Table>,
 }
 
@@ -610,12 +575,11 @@ impl<'a> Setup<'a> {
     pub fn new(text: &'a [u8], threads: usize) -> Setup<'a> {
         let len = text.len() - QUERY_PAD;
         let ranges = (0..=threads).map(|i| line_start(&text[..len], len * i / threads));
-        let (barrier, table) = (Barrier::new(threads), OnceLock::new());
         Setup {
             text,
             ranges: ranges.collect(),
-            barrier,
-            table,
+            barrier: Barrier::new(threads),
+            table: OnceLock::new(),
         }
     }
 
@@ -630,23 +594,13 @@ impl<'a> Setup<'a> {
         let _ = self.table.set(Table::new(words, self.ranges.len() - 1));
     }
 
-    /// `queries.txt` and `QUERY_PAD` zero bytes.
-    pub fn text(&self) -> &'a [u8] {
-        self.text
-    }
-
-    /// Waits for every thread.
-    pub fn wait(&self) {
-        self.barrier.wait();
-    }
-
     /// Thread `i`'s share of the start-up: its queries, parsed while the
     /// table is made, and the finished table.
     pub fn run(&self, i: usize) -> (Parsed, &Table) {
         let mut mine = Parsed::parse(self.text, self.ranges[i], self.ranges[i + 1]);
         let table = self.table.wait();
         mine.insert(table, self.text);
-        self.wait(); // anchors read every thread's counts
+        self.barrier.wait(); // anchors read every thread's counts
         mine.choose_anchors(table, i);
         (mine, table)
     }
@@ -654,13 +608,9 @@ impl<'a> Setup<'a> {
 
 /// The first line start of `text` at or after `at`.
 fn line_start(text: &[u8], at: usize) -> usize {
+    let lf = text[at.max(1) - 1..].iter().position(|&b| b == b'\n');
     match at {
         0 => 0,
-        _ => {
-            at + text[at - 1..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(text.len() - at)
-        }
+        _ => at + lf.unwrap_or(text.len() - at),
     }
 }

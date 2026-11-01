@@ -47,10 +47,8 @@ impl Part {
             for (i, pairs) in stream.chunks(16).enumerate() {
                 crate::prefetch(stream.as_ptr().wrapping_add(16 * i + 64));
                 for &x in pairs {
-                    let l = (x & 0xFFFF) as usize;
-                    debug_assert!(l < terms);
-                    // SAFETY: `l < terms`, the length of `counts` (see above).
-                    unsafe { *counts.get_unchecked_mut(l) += 1 };
+                    // SAFETY: `x & 0xFFFF < terms`, the length of `counts` (see above).
+                    unsafe { *counts.get_unchecked_mut((x & 0xFFFF) as usize) += 1 };
                 }
             }
         }
@@ -132,17 +130,15 @@ impl<'a> Set<'a> {
     /// The set of `term` (below `Table::ids`, so that `l` is below the
     /// `terms` the parts were built for) in the `PARTS` parts of a segment.
     fn of(parts: &'a [&'a Part], term: usize, words: usize) -> Set<'a> {
-        debug_assert!(parts.len() == PARTS && term / PARTS < parts[term % PARTS].dense.len());
         // SAFETY: `Part::build` makes `offsets` (ascending, ending at
-        // `docs.len()`) one longer than `dense`, and gives every term whose
+        // `docs.len()`) one longer than `dense` (of `terms` entries, `parts`
+        // being the `PARTS` parts of a segment), and gives every term whose
         // list holds more than 1/`DENSE` of the documents a bitmap of `words`
         // words at `dense[l]`; `l` is below `dense.len()` (see above).
         unsafe {
             let (part, l) = (*parts.get_unchecked(term % PARTS), term / PARTS);
-            let (from, to) = (
-                *part.offsets.get_unchecked(l),
-                *part.offsets.get_unchecked(l + 1),
-            );
+            let offsets = part.offsets.as_ptr().add(l);
+            let (from, to) = (*offsets, *offsets.add(1));
             let list = part.docs.get_unchecked(from as usize..to as usize);
             match list.len() {
                 0 => Set::Empty,
@@ -242,10 +238,9 @@ impl Evaluator {
             Acc::List => Set::List(&[]), // stands for `self.list`, taken below
         };
         let mine = std::mem::take(&mut self.list);
-        let list = if let Acc::List = acc {
-            &mine[..]
-        } else {
-            r.list()
+        let list = match acc {
+            Acc::List => &mine[..],
+            _ => r.list(),
         };
         let next = match (op, set, r) {
             // Two dense sets: one pass over the words.
@@ -322,8 +317,7 @@ impl Evaluator {
 /// Whether every document of the sorted `list` has a bit in `bits`: its
 /// last is the largest. The loops below index `bits` unchecked after this.
 fn fits(list: &[u16], bits: &[u64]) -> bool {
-    list.last()
-        .is_none_or(|&d| usize::from(d) / 64 < bits.len())
+    list.last().is_none_or(|&d| bits.len() > d as usize / 64)
 }
 
 fn set_bits(bits: &mut [u64], list: &[u16]) {
@@ -374,10 +368,8 @@ fn filter<'a>(list: &[u16], bits: &[u64], not: bool, out: &mut Vec<u16>) -> Acc<
             let docs = _mm_loadu_si128(block.as_ptr().cast());
             let wide = _mm256_cvtepu16_epi32(docs);
             let word = _mm256_i32gather_epi32::<4>(words, _mm256_srli_epi32::<5>(wide));
-            let up = _mm256_sub_epi32(
-                _mm256_set1_epi32(31),
-                _mm256_and_si256(wide, _mm256_set1_epi32(31)),
-            );
+            let low = _mm256_and_si256(wide, _mm256_set1_epi32(31));
+            let up = _mm256_sub_epi32(_mm256_set1_epi32(31), low);
             let keep = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_sllv_epi32(word, up))) ^ flip;
             let pack = _mm_loadu_si128(PACK[keep as usize].as_ptr().cast());
             _mm_storeu_si128(to.add(n).cast(), _mm_shuffle_epi8(docs, pack));
@@ -566,10 +558,8 @@ fn count_and_sum(bits: &[u64]) -> (u64, u64) {
             let c_hi = _mm256_shuffle_epi8(count_t, hi);
             let c = _mm256_add_epi8(_mm256_shuffle_epi8(count_t, lo), c_hi);
             // Within a byte: the low nibble's positions, the high one's plus 4 each.
-            let s = _mm256_add_epi8(
-                _mm256_shuffle_epi8(sum_t, lo),
-                _mm256_shuffle_epi8(sum_t, hi),
-            );
+            let s_lo = _mm256_shuffle_epi8(sum_t, lo);
+            let s = _mm256_add_epi8(s_lo, _mm256_shuffle_epi8(sum_t, hi));
             let s = _mm256_add_epi8(s, _mm256_slli_epi16::<2>(c_hi));
             let word_counts = _mm256_sad_epu8(c, _mm256_setzero_si256());
             counts = _mm256_add_epi64(counts, word_counts);
@@ -581,10 +571,7 @@ fn count_and_sum(bits: &[u64]) -> (u64, u64) {
             sums = _mm256_add_epi32(sums, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
             index = _mm256_add_epi64(index, _mm256_set1_epi64x(4));
         }
-        let lanes = |v: __m256i| {
-            let lanes: [u64; 4] = std::mem::transmute(v);
-            lanes.iter().sum::<u64>()
-        };
+        let lanes = |v: __m256i| std::mem::transmute::<_, [u64; 4]>(v).iter().sum::<u64>();
         // The 32-bit sums, two to a lane, added as 64-bit lanes would carry.
         let (high, low) = (_mm256_srli_epi64::<32>(sums), _mm256_slli_epi64::<32>(sums));
         let sums = _mm256_add_epi64(high, _mm256_srli_epi64::<32>(low));

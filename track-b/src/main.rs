@@ -44,7 +44,12 @@ const _: () = assert!(query::USES_CAP + MAX_THREADS as u32 <= 127);
 
 /// `track-b [data dir] [out dir]`, by default `/data` and `/out`.
 fn main() {
-    disable_huge_pages();
+    // Transparent huge pages off for this process (PR_SET_THP_DISABLE), so
+    // partly used 2 MB heap regions are not backed (and counted in our
+    // memory peak) as whole huge pages. It is only a hint, so a failure is
+    // ignored.
+    // SAFETY: PR_SET_THP_DISABLE takes integer arguments and touches no memory of ours.
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize, default: &'static str| args.get(i).map_or(default, String::as_str);
     run(arg(1, "/data"), arg(2, "/out"));
@@ -79,21 +84,18 @@ pub fn prefetch<T>(p: *const T) {
     unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast()) }
 }
 
-/// Turns transparent huge pages off for this process, so partly used 2 MB
-/// heap regions are not backed (and counted in our memory peak) as whole huge
-/// pages. It is only a hint, so a failure is ignored.
-fn disable_huge_pages() {
-    const PR_SET_THP_DISABLE: i32 = 41;
-    // SAFETY: PR_SET_THP_DISABLE takes integer arguments and touches no memory of ours.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
-}
-
 /// A run of whole lines of `docs.txt`, starting at document `first`.
 struct Segment {
     start: u64,
     end: u64,
     first: u32,
-    chunks: usize,
+}
+
+impl Segment {
+    /// The number of its `CHUNK_BYTES` chunks.
+    fn chunks(&self) -> usize {
+        (self.end - self.start).div_ceil(CHUNK_BYTES) as usize
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -157,9 +159,9 @@ fn run(data: &str, out_dir: &str) {
             *shared.bool_answers[2 * i + 1].write().unwrap() = answers(n - n / 2);
             *shared.phrase_answers[i].write().unwrap() = answers(mine.term_ends.len());
             let _ = parsed[i].set(mine);
-            setup.wait();
+            setup.barrier.wait();
             let parsed: Vec<&Parsed> = parsed.iter().map(|p| p.get().unwrap()).collect();
-            work(shared, table, setup.text(), &parsed);
+            work(shared, table, setup.text, &parsed);
         };
         (0..threads).for_each(|i| drop(s.spawn(move || worker(i))));
         // While the workers parse their queries; the threads have all started,
@@ -169,7 +171,7 @@ fn run(data: &str, out_dir: &str) {
         let out = File::create(format!("{out_dir}/results.txt"));
         let out = or_fail(out, "results.txt");
         let segments = plan(&file);
-        let max_chunks = segments.iter().map(|s| s.chunks).max().unwrap_or(0);
+        let max_chunks = segments.iter().map(Segment::chunks).max().unwrap_or(0);
         let _ = shared.set(Shared {
             tasks: schedule(&segments, threads),
             next: AtomicUsize::new(0),
@@ -195,9 +197,8 @@ fn run(data: &str, out_dir: &str) {
 /// unmapped.
 fn map_queries(file: &File) -> &'static [u8] {
     use std::os::fd::AsRawFd;
-    const PRIVATE: i32 = 0x02; // MAP_PRIVATE
-    const FIXED_POPULATE: i32 = 0x10 | 0x8000; // MAP_FIXED | MAP_POPULATE
-    const ANONYMOUS: i32 = 0x20; // MAP_ANONYMOUS
+    // MAP_PRIVATE (0x02), MAP_FIXED | MAP_POPULATE (0x10 | 0x8000), MAP_ANONYMOUS (0x20).
+    let (private, fixed_populate, anonymous) = (0x02, 0x10 | 0x8000, 0x20);
     let len = or_fail(file.metadata(), "queries.txt").len() as usize;
     assert!(len < query::MAX_QUERY_BYTES, "queries.txt over 1 GB");
     let span = len.div_ceil(4096) * 4096 + 4096;
@@ -205,8 +206,8 @@ fn map_queries(file: &File) -> &'static [u8] {
     // SAFETY: new mappings at an address of the kernel's choosing (the file
     // over the start of the anonymous one) touch no memory of ours.
     unsafe {
-        let base = mmap(std::ptr::null_mut(), span, 1, PRIVATE | ANONYMOUS, -1, 0);
-        let over = |base| mmap(base, len, 1, PRIVATE | FIXED_POPULATE, file.as_raw_fd(), 0);
+        let base = mmap(std::ptr::null_mut(), span, 1, private | anonymous, -1, 0);
+        let over = |base| mmap(base, len, 1, private | fixed_populate, file.as_raw_fd(), 0);
         if failed(base) || (len > 0 && failed(over(base))) {
             fail("cannot map queries.txt");
         }
@@ -247,13 +248,7 @@ fn plan(file: &File) -> Vec<Segment> {
             size = (size / 2).max(1);
             (end, next) = line(start + size);
         }
-        let chunks = (end - start).div_ceil(CHUNK_BYTES) as usize;
-        segments.push(Segment {
-            start,
-            end,
-            first,
-            chunks,
-        });
+        segments.push(Segment { start, end, first });
         (start, first) = (end, next);
     }
     segments
@@ -298,7 +293,7 @@ fn schedule(segments: &[Segment], ranges: usize) -> Vec<Task> {
     let mut tasks = Vec::new();
     for s in 0..=segments.len() {
         if let Some(segment) = segments.get(s) {
-            tasks.extend((0..segment.chunks).map(|c| Task::Scan(s, c)));
+            tasks.extend((0..segment.chunks()).map(|c| Task::Scan(s, c)));
         }
         if let Some(s) = s.checked_sub(1) {
             tasks.extend((0..=PARTS).map(|p| Task::Build(s, p)));
@@ -363,7 +358,7 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 count(s, SCANNED)
             }
             Task::Build(s, p) => {
-                wait(count(s, SCANNED), sh.segments[s].chunks);
+                wait(count(s, SCANNED), sh.segments[s].chunks());
                 if s >= 1 {
                     wait(count(s - 1, EVALUATED), 2 * ranges); // the eval of s - 1 read `parts`
                 }
@@ -433,7 +428,7 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
 /// the segment's phrase matches folded into the phrase answers, in document
 /// order. Each records the segment's document count, the chunks' lines.
 fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
-    let chunks = &sh.chunks[s % 2][..sh.segments[s].chunks];
+    let chunks = &sh.chunks[s % 2][..sh.segments[s].chunks()];
     let chunks: Vec<_> = chunks.iter().map(|c| c.read().unwrap()).collect();
     let docs: u32 = chunks.iter().map(|c| c.lines).sum();
     sh.counts[s][DOCS].store(docs, Relaxed);

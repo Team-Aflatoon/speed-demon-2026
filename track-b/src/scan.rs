@@ -229,12 +229,8 @@ impl<'a> Scanner<'a> {
             let live = u64::MAX >> (64 - (end - at).min(64));
             let (lf, tab) = (lf & live, tab & live);
             // Most blocks hold no LF or TAB, and stay all in or all out.
-            let id = in_id
-                ^ if lf | tab != 0 {
-                    prefix_xor(lf | tab)
-                } else {
-                    0
-                };
+            let flips = lf | tab;
+            let id = in_id ^ if flips != 0 { prefix_xor(flips) } else { 0 };
             in_id = ((id as i64) >> 63) as u64;
             let token = alnum & live & !id;
             let before = token << 1 | carry;
@@ -257,15 +253,10 @@ impl<'a> Scanner<'a> {
             n += unsafe { flatten(starts | (!token & before), at as u32, bounds.add(n)) };
             tabs += tab.count_ones() as usize;
         }
-        assert!(
-            tabs == lines,
-            "a line from document {first} on lacks its TAB"
-        );
+        assert!(tabs == lines, "a line from document {first} on lacks a TAB");
         // SAFETY: the first `n` bounds and `lines` line ends were written above.
-        unsafe {
-            self.bounds.set_len(n);
-            self.lfs.set_len(lines);
-        }
+        unsafe { self.bounds.set_len(n) };
+        unsafe { self.lfs.set_len(lines) };
         // Every token ends inside the region, which ends with an LF.
         (n / 2, lines)
     }
@@ -312,10 +303,7 @@ impl Doc {
     /// against the token sequence.
     #[inline(never)]
     fn finish(&mut self, doc: &[u32], out: &mut ChunkOut, table: &Table, ranges: &[&Parsed]) {
-        assert!(
-            self.local < MAX_SEGMENT_DOCS,
-            "too many documents in a segment"
-        );
+        assert!(self.local < MAX_SEGMENT_DOCS, "too many documents");
         // The distinct BOOL terms, appended to `fresh`. Branch-free: every
         // id is written, and kept only if its stamp is older than this
         // document's (a BOOL term not seen yet); every id's stamp is raised
@@ -425,10 +413,8 @@ unsafe fn classify(p: *const u8) -> (u64, u64, u64) {
     let half = |v: __m256i| {
         let table = |t: [u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
         let nibbles = _mm256_set1_epi8(0x0F);
-        let high = _mm256_shuffle_epi8(
-            table(HIGH),
-            _mm256_and_si256(_mm256_srli_epi16(v, 4), nibbles),
-        );
+        let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), nibbles);
+        let high = _mm256_shuffle_epi8(table(HIGH), hi);
         let low = _mm256_shuffle_epi8(table(LOW), _mm256_and_si256(v, nibbles));
         let other = _mm256_cmpeq_epi8(_mm256_and_si256(high, low), _mm256_setzero_si256());
         let lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
@@ -454,18 +440,14 @@ fn prefix_xor(mut x: u64) -> u64 {
 
 /// `POSITIONS[b]`: the positions of the set bits of byte `b`, ascending.
 static POSITIONS: [[u8; 8]; 256] = {
-    let mut t = [[0; 8]; 256];
-    let mut b = 0;
-    while b < 256 {
-        let (mut i, mut k) = (0, 0);
-        while i < 8 {
-            if b >> i & 1 == 1 {
-                t[b][k] = i as u8;
-                k += 1;
-            }
-            i += 1;
+    let (mut t, mut i) = ([[0; 8]; 256], 0);
+    while i < 2048 {
+        // Bit `bit` of `b`, set, is the one after the set bits below it.
+        let (b, bit) = (i / 8, i % 8);
+        if b >> bit & 1 == 1 {
+            t[b][(b & ((1 << bit) - 1)).count_ones() as usize] = bit as u8;
         }
-        b += 1;
+        i += 1;
     }
     t
 };
@@ -498,10 +480,8 @@ unsafe fn flatten(bits: u64, base: u32, out: *mut u32) -> usize {
 /// The decimal id at the start of a line, up to its TAB.
 /// `at` is the line's offset in docs.txt, for the error message.
 pub fn parse_id(line: &[u8], at: u64) -> u32 {
-    let digits = &line[..line.iter().position(|&b| b == b'\t').unwrap_or(0)];
-    let id = std::str::from_utf8(digits)
-        .ok()
-        .and_then(|d| d.parse().ok());
+    let d = &line[..line.iter().position(|&b| b == b'\t').unwrap_or(0)];
+    let id = std::str::from_utf8(d).ok().and_then(|d| d.parse().ok());
     id.unwrap_or_else(|| fail(&format!("no document id at byte {at} of docs.txt")))
 }
 
