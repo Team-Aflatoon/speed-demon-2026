@@ -3,6 +3,7 @@
 //! each phrase given an anchor term at which the scan will check it.
 
 use crate::fail;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, OnceLock};
 
@@ -91,14 +92,6 @@ pub struct Table {
 }
 
 const ID_BLOCK: u32 = 1024;
-/// Inserts prefetch the slot of the word this many places ahead.
-const INSERT_AHEAD: usize = 8;
-
-/// A thread's unused term ids: `next..end`.
-pub struct Ids {
-    next: u32,
-    end: u32,
-}
 
 impl Table {
     /// Room for the terms of `words` query words, and ids for all of them from
@@ -184,7 +177,8 @@ impl Table {
     }
 
     /// The id and slot of the term `text[at..at + len]`, claiming both if it is new.
-    fn insert(&self, text: &[u8], at: usize, len: usize, ids: &mut Ids) -> (u32, usize) {
+    /// `ids` are the thread's unused ids.
+    fn insert(&self, text: &[u8], at: usize, len: usize, ids: &mut Range<u32>) -> (u32, usize) {
         let key = Key::new(text, at, len);
         let mut i = key.hash() & self.mask;
         for _ in 0..self.slots.len() {
@@ -193,12 +187,11 @@ impl Table {
             if lo == 0 {
                 match slot[0].compare_exchange(0, key.lo, AcqRel, Acquire) {
                     Ok(_) => {
-                        if ids.next == ids.end {
-                            ids.next = self.next_block.fetch_add(ID_BLOCK, Relaxed);
-                            ids.end = ids.next + ID_BLOCK;
+                        if ids.start == ids.end {
+                            let block = self.next_block.fetch_add(ID_BLOCK, Relaxed);
+                            *ids = block..block + ID_BLOCK;
                         }
-                        let id = ids.next;
-                        ids.next += 1;
+                        let id = ids.next().unwrap();
                         self.text_at[id as usize].store(at as u32, Relaxed);
                         slot[1].store(key.w2 | u64::from(id) << ID_SHIFT, Release);
                         return (id, i);
@@ -240,10 +233,8 @@ impl Table {
     fn tail_eq(&self, token: &[u8], id: u32, text: &[u8]) -> bool {
         let at = self.text_at[id as usize].load(Relaxed) as usize + INLINE;
         let term = &text[at..at + token.len() - INLINE];
-        token[INLINE..]
-            .iter()
-            .zip(term)
-            .all(|(&a, &b)| a | 0x20 == b)
+        let tail = token[INLINE..].iter();
+        tail.zip(term).all(|(&a, &b)| a | 0x20 == b)
     }
 }
 
@@ -355,7 +346,7 @@ impl Parsed {
     /// Puts every word into the table, turning steps and phrase terms into
     /// term ids, counts how often each term occurs and flags BOOL terms.
     pub fn insert(&mut self, table: &Table, text: &[u8]) {
-        let mut ids = Ids { next: 0, end: 0 };
+        let mut ids = 0..0;
         let mut insert = |(at, len): (u32, u8)| {
             let (id, slot) = table.insert(text, at as usize, len as usize, &mut ids);
             if table.freq[id as usize].load(Relaxed) < FREQ_CAP {
@@ -363,19 +354,12 @@ impl Parsed {
             }
             (id, slot)
         };
-        let ahead = |words: &[(u32, u8)], k: usize| {
-            if let Some(&(at, len)) = words.get(k + INSERT_AHEAD) {
-                table.prefetch(table.slot(Key::new(text, at as usize, len as usize)));
-            }
-        };
-        for (k, (step, &word)) in self.steps.iter_mut().zip(&self.bool_words).enumerate() {
-            ahead(&self.bool_words, k);
+        for (step, &word) in self.steps.iter_mut().zip(&self.bool_words) {
             let (id, slot) = insert(word);
             table.flag(slot, BOOL_TERM);
             *step |= id;
         }
-        for (k, (term, &word)) in self.terms.iter_mut().zip(&self.phrase_words).enumerate() {
-            ahead(&self.phrase_words, k);
+        for (term, &word) in self.terms.iter_mut().zip(&self.phrase_words) {
             let (id, slot) = insert(word);
             *term = id;
             self.slots.push(slot as u32);
@@ -390,19 +374,15 @@ impl Parsed {
     pub fn choose_anchors(&mut self, table: &Table, range: usize) {
         for i in 0..self.term_ends.len() {
             let (terms, slots) = (self.phrase(i), span(&self.slots, &self.term_ends, i));
-            let rank = |j: usize| {
-                (
-                    table.freq[terms[j] as usize].load(Relaxed),
-                    usize::MAX - table.term_len(slots[j] as usize),
-                )
-            };
+            let freq = |j: usize| table.freq[terms[j] as usize].load(Relaxed);
+            let rank = |j: usize| (freq(j), usize::MAX - table.term_len(slots[j] as usize));
             let a = (0..terms.len()).min_by_key(|&j| rank(j)).unwrap();
             let (term, slot) = (terms[a], slots[a]);
             table.flag(slot as usize, ANCHOR);
             self.anchor.push(a as u8);
             let phrase = (range as u32) << RANGE_SHIFT | i as u32;
-            self.next
-                .push(table.heads[term as usize].swap(phrase, AcqRel));
+            let previous = table.heads[term as usize].swap(phrase, AcqRel);
+            self.next.push(previous);
         }
         (self.slots, self.bool_words, self.phrase_words) = Default::default();
     }
@@ -444,10 +424,8 @@ impl<'a> Setup<'a> {
         let mut mine = Parsed::parse(self.text, self.ranges[i], self.ranges[i + 1]);
         self.words.fetch_add(mine.word_count(), Relaxed);
         if self.barrier.wait().is_leader() {
-            let threads = self.ranges.len() - 1;
-            let _ = self
-                .table
-                .set(Table::new(self.words.load(Relaxed), threads));
+            let (words, threads) = (self.words.load(Relaxed), self.ranges.len() - 1);
+            let _ = self.table.set(Table::new(words, threads));
         }
         self.wait();
         let table = self.table.get().unwrap();
@@ -460,11 +438,10 @@ impl<'a> Setup<'a> {
 
 /// The first line start of `text` at or after `at`.
 fn line_start(text: &[u8], at: usize) -> usize {
-    match at {
-        0 => 0,
-        _ => text[at - 1..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(text.len(), |i| at + i),
+    let lf = text[at.max(1) - 1..].iter().position(|&b| b == b'\n');
+    if at == 0 {
+        0
+    } else {
+        lf.map_or(text.len(), |i| at + i)
     }
 }

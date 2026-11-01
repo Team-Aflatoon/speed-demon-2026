@@ -31,7 +31,7 @@ use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 const MAX_THREADS: usize = 12;
 const SEGMENT_BYTES: u64 = 8 << 20;
@@ -178,9 +178,6 @@ fn plan(file: &File) -> Vec<Segment> {
     let mut last = [0u8; 1];
     if len > 0 && (read_full(file, &mut last, len - 1) != 1 || last[0] != b'\n') {
         fail("docs.txt must end with an LF");
-    }
-    if len >= 1 << 32 {
-        fail("docs.txt is larger than 4 GB");
     }
     if len == 0 {
         return Vec::new();
@@ -358,37 +355,28 @@ fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
     let docs = check_ids(&sh.segments, s, &chunks);
     sh.docs[s].store(docs, Relaxed);
     if p < PARTS {
-        let streams = chunks.iter().map(|c| c.streams[p].as_slice());
+        let streams: Vec<&[u32]> = chunks.iter().map(|c| &c.streams[p][..]).collect();
         let mut part = sh.parts[p].write().unwrap();
-        return part.build(streams, terms, docs as usize, cursor);
+        return part.build(&streams, terms, docs as usize, cursor);
     }
-    let mut answers: Vec<_> = sh
-        .phrase_answers
-        .iter()
-        .map(|a| a.lock().unwrap())
-        .collect();
     for &(phrase, doc) in chunks.iter().flat_map(|c| &c.matches) {
         let (range, i) = (phrase >> RANGE_SHIFT, phrase & ((1 << RANGE_SHIFT) - 1));
-        answers[range as usize][i as usize].push(doc);
+        sh.phrase_answers[range as usize].lock().unwrap()[i as usize].push(doc);
     }
 }
 
 /// Checks that the chunks of segment `s` hold consecutive document ids that
 /// end where the next segment starts, and returns the segment's document count.
-fn check_ids(
-    segments: &[Segment],
-    s: usize,
-    chunks: &[impl std::ops::Deref<Target = ChunkOut>],
-) -> u32 {
-    let mut next = segments[s].first;
-    for c in chunks.iter().filter(|c| c.lines > 0) {
-        if c.first != next {
-            fail("document ids must be 0, 1, 2, ... in order");
+fn check_ids(segments: &[Segment], s: usize, chunks: &[RwLockReadGuard<ChunkOut>]) -> u32 {
+    let first = segments[s].first;
+    let mut lines = chunks.iter().filter(|c| c.lines > 0);
+    let end = lines.try_fold(first, |next, c| (c.first == next).then_some(next + c.lines));
+    match end {
+        Some(end)
+            if segments.get(s + 1).is_none_or(|n| n.first == end) && (s > 0 || first == 0) =>
+        {
+            end - first
         }
-        next += c.lines;
+        _ => fail("document ids must be 0, 1, 2, ... in order"),
     }
-    if segments.get(s + 1).is_some_and(|n| n.first != next) || (s == 0 && segments[0].first != 0) {
-        fail("document ids must be 0, 1, 2, ... in order");
-    }
-    next - segments[s].first
 }

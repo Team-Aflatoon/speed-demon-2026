@@ -69,9 +69,9 @@ and links the binary statically so that a run never pays for the dynamic loader.
 ## With another 24 hours
 
 - The query parse runs before the scan can start and takes about 6 ms of wall time: four
-  barriers, a 4 MB table filled by one thread while the others wait, and inserts that already
-  prefetch ahead. Letting the first scan tasks read and lex the corpus (which needs no table)
-  while the table is filled would hide most of it.
+  barriers, a 4 MB table filled by one thread while the others wait, and the inserts' cache
+  misses (prefetching ahead made no difference on the board). Letting the first scan tasks read
+  and lex the corpus (which needs no table) while the table is filled would hide most of it.
 - About 40% of the scan's CPU time is the table lookup itself, and halving the table changed
   nothing on the board, so the lookup's own work (hashing, compares, branches) is what to cut.
   Next would be a direct table for the one- and two-byte tokens (1,332 entries), which are among

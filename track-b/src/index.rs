@@ -26,16 +26,10 @@ pub struct Part {
 impl Part {
     /// Counting sort of the `doc << 16 | l` pairs of `streams` (in document
     /// order) by `l`, for a segment of `docs` documents.
-    pub fn build<'s>(
-        &mut self,
-        streams: impl Iterator<Item = &'s [u32]> + Clone,
-        terms: usize,
-        docs: usize,
-        cursor: &mut Vec<u32>,
-    ) {
+    pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize, cursor: &mut Vec<u32>) {
         self.offsets.clear();
         self.offsets.resize(terms + 1, 0);
-        for &x in streams.clone().flatten() {
+        for &x in streams.iter().copied().flatten() {
             self.offsets[(x & 0xFFFF) as usize + 1] += 1;
         }
         for l in 0..terms {
@@ -44,7 +38,7 @@ impl Part {
         cursor.clear();
         cursor.extend_from_slice(&self.offsets[..terms]);
         self.docs.resize(self.offsets[terms] as usize, 0);
-        for &x in streams.flatten() {
+        for &x in streams.iter().copied().flatten() {
             let at = &mut cursor[(x & 0xFFFF) as usize];
             self.docs[*at as usize] = (x >> 16) as u16;
             *at += 1;
@@ -236,10 +230,11 @@ impl Evaluator {
                 return [Acc::List, Acc::Empty][usize::from(self.list.is_empty())];
             }
             (OR, _) => set_bits(&mut self.bits, set.list()),
-            _ => set
-                .list()
-                .iter()
-                .for_each(|&d| self.bits[usize::from(d) / 64] &= !(1 << (d % 64))),
+            _ => {
+                for &d in set.list() {
+                    self.bits[usize::from(d) / 64] &= !(1 << (d % 64));
+                }
+            }
         }
         Acc::Bits
     }
@@ -292,18 +287,13 @@ fn sift<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16
 /// is `GALLOP` times longer the shorter one gallops through it; otherwise the
 /// one that decides is spread into `mask` and the other tested against it.
 fn combine<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
-    // AND is symmetric, so `a` is made the shorter list.
-    let (a, b) = if !not && a.len() > b.len() {
-        (b, a)
-    } else {
-        (a, b)
-    };
+    if !not && a.len() > b.len() {
+        return combine(b, a, not, mask, out); // AND is symmetric: `a` the shorter
+    }
     if a.len() * GALLOP >= b.len() {
-        return if not {
-            sift(a, b, true, mask, out)
-        } else {
-            sift(b, a, false, mask, out)
-        };
+        // NOT spreads what it removes; AND spreads the shorter list.
+        let (tested, spread) = if not { (a, b) } else { (b, a) };
+        return sift(tested, spread, not, mask, out);
     }
     out.clear();
     let mut at = 0;
@@ -405,9 +395,8 @@ fn bit_index_sum(w: u64) -> u64 {
         0xFFFF_0000_FFFF_0000,
         0xFFFF_FFFF_0000_0000,
     ];
-    (0..6)
-        .map(|k| u64::from((w & MASKS[k]).count_ones()) << k)
-        .sum()
+    let ones = |k: usize| u64::from((w & MASKS[k]).count_ones()) << k;
+    (0..6).map(ones).sum()
 }
 
 /// Decimal digits of `v`, without the formatting machinery.

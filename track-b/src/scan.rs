@@ -204,11 +204,8 @@ impl<'a> Scanner<'a> {
         let (tokens, lines) = self.lex(start, end);
         let (table, queries, phrases) = (self.table, self.queries, self.phrases);
         let (buf, doc, lfs) = (&self.buf[..], &mut self.doc, &self.lfs[..lines]);
-        let (starts, ends, ids) = (
-            &self.starts[..tokens],
-            &self.ends[..tokens],
-            &mut self.ids[..tokens],
-        );
+        let (starts, ends) = (&self.starts[..tokens], &self.ends[..tokens]);
+        let ids = &mut self.ids[..tokens];
         doc.first = 0; // token indexes restart with each region
         let miss = table.miss();
         let mut keys = [(Key { lo: 0, w2: 0 }, 0); BATCH];
@@ -229,9 +226,8 @@ impl<'a> Scanner<'a> {
                     line += 1;
                     next_lf = lfs.get(line).copied().unwrap_or(u32::MAX);
                 }
-                let w2 = table
-                    .find(key, slot, &buf[s as usize..e as usize], queries)
-                    .unwrap_or(miss);
+                let token = &buf[s as usize..e as usize];
+                let w2 = table.find(key, slot, token, queries).unwrap_or(miss);
                 ids[k] = Table::id(w2);
                 doc.token(k, w2);
             }
@@ -360,10 +356,11 @@ fn flatten(mut bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
 /// The decimal id at the start of a line, up to its TAB.
 pub fn parse_id(line: &[u8]) -> u32 {
     let digits = line.iter().position(|&b| b == b'\t').unwrap_or(0);
-    let id = std::str::from_utf8(&line[..digits])
-        .ok()
-        .and_then(|s| s.parse().ok());
-    id.unwrap_or_else(|| fail("a line of docs.txt does not start with a document id"))
+    let id = std::str::from_utf8(&line[..digits]).map(str::parse);
+    match id {
+        Ok(Ok(id)) => id,
+        _ => fail("a line of docs.txt does not start with a document id"),
+    }
 }
 
 /// Fills `buf` from `offset`, short only at the end of the file.
