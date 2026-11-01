@@ -143,8 +143,7 @@ fn grow<'s, F: Fn(usize) + Sync>(s: &'s Scope<'s, '_>, t: usize, n: usize, work:
 /// which `rest` bytes are left from there, into `buffer` with pread, rather than mapping the file: on the scoring
 /// box the page faults, page-table set-up and tear-down of a 200 MB mapping
 /// cost more than copying the bytes. Returns where in `buffer` the chunk
-/// starts and ends, with `PAD` zero bytes after it, and whether it ends the
-/// file.
+/// starts and ends, with `PAD` zero bytes after it.
 ///
 /// The chunk runs from the first record boundary at or after `from` to the
 /// first at or after `from + piece` (the first chunk from the end of the
@@ -169,8 +168,13 @@ fn read(file: &File, rest: usize, from: usize, piece: usize, buffer: &mut Vec<u8
         };
         // The last chunk ends at the end of the file, where no cut is.
         if let Some(end) = cut(b, nominal).or((want == rest).then_some(want)) {
+            let start = start.unwrap_or(end).min(end);
             buffer[end..end + PAD].fill(0);
-            return (start.unwrap_or(end).min(end), end, end == rest);
+            // An LF after a last record with no terminator (see `Parser::chunk`).
+            if end == rest && end > start && buffer[end - 1] != b'\n' {
+                buffer[end] = b'\n';
+            }
+            return (start, end);
         }
         want = (2 * want).min(rest);
     }

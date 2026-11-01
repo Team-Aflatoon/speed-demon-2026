@@ -5,12 +5,12 @@
 //! and LF. In this grammar a byte is inside a quoted field exactly when an
 //! odd number of quotes precede it (a `""` escape closes and reopens), so the
 //! prefix XOR of the quote mask is the in-quotes mask, and the commas and LFs
-//! outside it are the separators. The LFs among them end the records. A
-//! record's four commas are then the first two separators after its start
-//! and the last two before its end, read off the masks a word at a time.
+//! outside it are the separators. The LFs among them end the records. The
+//! separators' offsets are listed in order, so that a record's are simply
+//! the next five: its four commas, then its terminator.
 //!
 //! A chunk is handled a window of blocks at a time, in three tight loops:
-//! `scan` makes the masks and lists the records' ends, `parse` reads each
+//! `scan` makes the masks and lists the separators, `parse` reads each
 //! record's fields and starts loading the region-map entry and name-table
 //! line it needs, and `join` uses them, by which time most of those cache
 //! misses have overlapped.
@@ -19,16 +19,15 @@ use crate::names::{Key, Pairs, Table};
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
-/// Zero bytes after every chunk in its buffer: the parser reads whole 64-byte
-/// blocks, and names' and numbers' words, up to 64 bytes past the end.
+/// Zero bytes after every chunk in its buffer (but see `Parser::chunk`): the
+/// parser reads whole 64-byte blocks, and names' and numbers' words, up to
+/// 64 bytes past the end.
 pub const PAD: usize = 128;
 /// Bytes scanned per window; a multiple of 64.
 const WINDOW: usize = 4096;
 /// Records parsed before they are joined: a window's worth, at about 61
 /// bytes a record (a window with more takes several batches).
 const BATCH: usize = 128;
-/// '0' in every byte of a word.
-const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 /// A result, or the buffer offset near which the bytes break the grammar
 /// (or a chunk did not start and end at record boundaries).
@@ -59,19 +58,16 @@ struct Record {
     nums: [i64; 3],
 }
 
-/// Where a chunk starts and ends in its buffer, and whether it ends the file.
-pub type Span = (usize, usize, bool);
+/// Where a chunk starts and ends in its buffer.
+pub type Span = (usize, usize);
 
-/// A record's end (its terminator's offset in the buffer) and the quote
-/// bytes in the chunk before it.
-type End = [u32; 2];
-
-/// What the record loops read: the name table, the chunk's buffer, and its
-/// separator masks with where it starts in the buffer (see `window`).
-type Ctx<'a> = (&'a Table, &'a [u8], (&'a [u64], usize));
+/// What the record loops read: the name table, the chunk's buffer, and per
+/// 64-byte block of the chunk the quotes before it and its quote mask, with
+/// where the chunk starts in the buffer (see `quotes_before`).
+type Ctx<'a> = (&'a Table, &'a [u8], (&'a [[u64; 2]], usize));
 
 /// Where a record starts, and the quotes in the chunk before it.
-type At = (usize, u32);
+type At = (usize, u64);
 
 /// What a worker accumulates: aggregates by group, and its name pairs.
 pub struct Local {
@@ -80,124 +76,126 @@ pub struct Local {
 }
 
 /// A worker's parser: the tables it joins against, and its state, reused
-/// for every chunk: per 64-byte block of the chunk its separators (see
-/// `window`), the record ends found in the current window, and a batch of
-/// its records.
+/// for every chunk: per 64-byte block of the chunk its quotes (see `Ctx`),
+/// the separators found in the current window, and a batch of its records.
 pub struct Parser<'a> {
     tables: (&'a Table, &'a [AtomicU8]),
     /// While scanning a chunk: the in-quotes state (all ones or 0) after the
-    /// last block, and the quotes and separators so far.
-    state: [u64; 3],
-    seps: Vec<u64>,
-    ends: Vec<End>,
+    /// last block, and the quotes so far.
+    state: [u64; 2],
+    quotes: Vec<[u64; 2]>,
+    /// Offsets in the buffer, those of a record not yet ended first.
+    seps: Vec<u32>,
     batch: Vec<Record>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(table: &'a Table, map: &'a [AtomicU8]) -> Self {
-        let (ends, batch) = (vec![[0; 2]; WINDOW + 64], vec![Record::default(); BATCH]);
-        Parser { tables: (table, map), state: [0; 3], seps: Vec::new(), ends, batch }
+        let (seps, batch) = (vec![0; WINDOW + 128], vec![Record::default(); BATCH]);
+        Parser { tables: (table, map), state: [0; 2], quotes: Vec::new(), seps, batch }
     }
 
-    /// Parses the records in `b[start..end]` into `out`, `span` being
-    /// `(start, end, eof)`: one chunk of the file (after the header, for the
-    /// first), read into a buffer and followed there by `PAD` zero bytes. It
-    /// must start at a record start; `eof` says whether it ends the file.
-    /// Returns the number of quote bytes in it, which `run` uses to check the
-    /// chunk cuts.
+    /// Parses the records in `b[start..end]` into `out`: one chunk of the
+    /// file (after the header, for the first), read into a buffer and
+    /// followed there by `PAD` zero bytes, but for an LF just past a last
+    /// record that has no terminator (`run::read` adds it, and this scans
+    /// that one byte more). It must start at a record start. Returns the
+    /// number of quote bytes in it, which `run` uses to check the chunk cuts.
     ///
     /// Every record must hold exactly four commas outside quotes, with valid
-    /// numbers in their fields: `parse` checks that each record has at least
-    /// four, and this that the chunk has five separators per record in all.
-    /// What is not diagnosed is a quote placed where 2.1 forbids it (inside
-    /// an unquoted field, or not followed by a separator after closing).
-    pub fn chunk(&mut self, b: &[u8], (start, end, eof): Span, out: &mut Local) -> Res<u64> {
-        // One block more than the chunk's at each end (see `window`).
-        let blocks = (end - start) / 64 + 3;
-        self.seps.resize(self.seps.len().max(blocks), 0);
-        // Records so far, and where the next one starts.
-        let (mut records, mut at) = (0, (start, 0));
-        self.state = [0; 3];
+    /// numbers in their fields: the separators are taken five at a time, and
+    /// as `parse` checks that the fifth is always an LF, and this that there
+    /// are as many LFs, none of the first four is one. What is not diagnosed
+    /// is a quote placed where 2.1 forbids it (inside an unquoted field, or
+    /// not followed by a separator after closing).
+    pub fn chunk(&mut self, b: &[u8], (start, end): Span, out: &mut Local) -> Res<u64> {
+        // A CR before an added LF would end the record as if before a real
+        // one: refused.
+        if b[end] == b'\n' && b[end - 1] == b'\r' {
+            return Err(end - 1);
+        }
+        let blocks = (end - start) / 64 + 2;
+        self.quotes.resize(self.quotes.len().max(blocks), [0; 2]);
+        let (mut at, mut carry) = ((start, 0), 0);
+        self.state = [0; 2];
         for window in (start..end).step_by(WINDOW) {
             let last = (window + WINDOW).min(end);
             // SAFETY: main checked that the CPU has PCLMULQDQ.
-            let mut n = unsafe { self.scan(b, [start, window, last]) };
-            // The final record may end at end of file without a terminator.
-            let tail = self.ends[..n].last().map_or(at.0, |e| e[0] as usize + 1);
-            let [inside, quotes, seps] = self.state;
-            if eof && last == end && tail < end && inside == 0 {
-                // A CR there would end the record as if before an LF: refused.
-                (b[end - 1] != b'\r').then_some(()).ok_or(end - 1)?;
-                (self.ends[n], n, self.state[2]) = ([end as u32, quotes as u32], n + 1, seps + 1);
-            }
+            let (n, records) = unsafe { self.scan(b, [start, window, last + usize::from(last == end)], carry) };
+            // Five separators a record, and at most four commas of the next.
+            carry = n.checked_sub(5 * records).filter(|&c| c < 5).ok_or(at.0)?;
             let (table, map) = self.tables;
-            for ends in self.ends[..n].chunks(BATCH) {
-                let c = (table, b, (&self.seps[..], start));
-                let batch = &mut self.batch[..ends.len()];
-                at = parse(c, map, ends, batch, at)?;
+            for seps in self.seps[..5 * records].chunks(5 * BATCH) {
+                let c = (table, b, (&self.quotes[..], start));
+                let batch = &mut self.batch[..seps.len() / 5];
+                at = parse(c, map, seps, batch, at)?;
                 join(c, map, batch, out);
             }
-            records += n as u64;
+            self.seps.copy_within(5 * records..n, 0);
         }
-        // `at.0` is one past `end` after a final record with no terminator.
-        let whole = at.0.min(end) == end.max(start) && self.state[2] == 5 * records;
-        whole.then_some(self.state[1]).ok_or(at.0)
+        // `at.0` is one past `end` after a record ended by an added LF.
+        (carry == 0 && at.0.min(end) == end).then_some(self.state[1]).ok_or(at.0)
     }
 
-    /// Makes the separator masks of the blocks of `b[window..last]` and lists
-    /// the ends of the records they end in `self.ends`; returns how many.
+    /// Makes the masks of the blocks of `b[window..last]`, notes each
+    /// block's quotes, and lists its separators in `self.seps` after the
+    /// `n` there; returns how many there are then, and how many records
+    /// they end.
     ///
     /// # Safety
     /// The CPU must have PCLMULQDQ (see `prefix_xor`).
     #[target_feature(enable = "pclmulqdq")]
-    unsafe fn scan(&mut self, b: &[u8], [start, window, last]: [usize; 3]) -> usize {
-        let (first, mut n, state) = ((window - start) / 64 + 1, 0, &mut self.state);
+    unsafe fn scan(&mut self, b: &[u8], [start, window, last]: [usize; 3], mut n: usize) -> (usize, usize) {
+        let (first, mut records, state) = ((window - start) / 64, 0, &mut self.state);
         let blocks = (last - window).div_ceil(64);
-        for (k, sep) in self.seps[first..first + blocks].iter_mut().enumerate() {
+        for (k, quotes) in self.quotes[first..first + blocks].iter_mut().enumerate() {
             let o = window + 64 * k;
             let [quote, comma, lf] = masks(b, o);
             let inside = prefix_xor(quote) ^ state[0];
             state[0] = ((inside as i64) >> 63) as u64; // bit 63, broadcast
-            *sep = (comma | lf) & !inside;
-            n = push_ends(&mut self.ends, n, lf & !inside, [o as u64, quote, state[1]]);
+            *quotes = [state[1], quote];
             state[1] += u64::from(quote.count_ones());
-            state[2] += u64::from(sep.count_ones());
+            n = flatten(&mut self.seps, n, (comma | lf) & !inside, o as u32);
+            records += (lf & !inside).count_ones() as usize;
         }
-        n
+        (n, records)
     }
 }
 
-/// The 64 separator bits of the buffer's bytes `p - 64` to `p - 1`, for a `p`
-/// from the start of the chunk at `start` to 64 bytes past its end. `seps`
-/// holds the chunk's block k at index k + 1: index 0, an empty block, lets a
-/// record's last 64 bytes reach back before the chunk, and one block after
-/// it lets its first 64 reach past it. Bits past the window being parsed are
-/// stale; see `fields`.
-fn window((seps, start): (&[u64], usize), p: usize) -> u64 {
+/// The quote bytes in the chunk before offset `p` of the buffer, for a `p`
+/// in a block `scan` has been through.
+fn quotes_before((quotes, start): (&[[u64; 2]], usize), p: usize) -> u64 {
     let i = p - start;
-    debug_assert!(i / 64 + 1 < seps.len());
-    // SAFETY: as above, so within the chunk's blocks and the one after.
-    let [lo, hi] = [0, 1].map(|j| u128::from(*unsafe { seps.get_unchecked(i / 64 + j) }));
-    ((hi << 64 | lo) >> (i % 64)) as u64
+    debug_assert!(i / 64 < quotes.len());
+    // SAFETY: as above; and BMI2 is part of x86-64-v3, which the whole crate
+    // is compiled for (see `masks`).
+    let [before, mask] = *unsafe { quotes.get_unchecked(i / 64) };
+    before + u64::from(unsafe { _bzhi_u64(mask, (i % 64) as u32) }.count_ones())
 }
 
-/// Parses the records ending at `ends` into `out`, the first starting at
-/// `at.0` with `at.1` quotes before it in the chunk, and starts loading what
-/// their joins will need. Returns where the next record starts, and the
-/// quotes before it.
+/// Parses the records whose separators are `seps`, five each, into `out`,
+/// the first starting at `at.0` with `at.1` quotes before it in the chunk,
+/// and starts loading what their joins will need. Returns where the next
+/// record starts, and the quotes before it.
 #[inline(never)]
-fn parse(c: Ctx, map: &[AtomicU8], ends: &[End], out: &mut [Record], at: At) -> Res<At> {
-    let (mut s, mut quotes_before) = at;
-    for (&[e, quotes], f) in ends.iter().zip(out) {
-        let (e, q) = (e as usize, quotes.wrapping_sub(quotes_before));
-        if !fields(f, c, (s, e), q) {
-            slow(f, c, (s, e), q).ok_or(s)?;
+fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> Res<At> {
+    let (mut s, mut quotes_before_s) = at;
+    for (seps, f) in seps.chunks_exact(5).zip(out) {
+        let [c0, c1, c2, c3, e] = [0, 1, 2, 3, 4].map(|j| seps[j] as usize);
+        // SAFETY: a separator is within the chunk, or the LF just past it.
+        if unsafe { *c.1.get_unchecked(e) } != b'\n' {
+            return Err(s);
+        }
+        let (quotes, seps) = (quotes_before(c.2, e), [c0, c1, c2, c3, e]);
+        let q = (quotes - quotes_before_s) as u32;
+        if !fields(f, c, (s, seps, q)) {
+            slow(f, c, (s, seps, q)).ok_or(s)?;
         }
         crate::prefetch(map, f.region as usize);
         c.0.prefetch(&f.key);
-        (s, quotes_before) = (e + 1, quotes);
+        (s, quotes_before_s) = (e + 1, quotes);
     }
-    Ok((s, quotes_before))
+    Ok((s, quotes_before_s))
 }
 
 /// Joins the parsed records: their groups' aggregates, and their names'
@@ -216,56 +214,32 @@ fn join((table, b, _): Ctx, map: &[AtomicU8], records: &[Record], out: &mut Loca
     }
 }
 
-/// Parses into `f` the record `b[s..e]`, `e` being its terminator (or the
-/// end of file), with `q` quote bytes in it, if it takes the common form:
-/// its four commas within 64 bytes of its ends (in 64-bit windows of the
-/// separator masks), an id and region id of at most 8 digits, an amount of
-/// at most 5 before the dot. Anything else is left to `slow`.
-///
-/// The windows may hold stale bits past the window being parsed, but only
-/// at bytes past `e`; a record with fewer than four separators of its own
-/// might take one of those for its second comma, which then is not before
-/// its third, and `slow` decides.
+/// A record: where it starts, its four commas and terminator, and the quote
+/// bytes in it.
+type Rec = (usize, [usize; 5], u32);
+
+/// Parses into `f` record `r`, if it takes the common form: an id and region
+/// id of at most 8 digits, an amount of at most 5 before the dot. Anything
+/// else is left to `slow`.
 #[inline(always)]
-fn fields(f: &mut Record, c: Ctx, (s, e): (usize, usize), q: u32) -> bool {
-    let (b, m) = (c.1, c.2);
-    let (head, tail) = (window(m, s + 64), window(m, e));
-    let (head2, top) = (head & head.wrapping_sub(1), tail.leading_zeros().min(63));
-    let tail2 = tail & !(1 << (63 - top));
-    let [c0, c1] = [head, head2].map(|w| s + w.trailing_zeros() as usize);
-    // Wrapping: with too few separators the positions may be junk, and the
-    // checks below reject them.
-    let [c2, c3] = [tail2.leading_zeros(), top].map(|z| e.wrapping_sub(1 + z as usize));
-    if (head2 == 0) | (tail2 == 0) | (c1 >= c2) {
-        return false;
-    }
-    // SAFETY (all reads): the record starts at `s` and ends at `e`, at most
-    // the chunk's end, and these bytes are within it.
+fn fields(f: &mut Record, c: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> bool {
+    let b = c.1;
+    // SAFETY (all reads): the record's bytes, and these are within it.
     let byte = |p| unsafe { *b.get_unchecked(p) };
-    let end = e - usize::from(byte(e - 1) == b'\r'); // only ever before an LF (see `chunk`)
+    let end = e - usize::from(byte(e - 1) == b'\r');
     let negative = byte(c3 + 1) == b'-';
-    let whole = end.wrapping_sub(c3 + 4 + usize::from(negative)); // digits before the dot
-    let (n_id, n_region) = (c0 - s, c3 - c2 - 1);
-    // All three lengths in range at once: `n - 1` wraps below 0.
-    // (`end - 3` is past `s` once the four commas are in order.)
-    let common = (n_id.wrapping_sub(1) | n_region.wrapping_sub(1)) < 8 && whole.wrapping_sub(1) < 5;
-    if !common | (byte(end - 3) != b'.') {
+    let a = c3 + 1 + usize::from(negative);
+    // (`end - 3` is past `s`, as the four commas come before `e`.)
+    if byte(end - 3) != b'.' {
         return false;
     }
-    // Each number right-aligned in a word: its n digits at the top (the
-    // bytes after the field fall off), and '0's below them. The amount's
-    // last 8 bytes have the dot shifted out first.
-    // SAFETY (`bzhi`, the low `shift` bits of '0's): BMI2 is part of
-    // x86-64-v3, which the whole crate is compiled for. The loads: `end - 8`
-    // is at least `s`, as a record is at least 10 bytes before its
-    // terminator; `s` and `c2 + 1` start fields that end before `end`.
-    let fit = |p: usize, n: usize| unsafe { load(b, p) << (64 - 8 * n) | (ZEROS >> 4) >> (8 * n - 4) };
-    let w = unsafe { load(b, end - 8) };
-    let undotted = (w & 0xFF_FFFF_FFFF) << 8 | w & 0xFFFF << 48;
-    let before = !(u64::MAX << (8 * (6 - whole)));
-    let lanes = [fit(s, n_id), fit(c2 + 1, n_region), undotted & !before | ZEROS & before, ZEROS];
+    // Each number's field, the amount's with its dot, from its first byte
+    // (the word's lowest): `digits` shifts it to the word's top.
+    // SAFETY: each field ends before `end`, and the loads reach at most 8
+    // bytes past a field's start (see `load`).
+    let starts = [s, c2 + 1, a].map(|p| unsafe { load(b, p) });
     // A non-digit, a BOM before the id among them, takes the slow path.
-    let Some([id, region, cents, _]) = digits(lanes) else {
+    let Some([id, region, cents]) = digits(starts, [c0 - s, c3 - c2 - 1, end - a]) else {
         return false;
     };
     let cents = (1 - 2 * i64::from(negative)) * cents as i64;
@@ -273,28 +247,27 @@ fn fields(f: &mut Record, c: Ctx, (s, e): (usize, usize), q: u32) -> bool {
     true
 }
 
-/// `fields` for any record that is not in its common form: its separators
-/// found bit by bit, and its numbers one byte at a time; `None` if it breaks
-/// the grammar. Out of line, so that the hot loop keeps its registers.
+/// `fields` for any record that is not in its common form: its numbers one
+/// byte at a time; `None` if it breaks the grammar. Out of line, so that the
+/// hot loop keeps its registers.
 #[cold]
 #[inline(never)]
-fn slow(f: &mut Record, ctx: Ctx, (s, e): (usize, usize), q: u32) -> Option<()> {
+fn slow(f: &mut Record, ctx: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()> {
     let b = ctx.1;
-    let mut seps = (s..e).filter(|&p| window(ctx.2, p + 64) & 1 == 1);
-    let c = [seps.next()?, seps.next()?, seps.next()?, seps.next()?];
-    let crlf = e > c[3] + 1 && b[e - 1] == b'\r' && b.get(e) == Some(&b'\n');
+    let crlf = e > c3 + 1 && b[e - 1] == b'\r';
     // A BOM directly after a terminator is not data (spec 2.1).
-    let id = &b[s + 3 * usize::from(b[s..].starts_with(b"\xEF\xBB\xBF"))..c[0]];
+    let id = &b[s + 3 * usize::from(b[s..].starts_with(b"\xEF\xBB\xBF"))..c0];
     // The amount, `-?[0-9]+\.[0-9]{2}`, as cents.
-    let amount = &b[c[3] + 1..e - usize::from(crlf)];
+    let amount = &b[c3 + 1..e - usize::from(crlf)];
     let (sign, digits) = amount.strip_prefix(b"-").map_or((1, amount), |d| (-1, d));
     let (whole, fraction) = digits.split_at(digits.len().checked_sub(3)?);
     let (whole, fraction) = (number(whole)?, number(fraction.strip_prefix(b".")?)?);
     let cents = i64::try_from(whole.checked_mul(100)?.checked_add(fraction)?).ok()?;
     // A region id too big for the map is simply unknown (see `join`).
-    let region = number(&b[c[2] + 1..c[3]])?.min(u32::MAX.into());
+    let region = number(&b[c2 + 1..c3])?.min(u32::MAX.into());
     let nums = [number(id)? as i64, region as i64, sign * cents];
-    seps.next().is_none().then(|| finish(f, ctx, [c[0], c[1], c[2]], nums, q))
+    finish(f, ctx, [c0, c1, c2], nums, q);
+    Some(())
 }
 
 /// The rest of `fields`, given a record's first three commas and its
@@ -344,28 +317,26 @@ fn prefix_xor(x: u64) -> u64 {
     _mm_cvtsi128_si64(product) as u64
 }
 
-/// Appends the record ends in the block at `o`, the set bits of `mask`, to
-/// `ends[n..]` with the quotes before each (`before`, plus those of `quotes`
-/// below it), and returns the new count. Most blocks end at most two
-/// records, so two are written unconditionally (junk past the count, which
-/// later appends overwrite) and only more take the loop. `n` is at most the
-/// LFs of the window's blocks before this one, so the writes stay below
-/// `WINDOW + 64`.
-fn push_ends(ends: &mut [End], n: usize, mut mask: u64, [o, quotes, before]: [u64; 3]) -> usize {
-    debug_assert!(n + 64 <= ends.len());
+/// Appends the offsets of the set bits of `mask`, the separators of the
+/// block at `o`, to `seps[n..]`, and returns the new count. Most blocks hold
+/// at most eight (a record has five in about 61 bytes), so eight are written
+/// unconditionally (junk past the count, which later appends overwrite) and
+/// only more take the loop. `n` is at most four more than the bytes scanned
+/// before this block in the window, so the writes stay below `WINDOW + 128`.
+fn flatten(seps: &mut [u32], n: usize, mut mask: u64, o: u32) -> usize {
+    debug_assert!(n + 64 <= seps.len());
     let count = mask.count_ones() as usize;
-    let mut end = |i: usize, mask: u64| {
-        let below = (quotes & (mask & mask.wrapping_neg()).wrapping_sub(1)).count_ones();
-        let at = (o + u64::from(mask.trailing_zeros())) as u32;
+    let mut sep = |i: usize, mask: u64| {
         // SAFETY: as above.
-        *unsafe { ends.get_unchecked_mut(i) } = [at, before as u32 + below];
+        *unsafe { seps.get_unchecked_mut(i) } = o + mask.trailing_zeros();
         mask & mask.wrapping_sub(1)
     };
-    mask = end(n, mask);
-    mask = end(n + 1, mask);
-    let mut i = n + 2;
+    for i in n..n + 7 {
+        mask = sep(i, mask);
+    }
+    let mut i = n + 7;
     while mask != 0 {
-        (mask, i) = (end(i, mask), i + 1);
+        (mask, i) = (sep(i, mask), i + 1);
     }
     n + count
 }
@@ -383,23 +354,40 @@ pub unsafe fn load(b: &[u8], p: usize) -> u64 {
     unsafe { b.as_ptr().add(p).cast::<u64>().read_unaligned() }
 }
 
-/// Four words of eight ASCII digits each (the first in the lowest byte) to
-/// their values, or `None` if any byte is not a digit. Adjacent digits
-/// combine into pairs, the pairs into fours, the fours into eight.
-fn digits(lanes: [u64; 4]) -> Option<[u64; 4]> {
-    // SAFETY: plain AVX2 arithmetic on a local array; the whole crate is
-    // compiled for AVX2 (see `masks`).
+/// The values of an id, a region id and an amount (in cents), given the
+/// words at their fields' starts and their lengths in bytes, or `None` if
+/// any byte is not a digit or a length is out of range: 1 to 8, and the
+/// amount's 4 to 8 (with its dot third from last). Each field is shifted to the top of its word, the bytes
+/// after it falling off and zeros (as digits) coming in below it; then
+/// adjacent digits combine into pairs, the pairs into fours, the fours
+/// into eight. The amount's dot is masked out and weighs nothing, and its
+/// last two digits are cents, so its top four digits weigh 1,000 x.
+fn digits(words: [u64; 3], lens: [usize; 3]) -> Option<[u64; 3]> {
+    const DOT: i64 = !(0xFF << 40);
+    // SAFETY: plain AVX2 arithmetic on locals; the whole crate is compiled
+    // for AVX2 (see `masks`).
     unsafe {
-        let v = _mm256_loadu_si256(lanes.as_ptr().cast());
-        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
-        let ok = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
-        let pairs = _mm256_maddubs_epi16(d, _mm256_set1_epi16(10 | 1 << 8));
+        let [w0, w1, w2] = words.map(|w| w as i64);
+        let [n0, n1, n2] = lens.map(|n| 64 - 8 * n as i64);
+        let v = _mm256_sub_epi8(_mm256_set_epi64x(0, w2, w1, w0), _mm256_set1_epi8(b'0' as i8));
+        // The lengths in range: shifts from 0 to 56 bits, the amount's to 32.
+        let shifts = _mm256_set_epi64x(0, n2, n1, n0);
+        let long = _mm256_cmpgt_epi64(shifts, _mm256_set_epi64x(0, 32, 56, 56));
+        let bad = _mm256_or_si256(long, _mm256_cmpgt_epi64(_mm256_setzero_si256(), shifts));
+        // (`& 63` changes no count left, but spares the shift its case for
+        // counts of 64 or more, which give 0.)
+        let shifts = _mm256_and_si256(shifts, _mm256_set1_epi64x(63));
+        let d = _mm256_and_si256(_mm256_sllv_epi64(v, shifts), _mm256_set_epi64x(0, DOT, -1, -1));
+        let ok = _mm256_andnot_si256(bad, _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d));
+        let ten = 10 | 1 << 8;
+        let weights = _mm256_set_epi16(0, 0, 0, 0, ten, 1, ten, ten, ten, ten, ten, ten, ten, ten, ten, ten);
+        let pairs = _mm256_maddubs_epi16(d, weights);
         let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(100 | 1 << 16));
-        let high = _mm256_mul_epu32(fours, _mm256_set1_epi64x(10_000));
+        let high = _mm256_mul_epu32(fours, _mm256_set_epi64x(0, 1_000, 10_000, 10_000));
         let value = _mm256_add_epi64(high, _mm256_srli_epi64::<32>(fours));
         let mut out = [0u64; 4];
         _mm256_storeu_si256(out.as_mut_ptr().cast(), value);
-        (_mm256_movemask_epi8(ok) == -1).then_some(out)
+        (_mm256_movemask_epi8(ok) == -1).then_some([out[0], out[1], out[2]])
     }
 }
 
