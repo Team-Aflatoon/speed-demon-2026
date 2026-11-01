@@ -42,7 +42,7 @@ const BLOCK: usize = 1024;
 const CROWDED: usize = 1 << 17;
 /// Bytes of input a worker claims and reads at a time: a buffer that, with its
 /// hyperthread sibling's, stays in a P-core's 1.25 MB L2.
-const PIECE: usize = 128 << 10;
+const PIECE: usize = 64 << 10;
 /// The longest line the grammar allows: timestamp, 7-byte method, 125-byte endpoint,
 /// status and 10-digit latency, with their separators and the newline.
 const MAX_LINE: usize = 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1;
