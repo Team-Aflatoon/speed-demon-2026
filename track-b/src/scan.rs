@@ -6,9 +6,7 @@
 
 use crate::fail;
 use crate::index::PARTS;
-use crate::query::{
-    Lookup, Parsed, Probe, Table, ANCHOR, BOOL_TERM, ID_MASK, NONE, RANGE_SHIFT, SHORT,
-};
+use crate::query::{Lookup, Parsed, Probe, Table, BOOL_TERM, ID_MASK, NONE, RANGE_SHIFT, SHORT};
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -18,7 +16,7 @@ compile_error!("track-b needs AVX2: build with -C target-cpu=x86-64-v3 (see .car
 
 /// Bytes per `pread`. Reading into a small reused buffer measured 15% faster
 /// than `mmap` on the scoring box (Track A), whose page-fault path is slow.
-const PIECE: usize = 64 << 10;
+const PIECE: usize = 128 << 10;
 /// Slack after the data, so 64-byte vector loads and 16-byte key loads stay
 /// inside the buffer; whatever they read past the data is masked off.
 const PAD: usize = 64;
@@ -71,20 +69,17 @@ struct Run<'r> {
 struct Doc {
     local: u32,
     first: usize,
-    /// The term id of each token so far (0 for no query term), with
-    /// `ANCHOR` set if the term anchors a phrase.
+    /// The term id of each token so far (0 for no query term).
     ids: Vec<u32>,
     /// The distinct BOOL terms so far: `fresh[..n_fresh]`.
     fresh: Vec<u32>,
     /// Invariant: at most the document's token count, and 0 between documents.
     n_fresh: usize,
-    /// Per term id, the stamp of the last document it was seen in: a term
-    /// was seen in this document if its stamp is `stamp`. Stamps run from 1
-    /// to 255, and the array is zeroed when they wrap.
-    stamps: Vec<u8>,
-    stamp: u8,
-    /// The document's anchor tokens and their first phrase links.
-    links: Vec<(u32, u32)>,
+    /// Tokens that anchor phrases: `hits[..n_hits]`, likewise.
+    hits: Vec<u32>,
+    n_hits: usize,
+    /// Bitset over term ids: BOOL terms already in `fresh`.
+    seen: Vec<u64>,
 }
 
 impl<'a> Scanner<'a> {
@@ -93,9 +88,9 @@ impl<'a> Scanner<'a> {
         queries: &'a [u8],
         parsed_ranges: &'a [&'a Parsed],
     ) -> Scanner<'a> {
+        let seen = vec![0; table.ids().div_ceil(64)]; // a bit per id (see `Doc::record`)
         let doc = Doc {
-            stamps: vec![0; table.ids()], // a stamp per id (see `Doc::record`)
-            stamp: 1,
+            seen,
             ..Doc::default()
         };
         let (buf, bounds, lfs) = Default::default();
@@ -108,12 +103,6 @@ impl<'a> Scanner<'a> {
             lfs,
             doc,
         }
-    }
-
-    /// The read buffer, emptied, for a format task to write into.
-    pub fn out_buf(&mut self) -> &mut Vec<u8> {
-        self.buf.clear();
-        &mut self.buf
     }
 
     /// Scans the lines that start in `docs.txt[from..to]`, numbering
@@ -311,30 +300,34 @@ impl Doc {
     /// Looks up the tokens of `run` (all in this document), writes their ids
     /// to `ids` and records them. Branch-free apart from long tokens and
     /// overflowed buckets: every id is written to `fresh`, and kept only if it
-    /// is a BOOL term not seen in this document; every token stamps its id.
+    /// is a BOOL term not seen in this document; every token is written to
+    /// `hits`, and kept if it anchors a phrase. Bits set in `seen` for other
+    /// terms (and for id 0) are never cleared, which is harmless: they are
+    /// never BOOL terms.
     #[inline(always)]
     fn record(&mut self, run: Run, look: Lookup, buf: &[u8], text: &[u8]) {
-        let mut n_fresh = self.n_fresh;
-        // The run's tokens are tokens `at..to` of the document; `n_fresh` is
-        // at most `at`.
+        let (mut n_fresh, mut n_hits) = (self.n_fresh, self.n_hits);
+        // The run's tokens are tokens `at..to` of the document; `n_fresh`
+        // and `n_hits` are at most `at`.
         let (at, to) = (
             run.first - self.first,
             run.first - self.first + run.probes.len(),
         );
         if self.ids.len() < to {
             let n = to.next_power_of_two().max(1024);
-            self.ids.resize(n, 0);
-            self.fresh.resize(n, 0);
+            for v in [&mut self.ids, &mut self.fresh, &mut self.hits] {
+                v.resize(n, 0);
+            }
         }
-        // Unchecked indexing below, because this runs for every token: `stamps`
-        // has a slot for every id below `Table::ids` (see `Scanner::new`), and
-        // every value's id is below it; `fresh` has room for the run (checked
-        // here).
-        assert!(n_fresh + run.probes.len() <= self.fresh.len());
-        let (stamps, stamp, fresh) = (
-            self.stamps.as_mut_ptr(),
-            self.stamp,
+        // Unchecked indexing below, because this runs for every token: `seen`
+        // has a bit for every id below `Table::ids` (see `Scanner::new`), and
+        // every value's id is below it; `fresh` and `hits` have room for the
+        // run (checked here).
+        assert!(n_fresh.max(n_hits) + run.probes.len() <= self.fresh.len().min(self.hits.len()));
+        let (seen, fresh, hits) = (
+            self.seen.as_mut_ptr(),
             self.fresh.as_mut_ptr(),
+            self.hits.as_mut_ptr(),
         );
         let ids = &mut self.ids[at..to];
         for (k, (&probe, id_out)) in (at..to).zip(run.probes.iter().zip(ids)) {
@@ -346,17 +339,20 @@ impl Doc {
                 look.find_long(&buf[s..e], text)
             };
             let id = v & ID_MASK;
-            *id_out = v & (ID_MASK | ANCHOR);
+            *id_out = id;
+            let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
             // SAFETY: see above.
             unsafe {
-                let seen = stamps.add(id as usize);
-                let new = (*seen != stamp) & (v & BOOL_TERM != 0);
-                *seen = stamp;
+                let seen = seen.add(word);
+                let new = (*seen & bit == 0) & (v & BOOL_TERM != 0);
+                *seen |= bit;
                 *fresh.add(n_fresh) = id;
                 n_fresh += usize::from(new);
+                *hits.add(n_hits) = k as u32;
+                n_hits += (v >> 31) as usize;
             }
         }
-        self.n_fresh = n_fresh;
+        (self.n_fresh, self.n_hits) = (n_fresh, n_hits);
     }
 
     /// Ends the document before token `end` of the region: emits its BOOL
@@ -373,83 +369,34 @@ impl Doc {
         assert!(self.n_fresh <= self.fresh.len());
         for &term in &self.fresh[..self.n_fresh] {
             streams[term as usize % PARTS].push((self.local << 16) | (term / PARTS as u32));
+            // SAFETY: `seen` has a bit for every id (see `record`).
+            unsafe { *self.seen.get_unchecked_mut(term as usize / 64) &= !(1 << (term % 64)) };
         }
         self.n_fresh = 0;
-        // A new stamp for the next document; when they run out, every slot
-        // is cleared, so no old stamp can match one reused.
-        self.stamp = match self.stamp {
-            u8::MAX => {
-                self.stamps.fill(0);
-                1
-            }
-            s => s + 1,
-        };
         let doc = &self.ids[..end - self.first];
         let id = out.first + out.lines;
         let found = out.matches.len();
-        // The phrase lists of the anchors are cold: the heads of all of them
-        // are loaded at once, then the first record of each, before any is
-        // read.
-        self.links.clear();
-        for block in (0..doc.len()).step_by(64) {
-            let mut mask = anchors(doc, block);
-            while mask != 0 {
-                let at = block + mask.trailing_zeros() as usize;
-                mask &= mask - 1;
-                table.prefetch_head(doc[at] & ID_MASK);
-                self.links.push((at as u32, 0));
-            }
-        }
-        let record = |link: u32| {
-            let records = &ranges[(link >> RANGE_SHIFT) as usize].records;
-            &records[(link & ((1 << RANGE_SHIFT) - 1)) as usize..]
-        };
-        for (at, link) in &mut self.links {
-            *link = table.head(doc[*at as usize] & ID_MASK);
-            if *link != NONE {
-                crate::prefetch(record(*link).as_ptr());
-            }
-        }
-        for &(at, mut link) in &self.links {
+        for &at in &self.hits[..self.n_hits] {
             let at = at as usize;
-            while link != NONE {
-                let record = record(link);
-                let (anchor, len) = ((record[2] & 0xFF) as usize, (record[2] >> 8) as usize);
-                let terms = &record[3..3 + len];
+            let mut phrase = table.head(doc[at]);
+            while phrase != NONE {
+                let p = ranges[(phrase >> RANGE_SHIFT) as usize];
+                let i = (phrase & ((1 << RANGE_SHIFT) - 1)) as usize;
+                let (terms, anchor) = (p.phrase(i), usize::from(p.anchor[i]));
                 let here = at >= anchor
-                    && doc.len() - (at - anchor) >= len
-                    && terms
-                        .iter()
-                        .zip(&doc[at - anchor..])
-                        .all(|(&a, &b)| a == b & ID_MASK);
-                let phrase = link >> RANGE_SHIFT << RANGE_SHIFT | record[1];
+                    && doc.len() - (at - anchor) >= terms.len()
+                    && terms.iter().zip(&doc[at - anchor..]).all(|(a, b)| a == b);
                 if here && !out.matches[found..].iter().any(|m| m.0 == phrase) {
                     out.matches.push((phrase, id));
                 }
-                link = record[0];
+                phrase = p.next[i];
             }
         }
+        self.n_hits = 0;
         self.first = end;
         self.local += 1;
         out.lines += 1;
     }
-}
-
-/// Bit j of the result: token `at + j` of `doc` (one of the 64 from `at`)
-/// has a term that anchors a phrase (flagged `ANCHOR`, the top bit), read
-/// eight ids at a time.
-fn anchors(doc: &[u32], at: usize) -> u64 {
-    let block = &doc[at..doc.len().min(at + 64)];
-    let mut mask = 0;
-    for (j, ids) in block.chunks(8).enumerate() {
-        let bits = match ids.len() {
-            // SAFETY: 8 readable u32s; AVX2 is required by the crate.
-            8 => unsafe { _mm256_movemask_ps(_mm256_loadu_ps(ids.as_ptr().cast())) as u64 },
-            _ => (0..ids.len()).fold(0, |m, i| m | u64::from(ids[i] >> 31) << i),
-        };
-        mask |= bits << (8 * j);
-    }
-    mask
 }
 
 /// For 64 bytes, the masks of token bytes (ASCII letters and digits), LFs and TABs.
@@ -491,48 +438,24 @@ fn prefix_xor(mut x: u64) -> u64 {
     x
 }
 
-/// `POSITIONS[b]`: the positions of the set bits of byte `b`, ascending.
-static POSITIONS: [[u8; 8]; 256] = {
-    let mut t = [[0; 8]; 256];
-    let mut b = 0;
-    while b < 256 {
-        let (mut i, mut k) = (0, 0);
-        while i < 8 {
-            if b >> i & 1 == 1 {
-                t[b][k] = i as u8;
-                k += 1;
-            }
-            i += 1;
-        }
-        b += 1;
-    }
-    t
-};
-
-/// Appends `base + i` for every set bit i of `bits` at `out[*n..]`, a byte of
-/// `bits` at a time: its bit positions come from `POSITIONS`, widened to eight
-/// u32s and stored whole, and the count advances by the byte's bits. No
-/// branches; `out` has room for 64 past `*n`.
+/// Appends `base + i` for every set bit i of `bits` at `out[*n..]`. 24
+/// positions are written unconditionally (64 bytes hold about nine tokens,
+/// so 18 bounds), so few blocks take the loop; `out` has room for 64 past `*n`.
 #[inline]
-fn flatten(bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
+fn flatten(mut bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
+    let count = bits.count_ones() as usize;
     let out = &mut out[*n..*n + 64];
-    let mut k = 0;
-    for i in 0..8 {
-        let byte = (bits >> (8 * i)) as u8;
-        let row = &POSITIONS[usize::from(byte)];
-        // k + 8 <= 64: the bytes before this one had at most 56 bits.
-        let dst = &mut out[k..k + 8];
-        // SAFETY: `row` is 8 readable bytes and `dst` 8 writable u32s;
-        // unaligned loads and stores have no alignment rule; AVX2 is
-        // required by the crate.
-        unsafe {
-            let pos = _mm256_cvtepu8_epi32(_mm_loadl_epi64(row.as_ptr().cast()));
-            let at = _mm256_add_epi32(pos, _mm256_set1_epi32((base + 8 * i) as i32));
-            _mm256_storeu_si256(dst.as_mut_ptr().cast(), at);
-        }
-        k += byte.count_ones() as usize;
+    for slot in &mut out[..24] {
+        *slot = base + bits.trailing_zeros();
+        bits &= bits.wrapping_sub(1);
     }
-    *n += k;
+    let mut i = 24;
+    while bits != 0 {
+        out[i] = base + bits.trailing_zeros();
+        bits &= bits - 1;
+        i += 1;
+    }
+    *n += count;
 }
 
 /// The decimal id at the start of a line, up to its TAB.

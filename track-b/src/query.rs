@@ -5,7 +5,7 @@
 use crate::fail;
 use std::arch::x86_64::*;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, OnceLock};
 
 pub const NONE: u32 = u32::MAX;
@@ -209,7 +209,7 @@ impl Lookup<'_> {
             // `& mask` makes this a bucket of the table (whose bucket count
             // is a power of two), which lives until the process exits.
             let home: *const Bucket = self.buckets.get_unchecked(Key::of(key).hash() & self.mask);
-            crate::prefetch(home);
+            _mm_prefetch::<_MM_HINT_T0>(home.cast());
             let home = if len <= SHORT { home } else { std::ptr::null() };
             Probe { key, home }
         }
@@ -269,23 +269,33 @@ pub struct Table {
     heads: &'static [AtomicU32],
 }
 
-/// `n` zeroed values in fresh anonymous pages, never unmapped (the table
-/// lives until the process exits). With `populate`, the kernel maps and
-/// zeroes them all at once (`MAP_POPULATE`), far cheaper than faulting them
-/// in one at a time from twelve threads, or than the allocator zeroing them
-/// (as it does for 64-byte aligned memory); otherwise pages are faulted in
-/// where they are touched.
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+}
+
+/// `n` zeroed values in fresh anonymous pages, which the kernel maps and
+/// zeroes in one go (`MAP_POPULATE`: far cheaper than faulting them in one
+/// at a time from twelve threads, or than the allocator zeroing them from one,
+/// which it does for 64-byte aligned memory). The table lives until the
+/// process exits, so they are never unmapped.
 ///
 /// SAFETY: `T` must be valid as zero bytes, and need no more than page alignment.
-unsafe fn zeroed<T>(n: usize, populate: bool) -> &'static [T] {
+unsafe fn zeroed<T>(n: usize) -> &'static [T] {
     const PROT_READ_WRITE: i32 = 0x3;
-    const MAP_PRIVATE_ANONYMOUS: i32 = 0x22;
-    const MAP_POPULATE: i32 = 0x8000;
+    const MAP_PRIVATE_ANONYMOUS_POPULATE: i32 = 0x8022;
     let len = (n * std::mem::size_of::<T>()).max(1);
-    let flags = MAP_PRIVATE_ANONYMOUS | if populate { MAP_POPULATE } else { 0 };
     // SAFETY: an anonymous mapping at an address of the kernel's choosing
     // touches no memory of ours.
-    let p = unsafe { crate::mmap(std::ptr::null_mut(), len, PROT_READ_WRITE, flags, -1, 0) };
+    let p = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ_WRITE,
+            MAP_PRIVATE_ANONYMOUS_POPULATE,
+            -1,
+            0,
+        )
+    };
     if p as isize == -1 {
         fail(&format!("cannot map {len} bytes for the term table"));
     }
@@ -315,9 +325,7 @@ impl Table {
         }
         // SAFETY: zero bytes are valid atomic integers, which is all a
         // `Bucket` holds; it needs 64-byte alignment, less than a page.
-        // The buckets are touched all over; the per-id arrays only where ids are.
-        let (buckets, text_at, heads) =
-            unsafe { (zeroed(n, true), zeroed(ids, false), zeroed(ids, false)) };
+        let (buckets, text_at, heads) = unsafe { (zeroed(n), zeroed(ids), zeroed(ids)) };
         Table {
             buckets,
             mask: n - 1,
@@ -327,15 +335,10 @@ impl Table {
         }
     }
 
-    /// The link to the first phrase anchored at term `id`, or `NONE`.
+    /// The first phrase anchored at term `id`, or `NONE`.
     #[inline]
     pub fn head(&self, id: u32) -> u32 {
         self.heads[id as usize].load(Relaxed).wrapping_sub(1)
-    }
-
-    /// Starts loading the head of term `id`'s phrase list.
-    pub fn prefetch_head(&self, id: u32) {
-        crate::prefetch(self.heads.as_ptr().wrapping_add(id as usize));
     }
 
     /// One past the last id of the last block taken: a bound on the term ids
@@ -475,11 +478,10 @@ pub struct Parsed {
     /// Phrase `i` is the terms `span(terms, term_ends, i)`.
     pub terms: Vec<u32>,
     pub term_ends: Vec<u32>,
-    /// The phrases as the scan reads them, one record each: the link to the
-    /// next phrase with the same anchor (`NONE` ends the list), the phrase's
-    /// index, `anchor | len << 8` (the anchor's position among its `len`
-    /// terms), then the terms. A link is `range << RANGE_SHIFT | offset`.
-    pub records: Vec<u32>,
+    /// Position of each phrase's anchor among its terms.
+    pub anchor: Vec<u8>,
+    /// The next phrase with the same anchor (`NONE` ends the list).
+    pub next: Vec<u32>,
     /// `(offset in queries.txt, length)` of each step's and each phrase
     /// term's word, until `insert` turns them into term ids.
     bool_words: Vec<(u32, u8)>,
@@ -488,10 +490,9 @@ pub struct Parsed {
     slots: Vec<u32>,
 }
 
-/// A phrase is named across ranges by `range << 28 | index`, and its record
-/// by `range << 28 | offset`, which allows 16 ranges (one per thread, so at
-/// most 16 threads; there are 12) of up to 2^28 phrases and record words
-/// (term ids are under 2^22, and so are the words that hold them).
+/// A phrase is named across ranges by `range << 28 | index`, which allows 16
+/// ranges (one per thread, so at most 16 threads; there are 12) of up to 2^28
+/// phrases.
 pub const RANGE_SHIFT: u32 = 28;
 
 /// Record `i` of a list of variable-length records that end at `ends`.
@@ -503,6 +504,10 @@ fn span<'a>(items: &'a [u32], ends: &[u32], i: usize) -> &'a [u32] {
 impl Parsed {
     pub fn bool_steps(&self, i: usize) -> &[u32] {
         span(&self.steps, &self.ends, i)
+    }
+
+    pub fn phrase(&self, i: usize) -> &[u32] {
+        span(&self.terms, &self.term_ends, i)
     }
 
     /// Parses the lines of `text[from..to]` (a whole number of lines). Term
@@ -591,8 +596,7 @@ impl Parsed {
     /// rarest terms and 52 million for "the longest term".
     pub fn choose_anchors(&mut self, table: &Table, range: usize) {
         for i in 0..self.term_ends.len() {
-            let terms = span(&self.terms, &self.term_ends, i);
-            let slots = span(&self.slots, &self.term_ends, i);
+            let (terms, slots) = (self.phrase(i), span(&self.slots, &self.term_ends, i));
             let start = if i == 0 {
                 0
             } else {
@@ -603,13 +607,12 @@ impl Parsed {
             let a = (0..terms.len()).min_by_key(|&j| rank(j)).unwrap();
             let (term, slot) = (terms[a], slots[a]);
             table.flag(slot as usize, ANCHOR);
-            let link = (range as u32) << RANGE_SHIFT | self.records.len() as u32;
+            self.anchor.push(a as u8);
+            let phrase = (range as u32) << RANGE_SHIFT | i as u32;
             let previous = table.heads[term as usize]
-                .swap(link + 1, AcqRel)
+                .swap(phrase + 1, AcqRel)
                 .wrapping_sub(1);
-            let meta = a as u32 | (terms.len() as u32) << 8;
-            self.records.extend_from_slice(&[previous, i as u32, meta]);
-            self.records.extend_from_slice(terms);
+            self.next.push(previous);
         }
         (self.slots, self.bool_words, self.phrase_words) = Default::default();
     }
@@ -623,6 +626,7 @@ pub struct Setup<'a> {
     /// Thread `i` parses the lines in `text[ranges[i]..ranges[i + 1]]`.
     ranges: Vec<usize>,
     barrier: Barrier,
+    words: AtomicUsize,
     table: OnceLock<Table>,
 }
 
@@ -634,6 +638,7 @@ impl<'a> Setup<'a> {
             text,
             ranges: ranges.collect(),
             barrier: Barrier::new(threads),
+            words: AtomicUsize::new(0),
             table: OnceLock::new(),
         }
     }
@@ -643,51 +648,17 @@ impl<'a> Setup<'a> {
         self.barrier.wait();
     }
 
-    /// The words of `queries.txt`, counted to size the table before the
-    /// parse: in a query
-    /// line that parses, there is one space before every word but the first,
-    /// and an operator is the one word after a space that starts with an
-    /// uppercase letter, so a line holds its spaces less its operators
-    /// (counting the `BOOL` or `PHRASE` word for the first, and for PHRASE
-    /// the space before the quote for its first term). A line that does not
-    /// parse ends the run before it inserts anything, and adds at least 0.
-    pub fn count_words(&self) -> usize {
-        let text = &self.text[..self.text.len() - QUERY_PAD];
-        let (mut spaces, mut ops, mut after) = (0, 0, 0);
-        let (blocks, rest) = text.as_chunks::<32>();
-        for block in blocks {
-            // SAFETY: 32 readable bytes; AVX2 is required by the crate.
-            let (space, upper) = unsafe {
-                let v = _mm256_loadu_si256(block.as_ptr().cast());
-                let space = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b' ' as i8));
-                let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'A' as i8));
-                let upper = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(25)), d);
-                let mask = |m| _mm256_movemask_epi8(m) as u32;
-                (mask(space), mask(upper))
-            };
-            spaces += space.count_ones() as usize;
-            ops += (upper & (space << 1 | after)).count_ones() as usize;
-            after = space >> 31;
-        }
-        for &b in rest {
-            spaces += usize::from(b == b' ');
-            ops += usize::from(after == 1 && b.is_ascii_uppercase());
-            after = u32::from(b == b' ');
-        }
-        spaces - ops
-    }
-
-    /// Makes the table for `words` words (from `count_words`).
-    pub fn make_table(&self, words: usize) {
-        let _ = self.table.set(Table::new(words, self.ranges.len() - 1));
-    }
-
     /// Thread `i`'s share of the start-up: its queries, and the finished
-    /// table.
+    /// table. The table is sized once every thread has counted its words.
     pub fn run(&self, i: usize) -> (Parsed, &Table) {
         let mut mine = Parsed::parse(self.text, self.ranges[i], self.ranges[i + 1]);
-        let table = self.table.wait();
-        debug_assert!(mine.word_count() <= 3 * table.buckets.len());
+        self.words.fetch_add(mine.word_count(), Relaxed);
+        if self.barrier.wait().is_leader() {
+            let (words, threads) = (self.words.load(Relaxed), self.ranges.len() - 1);
+            let _ = self.table.set(Table::new(words, threads));
+        }
+        self.wait();
+        let table = self.table.get().unwrap();
         mine.insert(table, self.text);
         self.wait(); // anchors read every thread's counts
         mine.choose_anchors(table, i);

@@ -19,9 +19,6 @@ pub struct Part {
     docs: Vec<u16>,
     /// Where a dense term's bitmap starts in `bits`, or `NONE`.
     dense: Vec<u32>,
-    /// Bit `l`: term `l` is in the segment (a small array that stays in
-    /// cache, for `Evaluator::run` to skip queries that match nothing).
-    present: Vec<u64>,
     bits: Vec<u64>,
     docs_in_segment: usize,
 }
@@ -32,14 +29,9 @@ impl Part {
     pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize, cursor: &mut Vec<u32>) {
         self.offsets.clear();
         self.offsets.resize(terms + 1, 0);
-        // The streams were written by other threads: the count runs 256 bytes
-        // ahead of itself with prefetches, so their lines arrive in time.
         for stream in streams {
-            for (i, pairs) in stream.chunks(16).enumerate() {
-                crate::prefetch(stream.as_ptr().wrapping_add(16 * i + 64));
-                for &x in pairs {
-                    self.offsets[(x & 0xFFFF) as usize + 1] += 1;
-                }
+            for &x in *stream {
+                self.offsets[(x & 0xFFFF) as usize + 1] += 1;
             }
         }
         for l in 0..terms {
@@ -59,17 +51,16 @@ impl Part {
         self.docs_in_segment = docs;
         self.dense.clear();
         self.dense.resize(terms, NONE);
-        self.present.clear();
-        self.present.resize(terms.div_ceil(64), 0);
         self.bits.clear();
         for l in 0..terms {
             let (from, to) = (self.offsets[l] as usize, self.offsets[l + 1] as usize);
-            self.present[l / 64] |= u64::from(to > from) << (l % 64);
             if (to - from) * DENSE > docs {
                 self.dense[l] = self.bits.len() as u32;
                 let bits = self.bits.len();
                 self.bits.resize(bits + words, 0);
-                set_bits(&mut self.bits[bits..], &self.docs[from..to]);
+                for &d in &self.docs[from..to] {
+                    self.bits[bits + usize::from(d) / 64] |= 1 << (d % 64);
+                }
             }
         }
     }
@@ -80,12 +71,10 @@ impl Part {
 pub fn prefetch(parts: &[&Part], steps: &[u32]) {
     for &step in steps {
         let term = (step & ((1 << TERM_BITS) - 1)) as usize;
-        crate::prefetch(
-            parts[term % PARTS]
-                .offsets
-                .as_ptr()
-                .wrapping_add(term / PARTS),
-        );
+        let offsets = &parts[term % PARTS].offsets;
+        let p = offsets.as_ptr().wrapping_add(term / PARTS);
+        // SAFETY: a prefetch is only a hint; it never faults or changes memory.
+        unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast()) };
     }
 }
 
@@ -154,25 +143,7 @@ impl Evaluator {
         let words = docs.div_ceil(64);
         self.bits.resize(words, 0);
         self.mask.resize(words, 0);
-        let term = |step: u32| (step & ((1 << TERM_BITS) - 1)) as usize;
-        let present = |&step: &u32| {
-            let (part, l) = (parts[term(step) % PARTS], term(step) / PARTS);
-            part.present[l / 64] >> (l % 64) & 1 != 0
-        };
-        // The query matches nothing here if a term ANDed after the last OR
-        // is absent (the first step counts as an OR), or if every term that
-        // can add documents (the ORed ones) is absent.
-        let last_or = steps
-            .iter()
-            .rposition(|&s| s >> TERM_BITS == OR)
-            .unwrap_or(0);
-        let and_absent = steps[last_or..]
-            .iter()
-            .any(|s| s >> TERM_BITS == AND && !present(s));
-        if and_absent || !steps.iter().any(|s| s >> TERM_BITS == OR && present(s)) {
-            return;
-        }
-        let set = |step: u32| Set::of(parts, term(step), words);
+        let set = |step: u32| Set::of(parts, (step & ((1 << TERM_BITS) - 1)) as usize, words);
         let mut acc = Acc::Empty;
         for &step in steps {
             let op = step >> TERM_BITS;
