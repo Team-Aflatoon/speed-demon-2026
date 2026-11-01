@@ -12,11 +12,6 @@ pub const NONE: u32 = u32::MAX;
 /// and the term anchors at least one phrase (the scan checks phrases there).
 pub const BOOL_TERM: u64 = 1 << 62;
 pub const ANCHOR: u64 = 1 << 63;
-/// Slot flag: from segment 2 on, the scan sets this term's bits directly
-/// instead of writing postings for it (see `Table::make_hot`).
-pub const HOT: u64 = 1 << 61;
-/// At most this many hot terms (the width of the scan's rows of hot bits).
-const MAX_HOT: usize = 512;
 /// Query operators, kept in the top two bits of a BOOL step.
 pub const AND: u32 = 0;
 pub const OR: u32 = 1;
@@ -29,11 +24,11 @@ pub const PHRASE: u32 = 1 << 31;
 /// A slot holds the first 12 bytes of its term inline; longer terms are
 /// confirmed against their text in `queries.txt`.
 const INLINE: usize = 12;
-/// `w2` bits 0..38 are the key (12 bytes inline + 6-bit length), 38..61 the
-/// term id, 61 to 63 the flags.
+/// `w2` bits 0..38 are the key (12 bytes inline + 6-bit length), 38..62 the
+/// term id, 62 and 63 the flags.
 const KEY_BITS: u64 = (1 << 38) - 1;
 const ID_SHIFT: u32 = 38;
-const ID_MASK: u32 = (1 << 23) - 1;
+const ID_MASK: u32 = (1 << 24) - 1;
 /// Term offsets in `queries.txt` are kept as u32.
 pub const MAX_QUERY_BYTES: usize = 1 << 30;
 /// Zero bytes after `queries.txt`, so a key can read 12 bytes from any term.
@@ -87,12 +82,8 @@ pub struct Table {
     slots: Vec<[AtomicU64; 2]>,
     pub mask: usize,
     next_block: AtomicU32,
-    /// Per term id: where the term starts in `queries.txt` (for long terms),
-    /// its slot, and its column among the hot terms.
+    /// Per term id: where the term starts in `queries.txt` (for long terms).
     text_at: Vec<AtomicU32>,
-    slot_of: Vec<AtomicU32>,
-    hot_of: Vec<AtomicU32>,
-    hot_count: AtomicU32,
     /// Per term id: a saturating count of its query words, for choosing anchors.
     freq: Vec<AtomicU8>,
     /// Per term id: the first phrase anchored at it, linked on through
@@ -117,36 +108,9 @@ impl Table {
             mask: n - 1,
             next_block: AtomicU32::new(0),
             text_at: (0..ids).map(|_| AtomicU32::new(0)).collect(),
-            slot_of: (0..ids).map(|_| AtomicU32::new(0)).collect(),
-            hot_of: (0..ids).map(|_| AtomicU32::new(0)).collect(),
-            hot_count: AtomicU32::new(0),
             freq: (0..ids).map(|_| AtomicU8::new(0)).collect(),
             heads: (0..ids).map(|_| AtomicU32::new(NONE)).collect(),
         }
-    }
-
-    /// Makes BOOL term `id` hot, returning its column, unless there are
-    /// `MAX_HOT` already. Called by the build of segment 0, which every scan
-    /// of segment 2 and later waits for.
-    pub fn make_hot(&self, id: u32) -> Option<usize> {
-        let column = self.hot_count.fetch_add(1, Relaxed) as usize;
-        (column < MAX_HOT).then(|| {
-            self.hot_of[id as usize].store(column as u32, Relaxed);
-            let slot = self.slot_of[id as usize].load(Relaxed) as usize;
-            self.slots[slot][1].fetch_or(HOT, Relaxed);
-            column
-        })
-    }
-
-    /// The number of hot terms, once segment 0 is built.
-    pub fn hot_width(&self) -> usize {
-        (self.hot_count.load(Relaxed) as usize).min(MAX_HOT)
-    }
-
-    /// The column of hot term `id`.
-    #[inline]
-    pub fn hot_column(&self, id: u32) -> usize {
-        self.hot_of[id as usize].load(Relaxed) as usize
     }
 
     /// The first phrase anchored at term `id`, or `NONE`.
@@ -229,7 +193,6 @@ impl Table {
                         }
                         let id = ids.next().unwrap();
                         self.text_at[id as usize].store(at as u32, Relaxed);
-                        self.slot_of[id as usize].store(i as u32, Relaxed);
                         slot[1].store(key.w2 | u64::from(id) << ID_SHIFT, Release);
                         return (id, i);
                     }

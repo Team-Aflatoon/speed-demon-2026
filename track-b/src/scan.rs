@@ -6,7 +6,7 @@
 
 use crate::fail;
 use crate::index::PARTS;
-use crate::query::{Key, Parsed, Table, ANCHOR, BOOL_TERM, HOT, NONE, RANGE_SHIFT};
+use crate::query::{Key, Parsed, Table, ANCHOR, BOOL_TERM, NONE, RANGE_SHIFT};
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -38,10 +38,6 @@ pub struct ChunkOut {
     /// First document id of the chunk and its number of documents.
     pub first: u32,
     pub lines: u32,
-    /// The hot terms' bits: per 64 documents of the segment from block
-    /// `hot_base`, one row of `Table::hot_width` words, one per hot term.
-    pub hot_rows: Vec<u64>,
-    pub hot_base: u32,
 }
 
 /// Per-thread scratch, reused for every chunk.
@@ -65,15 +61,9 @@ pub struct Scanner<'a> {
 struct Doc {
     local: u32,
     first: usize,
-    /// The distinct BOOL terms so far that get postings, `fresh[..n_fresh]`,
-    /// and those that are hot, `hot[..n_hot]` (both sized like `ids`).
+    /// The distinct BOOL terms so far: `fresh[..n_fresh]` (sized like `ids`).
     fresh: Vec<u32>,
     n_fresh: usize,
-    hot: Vec<u32>,
-    n_hot: usize,
-    /// `!0` when hot terms are in use for this chunk, else `!HOT`; the row width.
-    hot_mask: u64,
-    width: usize,
     /// Tokens (region indexes) that anchor phrases.
     hits: Vec<u32>,
     /// Bitset over term ids: BOOL terms already in `fresh`.
@@ -102,23 +92,12 @@ impl<'a> Scanner<'a> {
     }
 
     /// Scans the lines that start in `docs.txt[from..to]`, numbering
-    /// documents from `first` (the id of the segment's first line), with or
-    /// without the `hot` terms.
-    pub fn scan(
-        &mut self,
-        file: &File,
-        (from, to): (u64, u64),
-        first: u32,
-        hot: bool,
-        out: &mut ChunkOut,
-    ) {
+    /// documents from `first` (the id of the segment's first line).
+    pub fn scan(&mut self, file: &File, (from, to): (u64, u64), first: u32, out: &mut ChunkOut) {
         out.streams.resize_with(PARTS, Vec::new);
         out.streams.iter_mut().for_each(Vec::clear);
         out.matches.clear();
-        out.hot_rows.clear();
         out.lines = 0;
-        self.doc.hot_mask = if hot { !0 } else { !HOT };
-        self.doc.width = self.table.hot_width();
         // buf[..len] holds the file from `off`. A chunk that does not start the
         // file reads from `from - 1` and drops everything up to the first LF:
         // that is the end of the previous chunk's last line.
@@ -162,7 +141,6 @@ impl<'a> Scanner<'a> {
                     let local = out.first.checked_sub(first);
                     self.doc.local =
                         local.unwrap_or_else(|| fail("document ids are not ascending"));
-                    out.hot_base = self.doc.local / 64;
                     known = true;
                 }
                 self.region(start, end, out);
@@ -193,7 +171,6 @@ impl<'a> Scanner<'a> {
                     &mut self.ends,
                     &mut self.ids,
                     &mut doc.fresh,
-                    &mut doc.hot,
                 ] {
                     v.resize(n, 0);
                 }
@@ -268,15 +245,12 @@ impl Doc {
     /// `Table::miss`) are never cleared, which is harmless: they are never BOOL terms.
     #[inline]
     fn token(&mut self, k: usize, w2: u64) {
-        let (id, w2) = (Table::id(w2), w2 & self.hot_mask);
+        let id = Table::id(w2);
         let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
         let fresh = (self.seen[word] & bit == 0) & (w2 & BOOL_TERM != 0);
-        let hot = w2 & HOT != 0;
         self.seen[word] |= bit;
         self.fresh[self.n_fresh] = id;
-        self.n_fresh += usize::from(fresh & !hot);
-        self.hot[self.n_hot] = id;
-        self.n_hot += usize::from(fresh & hot);
+        self.n_fresh += usize::from(fresh);
         if w2 & ANCHOR != 0 {
             self.hits.push(k as u32);
         }
@@ -294,15 +268,6 @@ impl Doc {
             self.seen[term as usize / 64] &= !(1 << (term % 64));
         }
         self.n_fresh = 0;
-        let row = (self.local / 64 - out.hot_base) as usize * self.width;
-        for &term in &self.hot[..self.n_hot] {
-            if out.hot_rows.len() <= row {
-                out.hot_rows.resize(row + self.width, 0);
-            }
-            out.hot_rows[row + table.hot_column(term)] |= 1 << (self.local % 64);
-            self.seen[term as usize / 64] &= !(1 << (term % 64));
-        }
-        self.n_hot = 0;
         let doc = &ids[self.first..];
         let id = out.first + out.lines;
         let found = out.matches.len();
