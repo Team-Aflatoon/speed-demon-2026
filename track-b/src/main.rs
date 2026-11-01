@@ -11,9 +11,9 @@
 //! - build (per partition): counting-sort the streams of a segment into
 //!   sorted lists and bitmaps (`index.rs`); one extra build task folds the
 //!   segment's phrase matches into the phrase answers;
-//! - eval (per half of a query range): answer every BOOL query against the
-//!   segment and add the result to its running answer;
-//! - format (per half of a query range, after its last eval): write its
+//! - eval (per query range): answer every BOOL query against the segment and
+//!   add the result to its running answer;
+//! - format (per query range, after the last segment): write the range's
 //!   answer lines.
 //!
 //! The queue is `scan 0, scan 1, build 0, eval 0, scan 2, build 1, eval 1, ...`,
@@ -26,12 +26,12 @@ mod query;
 mod scan;
 
 use index::{Answer, Evaluator, Part, PARTS};
-use query::{Parsed, Setup, Table, PHRASE, QUERY_PAD, RANGE_SHIFT};
+use query::{Parsed, Setup, Table, MAX_QUERY_BYTES, PHRASE, QUERY_PAD, RANGE_SHIFT};
 use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 const MAX_THREADS: usize = 12;
 const SEGMENT_BYTES: u64 = 12 << 20;
@@ -50,21 +50,24 @@ fn main() {
     run(arg(1, "/data"), arg(2, "/out"));
 }
 
+/// The path of `results.txt`, once it is created.
+static OUT: OnceLock<String> = OnceLock::new();
+
 /// Prints `msg` and exits with status 1. Every input and I/O error ends here.
 /// `exit` must not run on two threads at once, so only the first caller
 /// reports; any other thread that fails meanwhile waits for the exit.
 pub fn fail(msg: &str) -> ! {
     static FAILED: AtomicBool = AtomicBool::new(false);
-    while FAILED.swap(true, AcqRel) {
-        std::thread::park();
+    if FAILED.swap(true, AcqRel) {
+        loop {
+            std::thread::park();
+        }
+    }
+    if let Some(out) = OUT.get() {
+        let _ = std::fs::remove_file(out); // no partial results.txt
     }
     eprintln!("track-b: {msg}");
     std::process::exit(1)
-}
-
-/// `value`, or the end of the run with `what` and the error.
-fn or_fail<T, E: std::fmt::Display>(value: Result<T, E>, what: &str) -> T {
-    value.unwrap_or_else(|e| fail(&format!("{what}: {e}")))
 }
 
 extern "C" {
@@ -104,13 +107,6 @@ enum Task {
     Format(usize),
 }
 
-/// Per segment: how many of its scan, build and eval tasks are done, and
-/// (once it is scanned) its number of documents.
-const SCANNED: usize = 0;
-const BUILT: usize = 1;
-const EVALUATED: usize = 2;
-const DOCS: usize = 3;
-
 /// Everything the tasks share. Each lock is taken by one writer task or by
 /// readers, never both at once: the done counters order the tasks (a task
 /// only starts once every task it reads from has counted itself done), so
@@ -118,71 +114,82 @@ const DOCS: usize = 3;
 /// `OnceLock::get` cannot fire: with `panic = "abort"` a panic ends the
 /// process, so no lock is ever poisoned, and every `OnceLock` is set before
 /// the barrier that precedes its reads.
-struct Shared {
-    file: File,
+struct Shared<'a> {
+    file: &'a File,
     segments: Vec<Segment>,
     tasks: Vec<Task>,
     next: AtomicUsize,
-    /// Per segment, the counters `SCANNED`, `BUILT`, `EVALUATED`, `DOCS`.
-    counts: Vec<[AtomicU32; 4]>,
     /// Chunk outputs of the even and the odd segments.
     chunks: [Vec<RwLock<ChunkOut>>; 2],
+    /// Documents in each segment, known once it is scanned.
+    docs: Vec<AtomicU32>,
     parts: Vec<RwLock<Part>>,
-    /// The BOOL answers of range `r` in two halves, `2r` and `2r + 1`, each
-    /// evaluated by its own task; `halves[h]` counts the segments that half
-    /// `h` has evaluated.
-    bool_answers: Vec<RwLock<Vec<Answer>>>,
-    halves: Vec<AtomicU32>,
-    phrase_answers: Vec<RwLock<Vec<Answer>>>,
-    /// `results.txt`, which the format tasks write in order, two per range:
-    /// task `h` takes `out_at` once `formatted` reaches `h`, and moves it on.
+    bool_answers: Vec<Mutex<Vec<Answer>>>,
+    phrase_answers: Vec<Mutex<Vec<Answer>>>,
+    /// `results.txt`, which the format tasks write in range order: range `r`
+    /// takes `out_at` once `formatted` reaches `r`, and moves it on.
     out: File,
     out_at: AtomicU64,
     formatted: AtomicU32,
+    scanned: Vec<AtomicU32>,
+    built: Vec<AtomicU32>,
+    evaluated: Vec<AtomicU32>,
 }
 
 fn run(data: &str, out_dir: &str) {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS));
-    let open = |name: &str| or_fail(File::open(format!("{data}/{name}")), name);
-    let setup = Setup::new(map_queries(&open("queries.txt")), threads);
-    let shared: OnceLock<Shared> = OnceLock::new();
+    let (query_path, docs_path) = (format!("{data}/queries.txt"), format!("{data}/docs.txt"));
+    let queries = map_queries(&query_path);
+    let file = File::open(&docs_path).unwrap_or_else(|e| fail(&format!("{docs_path}: {e}")));
+    let out_path = format!("{out_dir}/results.txt");
+    let out = File::create(&out_path).unwrap_or_else(|e| fail(&format!("{out_path}: {e}")));
+    let _ = OUT.set(out_path);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS);
+    let setup = Setup::new(queries, threads);
+    // Before any other thread starts: while the kernel maps the table's pages
+    // it holds up their starts and their allocations.
+    setup.make_table(setup.count_words());
     let parsed: Vec<OnceLock<Parsed>> = many(threads);
+    // Set by this thread while the workers parse the queries.
+    let shared: OnceLock<Shared> = OnceLock::new();
     std::thread::scope(|s| {
         let worker = |i: usize| {
             let (mine, table) = setup.run(i);
             let shared = shared.wait();
-            let answers = |n: usize| vec![Answer::default(); n];
-            let n = mine.ends.len();
-            *shared.bool_answers[2 * i].write().unwrap() = answers(n / 2);
-            *shared.bool_answers[2 * i + 1].write().unwrap() = answers(n - n / 2);
-            *shared.phrase_answers[i].write().unwrap() = answers(mine.term_ends.len());
+            *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
+            *shared.phrase_answers[i].lock().unwrap() =
+                vec![Answer::default(); mine.term_ends.len()];
             let _ = parsed[i].set(mine);
             setup.wait();
             let parsed: Vec<&Parsed> = parsed.iter().map(|p| p.get().unwrap()).collect();
-            work(shared, table, setup.text(), &parsed);
+            work(shared, table, queries, &parsed);
         };
-        (0..threads).for_each(|i| drop(s.spawn(move || worker(i))));
-        // While the workers parse their queries; the threads have all started,
-        // so they do not wait for the kernel to map the table's pages.
-        setup.make_table();
-        let file = open("docs.txt");
-        let out = File::create(format!("{out_dir}/results.txt"));
-        let out = or_fail(out, "results.txt");
-        let segments = plan(&file);
-        let max_chunks = segments.iter().map(|s| s.chunks).max().unwrap_or(0);
+        // Starting a thread takes about 0.1 ms, so this thread and worker 0
+        // start half of them each.
+        let half = threads.div_ceil(2);
+        s.spawn(move || {
+            (half..threads).for_each(|i| drop(s.spawn(move || worker(i))));
+            worker(0);
+        });
+        (1..half).for_each(|i| drop(s.spawn(move || worker(i))));
+        let segments = plan(&file, &docs_path);
+        let (n, max_chunks) = (segments.len(), segments.iter().map(|s| s.chunks).max());
         let _ = shared.set(Shared {
+            file: &file,
             tasks: schedule(&segments, threads),
             next: AtomicUsize::new(0),
-            counts: many(segments.len()),
-            chunks: [0, 1].map(|_| many(max_chunks)),
+            chunks: [0, 1].map(|_| many(max_chunks.unwrap_or(0))),
+            docs: many(n),
             parts: many(PARTS),
-            bool_answers: many(2 * threads),
-            halves: many(2 * threads),
+            bool_answers: many(threads),
             phrase_answers: many(threads),
+            out,
             out_at: AtomicU64::new(0),
             formatted: AtomicU32::new(0),
-            file,
-            out,
+            scanned: many(n),
+            built: many(n),
+            evaluated: many(n),
             segments,
         });
     });
@@ -193,22 +200,38 @@ fn run(data: &str, out_dir: &str) {
 /// bytes past its end read as zero. Mapping its cached pages costs far less
 /// than copying it into a fresh buffer, whose every page faults. Never
 /// unmapped.
-fn map_queries(file: &File) -> &'static [u8] {
+fn map_queries(path: &str) -> &'static [u8] {
     use std::os::fd::AsRawFd;
-    const PRIVATE: i32 = 0x02; // MAP_PRIVATE
-    const FIXED_POPULATE: i32 = 0x10 | 0x8000; // MAP_FIXED | MAP_POPULATE
-    const ANONYMOUS: i32 = 0x20; // MAP_ANONYMOUS
-    let len = or_fail(file.metadata(), "queries.txt").len() as usize;
-    assert!(len < query::MAX_QUERY_BYTES, "queries.txt over 1 GB");
-    let span = len.div_ceil(4096) * 4096 + 4096;
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_POPULATE: i32 = 0x8000;
+    let file = File::open(path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+    let len = file
+        .metadata()
+        .map_or_else(|e| fail(&format!("{path}: {e}")), |m| m.len());
+    if len >= MAX_QUERY_BYTES as u64 {
+        fail(&format!("{path} is larger than 1 GB"));
+    }
+    let (len, span) = (len as usize, (len as usize).div_ceil(4096) * 4096 + 4096);
+    let flags = MAP_PRIVATE | MAP_FIXED | MAP_POPULATE;
     let failed = |p: *mut u8| p as isize == -1;
     // SAFETY: new mappings at an address of the kernel's choosing (the file
     // over the start of the anonymous one) touch no memory of ours.
     unsafe {
-        let base = mmap(std::ptr::null_mut(), span, 1, PRIVATE | ANONYMOUS, -1, 0);
-        let over = |base| mmap(base, len, 1, PRIVATE | FIXED_POPULATE, file.as_raw_fd(), 0);
-        if failed(base) || (len > 0 && failed(over(base))) {
-            fail("cannot map queries.txt");
+        let base = mmap(
+            std::ptr::null_mut(),
+            span,
+            PROT_READ,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if failed(base)
+            || (len > 0 && failed(mmap(base, len, PROT_READ, flags, file.as_raw_fd(), 0)))
+        {
+            fail(&format!("{path}: cannot map {len} bytes"));
         }
         // SAFETY: `span >= len + QUERY_PAD` readable bytes, never unmapped;
         // the inputs are read-only, so the file does not change under it.
@@ -223,31 +246,40 @@ fn many<T: Default>(n: usize) -> Vec<T> {
 
 /// Cuts `docs.txt` into segments at line starts, of about `SEGMENT_BYTES`
 /// and at most `MAX_SEGMENT_DOCS` documents.
-fn plan(file: &File) -> Vec<Segment> {
-    let len = or_fail(file.metadata(), "docs.txt").len();
+fn plan(file: &File, path: &str) -> Vec<Segment> {
+    let meta = file.metadata();
+    let len = meta.map_or_else(|e| fail(&format!("{path}: {e}")), |m| m.len());
     let mut last = [0u8; 1];
     if len > 0 && (read_full(file, &mut last, len - 1) != 1 || last[0] != b'\n') {
-        fail("docs.txt must end with an LF");
+        fail(&format!("{path} must end with an LF"));
     }
-    // The first line start at or after `at` and its id (the end of the file
+    if len == 0 {
+        return Vec::new();
+    }
+    // The first line start at or after `at`, with its id (the end of the file
     // counts as the line after the last).
-    let docs = if len > 0 { last_id(file, len) + 1 } else { 0 };
+    let docs = last_id(file, len) + 1;
     let line = |at: u64| match next_line(file, len, at) {
         end if end == len => (len, docs),
         start => (start, id_at(file, start)),
     };
-    let (mut segments, mut start) = (Vec::new(), 0);
-    let mut first = if len > 0 { id_at(file, 0) } else { 0 };
+    let mut segments: Vec<Segment> = Vec::new();
+    let (mut start, mut first) = (0, id_at(file, 0));
     while start < len {
-        // Many short documents: halve the size until the segment holds at
-        // most `MAX_SEGMENT_DOCS` (one line always does).
-        // The last segments shrink (to half of what is left, down to
-        // `SEGMENT_BYTES / 8`), so little work remains once the scan ends.
-        let mut size = SEGMENT_BYTES.min(((len - start) / 2).max(SEGMENT_BYTES / 8));
-        let (mut end, mut next) = line(start + size);
-        while next - first > MAX_SEGMENT_DOCS {
-            size = (size / 2).max(1);
-            (end, next) = line(start + size);
+        let (mut end, mut next) = line(start + SEGMENT_BYTES);
+        if next - first > MAX_SEGMENT_DOCS {
+            // Many short documents: bisect for the last line start that keeps
+            // the segment within u16 document numbers (`start + 1` does).
+            let (mut lo, mut hi) = (start + 1, end);
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if line(mid).1 - first <= MAX_SEGMENT_DOCS {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            (end, next) = line(lo);
         }
         let chunks = (end - start).div_ceil(CHUNK_BYTES) as usize;
         segments.push(Segment {
@@ -268,11 +300,12 @@ fn id_at(file: &File, at: u64) -> u32 {
     parse_id(&id[..n], at)
 }
 
-/// The id of the last line of the file (`len > 0` bytes, ending with an LF).
+/// The id of the last line of the file (`len` bytes, ending with an LF).
 fn last_id(file: &File, len: u64) -> u32 {
     let mut end = len - 1; // the final LF
     loop {
-        let (from, mut buf) = (end.saturating_sub(4096), [0u8; 4096]);
+        let from = end.saturating_sub(4096);
+        let mut buf = [0u8; 4096];
         let n = read_full(file, &mut buf[..(end - from) as usize], from);
         match buf[..n].iter().rposition(|&b| b == b'\n') {
             Some(i) => return id_at(file, from + i as u64 + 1),
@@ -284,7 +317,8 @@ fn last_id(file: &File, len: u64) -> u32 {
 
 /// The first line start at or after `at` (or the end of the file).
 fn next_line(file: &File, len: u64, at: u64) -> u64 {
-    let (mut buf, mut pos) = ([0u8; 4096], at - 1);
+    let mut buf = [0u8; 4096];
+    let mut pos = at - 1;
     while pos < len {
         let n = read_full(file, &mut buf, pos);
         if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
@@ -298,16 +332,20 @@ fn next_line(file: &File, len: u64, at: u64) -> u64 {
 /// The task queue: see the module comment.
 fn schedule(segments: &[Segment], ranges: usize) -> Vec<Task> {
     let mut tasks = Vec::new();
-    for s in 0..=segments.len() {
-        if let Some(segment) = segments.get(s) {
-            tasks.extend((0..segment.chunks).map(|c| Task::Scan(s, c)));
-        }
-        if let Some(s) = s.checked_sub(1) {
-            tasks.extend((0..=PARTS).map(|p| Task::Build(s, p)));
-            tasks.extend((0..2 * ranges).map(|h| Task::Eval(s, h)));
+    let finish = |tasks: &mut Vec<Task>, s: usize| {
+        tasks.extend((0..=PARTS).map(|p| Task::Build(s, p)));
+        tasks.extend((0..ranges).map(|r| Task::Eval(s, r)));
+    };
+    for (s, segment) in segments.iter().enumerate() {
+        tasks.extend((0..segment.chunks).map(|c| Task::Scan(s, c)));
+        if s > 0 {
+            finish(&mut tasks, s - 1);
         }
     }
-    tasks.extend((0..2 * ranges).map(Task::Format));
+    if !segments.is_empty() {
+        finish(&mut tasks, segments.len() - 1);
+    }
+    tasks.extend((0..ranges).map(Task::Format));
     tasks
 }
 
@@ -319,13 +357,13 @@ const AHEAD: usize = 4;
 /// Most waits are short, so it first spins with `PAUSE`, which leaves the
 /// core to its other hardware thread, and only then yields to the kernel.
 fn wait(count: &AtomicU32, n: usize) {
-    for spins in 0.. {
-        if count.load(Acquire) as usize >= n {
-            return;
-        }
-        match spins < 2000 {
-            true => std::hint::spin_loop(),
-            false => std::thread::yield_now(),
+    let mut spins = 0;
+    while (count.load(Acquire) as usize) < n {
+        if spins < 2000 {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            std::thread::yield_now();
         }
     }
 }
@@ -340,7 +378,7 @@ fn wait(count: &AtomicU32, n: usize) {
 /// | scan s   | build s - 2 is done           | reuses the chunk buffers of s - 2   |
 /// | build s  | scan s and eval s - 1 are done | reads s's chunks, rewrites `parts`  |
 /// | eval s   | build s is done               | reads `parts`                       |
-/// | format r | r's last evals are done       | reads the finished answers          |
+/// | format   | the last eval is done         | reads the finished answers          |
 ///
 /// It cannot deadlock: tasks are claimed in queue order and a task waits only
 /// on tasks earlier in the queue, so the oldest unfinished task waits on
@@ -349,92 +387,84 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
     let mut scanner = Scanner::new(table, queries, parsed);
     let mut eval = Evaluator::default();
     let mut cursor = Vec::new();
-    let (terms, ranges) = (table.ids().div_ceil(PARTS), parsed.len());
-    let count = |s: usize, which: usize| &sh.counts[s][which];
-    while let Some(&task) = sh.tasks.get(sh.next.fetch_add(1, Relaxed)) {
+    let terms = table.ids().div_ceil(PARTS);
+    loop {
+        let Some(&task) = sh.tasks.get(sh.next.fetch_add(1, Relaxed)) else {
+            // Freeing the scratch would unmap memory while the other threads
+            // run, which costs every core a TLB flush; the process is about
+            // to exit and frees it all at once.
+            std::mem::forget((scanner, eval, cursor));
+            return;
+        };
         let done = match task {
             Task::Scan(s, c) => {
                 if s >= 2 {
-                    wait(count(s - 2, BUILT), PARTS + 1); // the build of s - 2 read this buffer
+                    wait(&sh.built[s - 2], PARTS + 1); // the build of s - 2 read this buffer
                 }
                 let seg = &sh.segments[s];
                 let at = |c: usize| (seg.start + c as u64 * CHUNK_BYTES).min(seg.end);
                 let out = &mut *sh.chunks[s % 2][c].write().unwrap();
-                scanner.scan(&sh.file, (at(c), at(c + 1)), seg.first, out);
-                count(s, SCANNED)
+                scanner.scan(sh.file, (at(c), at(c + 1)), seg.first, out);
+                &sh.scanned[s]
             }
             Task::Build(s, p) => {
-                wait(count(s, SCANNED), sh.segments[s].chunks);
+                wait(&sh.scanned[s], sh.segments[s].chunks);
                 if s >= 1 {
-                    wait(count(s - 1, EVALUATED), 2 * ranges); // the eval of s - 1 read `parts`
+                    wait(&sh.evaluated[s - 1], parsed.len()); // the eval of s - 1 read `parts`
                 }
                 build(sh, s, p, terms, &mut cursor);
-                count(s, BUILT)
+                &sh.built[s]
             }
-            Task::Eval(s, h) => {
-                wait(count(s, BUILT), PARTS + 1);
+            Task::Eval(s, r) => {
+                wait(&sh.built[s], PARTS + 1);
                 let guards: Vec<_> = sh.parts.iter().map(|p| p.read().unwrap()).collect();
                 let parts: Vec<&Part> = guards.iter().map(|p| &**p).collect();
-                let (docs, base) = (count(s, DOCS).load(Relaxed) as usize, sh.segments[s].first);
-                let (r, mut answers) = (h / 2, sh.bool_answers[h].write().unwrap());
-                let first = parsed[r].ends.len() / 2 * (h % 2); // the half's first query
-                let queries = first + answers.len();
-                for (q, answer) in (first..).zip(answers.iter_mut()) {
+                let (docs, base) = (sh.docs[s].load(Relaxed) as usize, sh.segments[s].first);
+                let mut answers = sh.bool_answers[r].lock().unwrap();
+                let queries = answers.len();
+                for (q, answer) in answers.iter_mut().enumerate() {
                     if q + AHEAD < queries {
                         index::prefetch(&parts, parsed[r].bool_steps(q + AHEAD));
                     }
                     eval.run(&parts, parsed[r].bool_steps(q), docs, base, answer);
                 }
-                sh.halves[h].fetch_add(1, Release);
-                count(s, EVALUATED)
+                &sh.evaluated[s]
             }
-            Task::Format(h) => {
-                let r = h / 2;
-                // Once both halves of the range have evaluated every segment.
-                wait(&sh.halves[2 * r], sh.segments.len());
-                wait(&sh.halves[2 * r + 1], sh.segments.len());
+            Task::Format(r) => {
+                if let Some(last) = sh.evaluated.last() {
+                    wait(last, parsed.len());
+                }
+                let bools = sh.bool_answers[r].lock().unwrap();
+                let phrases = sh.phrase_answers[r].lock().unwrap();
                 // The read buffer is no longer needed, and its pages are mapped.
-                let out = &mut scanner.buf;
-                out.clear();
-                let low = sh.bool_answers[2 * r].read().unwrap();
-                let high = sh.bool_answers[2 * r + 1].read().unwrap();
-                let phrases = sh.phrase_answers[r].read().unwrap();
-                let order = &parsed[r].order;
-                let (lines, half) = (order.len(), order.len() / 2);
-                for &entry in &order[[0, half][h % 2]..[half, lines][h % 2]] {
-                    let (i, half) = ((entry & !PHRASE) as usize, low.len());
+                let out = scanner.out_buf();
+                for &entry in &parsed[r].order {
                     match entry & PHRASE {
-                        0 if i < half => low[i].write(out),
-                        0 => high[i - half].write(out),
-                        _ => phrases[i].write(out),
+                        0 => bools[entry as usize].write(out),
+                        _ => phrases[(entry & !PHRASE) as usize].write(out),
                     }
                 }
-                // No lock is held while waiting for the tasks before this one.
-                drop((low, high, phrases));
-                wait(&sh.formatted, h); // the halves before this one took their bytes
+                wait(&sh.formatted, r); // the ranges before this one took their bytes
                 let at = sh.out_at.load(Acquire);
                 sh.out_at.store(at + out.len() as u64, Release);
                 sh.formatted.fetch_add(1, Release);
-                or_fail(sh.out.write_all_at(out, at), "results.txt");
+                if let Err(e) = sh.out.write_all_at(out, at) {
+                    fail(&format!("{}: {e}", OUT.get().unwrap()));
+                }
                 continue;
             }
         };
         done.fetch_add(1, Release);
     }
-    // Freeing the scratch would unmap memory while the other threads run,
-    // which costs every core a TLB flush; the process is about to exit and
-    // frees it all at once.
-    std::mem::forget((scanner, eval, cursor));
 }
 
 /// Build task `p` of segment `s`: partition `p`'s postings, or (`p == PARTS`)
-/// the segment's phrase matches folded into the phrase answers, in document
-/// order. Each records the segment's document count, the chunks' lines.
+/// the segment's phrase matches folded into the phrase answers, in document order.
 fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
     let chunks = &sh.chunks[s % 2][..sh.segments[s].chunks];
     let chunks: Vec<_> = chunks.iter().map(|c| c.read().unwrap()).collect();
-    let docs: u32 = chunks.iter().map(|c| c.lines).sum();
-    sh.counts[s][DOCS].store(docs, Relaxed);
+    let docs = check_ids(&sh.segments, s, &chunks);
+    sh.docs[s].store(docs, Relaxed);
     if p < PARTS {
         let streams: Vec<&[u32]> = chunks.iter().map(|c| c.stream(p)).collect();
         let mut part = sh.parts[p].write().unwrap();
@@ -442,6 +472,25 @@ fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
     }
     for &(phrase, doc) in chunks.iter().flat_map(|c| &c.matches) {
         let (range, i) = (phrase >> RANGE_SHIFT, phrase & ((1 << RANGE_SHIFT) - 1));
-        sh.phrase_answers[range as usize].write().unwrap()[i as usize].push(doc);
+        sh.phrase_answers[range as usize].lock().unwrap()[i as usize].push(doc);
+    }
+}
+
+/// Checks that the chunks of segment `s` hold consecutive document ids that
+/// end where the next segment starts, and returns the segment's document count.
+fn check_ids(segments: &[Segment], s: usize, chunks: &[RwLockReadGuard<ChunkOut>]) -> u32 {
+    let first = segments[s].first;
+    let mut lines = chunks.iter().filter(|c| c.lines > 0);
+    let end = lines.try_fold(first, |next, c| (c.first == next).then_some(next + c.lines));
+    match end {
+        Some(end)
+            if segments.get(s + 1).is_none_or(|n| n.first == end) && (s > 0 || first == 0) =>
+        {
+            end - first
+        }
+        _ => fail(&format!(
+            "document ids must be 0, 1, 2, ... in order (in docs.txt bytes {}..{})",
+            segments[s].start, segments[s].end
+        )),
     }
 }

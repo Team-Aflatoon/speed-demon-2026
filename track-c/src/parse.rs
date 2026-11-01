@@ -16,9 +16,13 @@
 //! misses have overlapped.
 
 use crate::names::{Key, Pairs, Table};
+use crate::run::Shared;
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
+const HEADER: &[u8] = b"id,name,note,region_id,amount";
+/// The BOM's bytes EF BB BF as the low three bytes of a little-endian load.
+const BOM: u64 = 0xBF_BB_EF;
 /// Zero bytes after every chunk in its buffer: the parser reads whole 64-byte
 /// blocks, and names' and numbers' words, up to 64 bytes past the end.
 pub const PAD: usize = 128;
@@ -30,9 +34,17 @@ const BATCH: usize = 128;
 /// '0' in every byte of a word.
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
-/// A result, or the buffer offset near which the bytes break the grammar
-/// (or a chunk did not start and end at record boundaries).
-pub type Res<T> = Result<T, usize>;
+/// Why a run could not count the file, worst last.
+#[derive(Clone, Copy, Debug)]
+pub enum Fail {
+    /// More distinct names than the name table was sized for.
+    Full,
+    /// The bytes break the grammar at this buffer offset, or a chunk did not
+    /// start and end at record boundaries.
+    Malformed(usize),
+}
+
+pub type Res<T> = Result<T, Fail>;
 
 /// Per group, what a worker adds while parsing: `[ids, cents, text, min,
 /// max]`, the sums of ids, of amounts in cents and of text bytes, then the
@@ -73,30 +85,26 @@ type Ctx<'a> = (&'a Table, &'a [u8], (&'a [u64], usize));
 /// Where a record starts, and the quotes in the chunk before it.
 type At = (usize, u32);
 
+/// A worker's parser state, reused for every chunk: per 64-byte block of the
+/// chunk its separators (see `window`), then the record ends found in the
+/// current window, and a batch of its records.
+pub struct Parser {
+    seps: Vec<u64>,
+    ends: Vec<End>,
+    batch: Vec<Record>,
+}
+
 /// What a worker accumulates: aggregates by group, and its name pairs.
 pub struct Local {
     pub aggs: [Agg; crate::GROUPS],
     pub pairs: Pairs,
 }
 
-/// A worker's parser: the tables it joins against, and its state, reused
-/// for every chunk: per 64-byte block of the chunk its separators (see
-/// `window`), the record ends found in the current window, and a batch of
-/// its records.
-pub struct Parser<'a> {
-    tables: (&'a Table, &'a [AtomicU8]),
-    /// While scanning a chunk: the in-quotes state (all ones or 0) after the
-    /// last block, and the quotes and separators so far.
-    state: [u64; 3],
-    seps: Vec<u64>,
-    ends: Vec<End>,
-    batch: Vec<Record>,
-}
-
-impl<'a> Parser<'a> {
-    pub fn new(table: &'a Table, map: &'a [AtomicU8]) -> Self {
+impl Parser {
+    pub fn new() -> Self {
         let (ends, batch) = (vec![[0; 2]; WINDOW + 64], vec![Record::default(); BATCH]);
-        Parser { tables: (table, map), state: [0; 3], seps: Vec::new(), ends, batch }
+        let seps = Vec::new();
+        Parser { seps, ends, batch }
     }
 
     /// Parses the records in `b[start..end]` into `out`, `span` being
@@ -111,37 +119,34 @@ impl<'a> Parser<'a> {
     /// four, and this that the chunk has five separators per record in all.
     /// What is not diagnosed is a quote placed where 2.1 forbids it (inside
     /// an unquoted field, or not followed by a separator after closing).
-    pub fn chunk(&mut self, b: &[u8], (start, end, eof): Span, out: &mut Local) -> Res<u64> {
+    pub fn chunk(&mut self, sh: &Shared, b: &[u8], span: Span, out: &mut Local) -> Res<u64> {
+        let (start, end, eof) = span;
         // One block more than the chunk's at each end (see `window`).
         let blocks = (end - start) / 64 + 3;
         self.seps.resize(self.seps.len().max(blocks), 0);
-        // Records so far, and where the next one starts.
-        let (mut records, mut at) = (0, (start, 0));
-        self.state = [0; 3];
+        // In-quotes state (all ones or 0) after the last block, quotes and
+        // separators so far; records so far, and where the next one starts.
+        let (mut state, mut records, mut at) = ([0, 0, 0], 0, (start, 0));
         for window in (start..end).step_by(WINDOW) {
             let last = (window + WINDOW).min(end);
             // SAFETY: main checked that the CPU has PCLMULQDQ.
-            let mut n = unsafe { self.scan(b, [start, window, last]) };
+            let mut n = unsafe { self.scan(b, [start, window, last], &mut state) };
             // The final record may end at end of file without a terminator.
-            let tail = self.ends[..n].last().map_or(at.0, |e| e[0] as usize + 1);
-            let [inside, quotes, seps] = self.state;
-            if eof && last == end && tail < end && inside == 0 {
-                // A CR there would end the record as if before an LF: refused.
-                (b[end - 1] != b'\r').then_some(()).ok_or(end - 1)?;
-                (self.ends[n], n, self.state[2]) = ([end as u32, quotes as u32], n + 1, seps + 1);
+            let tail = if n > 0 { self.ends[n - 1][0] as usize + 1 } else { at.0 };
+            if eof && last == end && tail < end && state[0] == 0 {
+                (self.ends[n], n, state[2]) = ([end as u32, state[1] as u32], n + 1, state[2] + 1);
             }
-            let (table, map) = self.tables;
+            let c = (&sh.table, b, (&self.seps[..], start));
             for ends in self.ends[..n].chunks(BATCH) {
-                let c = (table, b, (&self.seps[..], start));
                 let batch = &mut self.batch[..ends.len()];
-                at = parse(c, map, ends, batch, at)?;
-                join(c, map, batch, out);
+                at = parse(c, sh.regions.map, ends, batch, at)?;
+                join(sh, b, batch, out)?;
             }
             records += n as u64;
         }
         // `at.0` is one past `end` after a final record with no terminator.
-        let whole = at.0.min(end) == end.max(start) && self.state[2] == 5 * records;
-        whole.then_some(self.state[1]).ok_or(at.0)
+        let whole = at.0.min(end) == end.max(start) && state[2] == 5 * records;
+        whole.then_some(state[1]).ok_or(Fail::Malformed(at.0))
     }
 
     /// Makes the separator masks of the blocks of `b[window..last]` and lists
@@ -150,8 +155,8 @@ impl<'a> Parser<'a> {
     /// # Safety
     /// The CPU must have PCLMULQDQ (see `prefix_xor`).
     #[target_feature(enable = "pclmulqdq")]
-    unsafe fn scan(&mut self, b: &[u8], [start, window, last]: [usize; 3]) -> usize {
-        let (first, mut n, state) = ((window - start) / 64 + 1, 0, &mut self.state);
+    unsafe fn scan(&mut self, b: &[u8], [start, window, last]: [usize; 3], state: &mut [u64; 3]) -> usize {
+        let (first, mut n) = ((window - start) / 64 + 1, 0);
         let blocks = (last - window).div_ceil(64);
         for (k, sep) in self.seps[first..first + blocks].iter_mut().enumerate() {
             let o = window + 64 * k;
@@ -191,7 +196,7 @@ fn parse(c: Ctx, map: &[AtomicU8], ends: &[End], out: &mut [Record], at: At) -> 
     for (&[e, quotes], f) in ends.iter().zip(out) {
         let (e, q) = (e as usize, quotes.wrapping_sub(quotes_before));
         if !fields(f, c, (s, e), q) {
-            slow(f, c, (s, e), q).ok_or(s)?;
+            slow(f, c, (s, e), q).ok_or(Fail::Malformed(s))?;
         }
         crate::prefetch(map, f.region as usize);
         c.0.prefetch(&f.key);
@@ -204,16 +209,18 @@ fn parse(c: Ctx, map: &[AtomicU8], ends: &[End], out: &mut [Record], at: At) -> 
 /// (id, group) pairs. Every region id past the map's end shares its last
 /// entry, a 0 (`_UNMATCHED`).
 #[inline(never)]
-fn join((table, b, _): Ctx, map: &[AtomicU8], records: &[Record], out: &mut Local) {
+fn join(sh: &Shared, b: &[u8], records: &[Record], out: &mut Local) -> Res<()> {
+    let map = sh.regions.map;
     for f in records {
-        // SAFETY (both): the map has at least one entry (regions sized it),
-        // and a name starts within its record.
+        // SAFETY (both): the map has at least one entry (main sized it), and
+        // a name starts within its record.
         let group = unsafe { map.get_unchecked((f.region as usize).min(map.len() - 1)) }.load(Relaxed);
         let [id, cents, text] = f.nums;
         merge(&mut out.aggs[usize::from(group)], &[id, cents, text, cents, cents]);
-        let id = table.find(&f.key, unsafe { b.get_unchecked(f.name as usize..) });
+        let id = sh.table.find(&f.key, unsafe { b.get_unchecked(f.name as usize..) })?;
         out.pairs.push(id, group);
     }
+    Ok(())
 }
 
 /// Parses into `f` the record `b[s..e]`, `e` being its terminator (or the
@@ -241,15 +248,14 @@ fn fields(f: &mut Record, c: Ctx, (s, e): (usize, usize), q: u32) -> bool {
     }
     // SAFETY (all reads): the record starts at `s` and ends at `e`, at most
     // the chunk's end, and these bytes are within it.
-    let byte = |p| unsafe { *b.get_unchecked(p) };
-    let end = e - usize::from(byte(e - 1) == b'\r'); // only ever before an LF (see `chunk`)
+    let byte = |p| unsafe { byte(b, p) };
+    let end = e - usize::from((byte(e - 1) == b'\r') & (byte(e) == b'\n'));
     let negative = byte(c3 + 1) == b'-';
     let whole = end.wrapping_sub(c3 + 4 + usize::from(negative)); // digits before the dot
     let (n_id, n_region) = (c0 - s, c3 - c2 - 1);
     // All three lengths in range at once: `n - 1` wraps below 0.
-    // (`end - 3` is past `s` once the four commas are in order.)
     let common = (n_id.wrapping_sub(1) | n_region.wrapping_sub(1)) < 8 && whole.wrapping_sub(1) < 5;
-    if !common | (byte(end - 3) != b'.') {
+    if !common || byte(end - 3) != b'.' {
         return false;
     }
     // Each number right-aligned in a word: its n digits at the top (the
@@ -259,7 +265,7 @@ fn fields(f: &mut Record, c: Ctx, (s, e): (usize, usize), q: u32) -> bool {
     // x86-64-v3, which the whole crate is compiled for. The loads: `end - 8`
     // is at least `s`, as a record is at least 10 bytes before its
     // terminator; `s` and `c2 + 1` start fields that end before `end`.
-    let fit = |p: usize, n: usize| unsafe { load(b, p) << (64 - 8 * n) | (ZEROS >> 4) >> (8 * n - 4) };
+    let fit = |p: usize, n: usize| unsafe { load(b, p) << (64 - 8 * n) | _bzhi_u64(ZEROS, 64 - 8 * n as u32) };
     let w = unsafe { load(b, end - 8) };
     let undotted = (w & 0xFF_FFFF_FFFF) << 8 | w & 0xFFFF << 48;
     let before = !(u64::MAX << (8 * (6 - whole)));
@@ -284,17 +290,12 @@ fn slow(f: &mut Record, ctx: Ctx, (s, e): (usize, usize), q: u32) -> Option<()> 
     let c = [seps.next()?, seps.next()?, seps.next()?, seps.next()?];
     let crlf = e > c[3] + 1 && b[e - 1] == b'\r' && b.get(e) == Some(&b'\n');
     // A BOM directly after a terminator is not data (spec 2.1).
-    let id = &b[s + 3 * usize::from(b[s..].starts_with(b"\xEF\xBB\xBF"))..c[0]];
-    // The amount, `-?[0-9]+\.[0-9]{2}`, as cents.
+    let id = s + 3 * usize::from(b[s..].starts_with(&BOM.to_le_bytes()[..3]));
+    let [id, region] = [(id, c[0]), (c[2] + 1, c[3])].map(|(from, to)| number(&b[from..to]));
     let amount = &b[c[3] + 1..e - usize::from(crlf)];
-    let (sign, digits) = amount.strip_prefix(b"-").map_or((1, amount), |d| (-1, d));
-    let (whole, fraction) = digits.split_at(digits.len().checked_sub(3)?);
-    let (whole, fraction) = (number(whole)?, number(fraction.strip_prefix(b".")?)?);
-    let cents = i64::try_from(whole.checked_mul(100)?.checked_add(fraction)?).ok()?;
-    // A region id too big for the map is simply unknown (see `join`).
-    let region = number(&b[c[2] + 1..c[3]])?.min(u32::MAX.into());
-    let nums = [number(id)? as i64, region as i64, sign * cents];
-    seps.next().is_none().then(|| finish(f, ctx, [c[0], c[1], c[2]], nums, q))
+    let region = region?.min(u64::from(u32::MAX));
+    let (nums, extra) = ([id? as i64, region as i64, cents(amount)?], seps.next());
+    extra.is_none().then(|| finish(f, ctx, [c[0], c[1], c[2]], nums, q))
 }
 
 /// The rest of `fields`, given a record's first three commas and its
@@ -306,15 +307,24 @@ fn slow(f: &mut Record, ctx: Ctx, (s, e): (usize, usize), q: u32) -> Option<()> 
 fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: u32) {
     let [id, region, cents] = nums;
     // SAFETY: `c0 + 1` and `c1 + 1` are at most `c2`, within the record.
-    let quoted = |c: usize| usize::from(unsafe { *b.get_unchecked(c + 1) } == b'"');
+    let quoted = |c: usize| usize::from(unsafe { byte(b, c + 1) } == b'"');
     let (name_quoted, note_quoted) = (quoted(c0), quoted(c1));
     // Name and note together; only the quotes, delimiting or escaping, are
     // not value bytes, and an escape is two of them for one value byte.
     let text = c2 as i64 - c0 as i64 - 2 - (name_quoted + note_quoted) as i64 - i64::from(q / 2);
     let name = c0 + 1 + name_quoted;
     let len = (c1 - name).saturating_sub(name_quoted);
+    // `slow` clamps a huge region id; `join`, any past the map.
     (f.key, f.name, f.region) = (t.key(b, name, len), name as u32, region as u32);
     f.nums = [id, cents, text];
+}
+
+/// Where the first record starts, after the BOM-prefixed header line.
+pub fn header(b: &[u8]) -> Option<usize> {
+    let p = 3 * usize::from(b.starts_with(&BOM.to_le_bytes()[..3]));
+    let q = p + HEADER.len();
+    let crlf = usize::from(b.get(q) == Some(&b'\r'));
+    (b.get(p..q) == Some(HEADER) && b.get(q + crlf) == Some(&b'\n')).then_some(q + crlf + 1)
 }
 
 /// Masks of the bytes equal to `"`, `,` and LF among the 64 at `o`; bit i
@@ -383,6 +393,17 @@ pub unsafe fn load(b: &[u8], p: usize) -> u64 {
     unsafe { b.as_ptr().add(p).cast::<u64>().read_unaligned() }
 }
 
+/// The byte at `p`, unchecked like `load`.
+///
+/// # Safety
+/// `p < b.len()`: every caller's `p` is within a record of the chunk, or
+/// its terminator, so at most the chunk's end, which `PAD` bytes follow.
+unsafe fn byte(b: &[u8], p: usize) -> u8 {
+    debug_assert!(p < b.len());
+    // SAFETY: the caller's promise.
+    unsafe { *b.get_unchecked(p) }
+}
+
 /// Four words of eight ASCII digits each (the first in the lowest byte) to
 /// their values, or `None` if any byte is not a digit. Adjacent digits
 /// combine into pairs, the pairs into fours, the fours into eight.
@@ -409,6 +430,23 @@ fn digits(lanes: [u64; 4]) -> Option<[u64; 4]> {
 /// bits anyway (2.2 keeps ids below 4 x 10^7 and amounts below 10^5).
 #[cold]
 fn number(digits: &[u8]) -> Option<u64> {
-    let digits = (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)).then_some(digits)?;
-    Some(digits.iter().fold(0, |v: u64, &d| v.saturating_mul(10).saturating_add(u64::from(d - b'0'))))
+    let digits = (!digits.is_empty()).then_some(digits)?;
+    digits.iter().try_fold(0u64, |v, &d| {
+        let d = d.checked_sub(b'0').filter(|&d| d < 10)?;
+        Some(v.saturating_mul(10).saturating_add(u64::from(d)))
+    })
+}
+
+/// The amount `-?[0-9]+\.[0-9]{2}` that is exactly `field`, in cents (see
+/// `fields` for the common case).
+#[cold]
+fn cents(field: &[u8]) -> Option<i64> {
+    let (sign, digits) = field.strip_prefix(b"-").map_or((1, field), |d| (-1, d));
+    let (whole, fraction) = digits.split_at(digits.len().checked_sub(3)?);
+    if fraction[0] != b'.' {
+        return None;
+    }
+    let (whole, fraction) = (number(whole)?, number(&fraction[1..])?);
+    let cents = whole.checked_mul(100)?.checked_add(fraction)?;
+    Some(sign * i64::try_from(cents).ok()?)
 }

@@ -50,10 +50,12 @@ pub const QUERY_PAD: usize = 16;
 /// unique to it, and its byte 15 is 0 or a letter or digit. A longer token
 /// keeps its first 15 bytes and puts `0x80 | length` (at most 127) in byte
 /// 15, which no short token has; two long tokens with the same key are told
-/// apart by comparing the rest of their bytes. The two halves are bytes 0..8
-/// and 8..16 read as little-endian words.
+/// apart by comparing the rest of their bytes.
 #[derive(Clone, Copy)]
-struct Key(u64, u64);
+struct Key {
+    lo: u64,
+    hi: u64,
+}
 
 /// `SLOT[m]`: the slot whose key matches, from the bits `m` of matching key
 /// words (bits 2j and 2j + 1 for slot j), or 3 (the bucket's miss value).
@@ -118,13 +120,17 @@ unsafe fn lowered(p: *const u8, len: usize) -> __m128i {
 impl Key {
     /// The token `bytes[at..at + len]`; 16 bytes from `at` must be readable
     /// (anything after the token is masked off).
+    #[inline]
     pub fn new(bytes: &[u8], at: usize, len: usize) -> Key {
         // SAFETY: the 16 bytes are checked by the slice.
         let key = Key::of(unsafe { lowered(bytes[at..at + 16].as_ptr(), len.min(SHORT)) });
         let tag = (0x80 | len.min(127) as u64) << 56;
         match len {
             ..=SHORT => key,
-            _ => Key(key.0, key.1 & (u64::MAX >> 8) | tag),
+            _ => Key {
+                lo: key.lo,
+                hi: key.hi & (u64::MAX >> 8) | tag,
+            },
         }
     }
 
@@ -133,10 +139,10 @@ impl Key {
     fn of(v: __m128i) -> Key {
         // SAFETY: SSE4.1 is part of x86-64-v3, which the crate requires.
         unsafe {
-            Key(
-                _mm_cvtsi128_si64(v) as u64,
-                _mm_extract_epi64::<1>(v) as u64,
-            )
+            Key {
+                lo: _mm_cvtsi128_si64(v) as u64,
+                hi: _mm_extract_epi64::<1>(v) as u64,
+            }
         }
     }
 
@@ -147,7 +153,7 @@ impl Key {
     #[inline(always)]
     pub fn hash(self) -> usize {
         // SAFETY: SSE4.2 is part of x86-64-v3, which the crate requires.
-        unsafe { _mm_crc32_u64(self.1, self.0) as usize }
+        unsafe { _mm_crc32_u64(self.hi, self.lo) as usize }
     }
 }
 
@@ -210,9 +216,22 @@ impl Lookup<'_> {
             *bucket.vals[usize::from(SLOT[m as usize])].as_ptr()
         };
         if v & OVERFLOW != 0 {
-            return self.table.find_slow(Key::of(probe.key), token(), text);
+            return self.find_slow(probe, token(), text);
         }
         v
+    }
+
+    /// The value of a long token, or of one whose bucket has overflowed.
+    #[cold]
+    #[inline(never)]
+    fn find_slow(self, probe: Probe, token: &[u8], text: &[u8]) -> u32 {
+        match token.len() {
+            // A short token needs no text to be compared.
+            ..=SHORT => self.table.find_slow(Key::of(probe.key), None),
+            len => self
+                .table
+                .find_slow(Key::new(token, 0, len), Some((token, text))),
+        }
     }
 }
 
@@ -253,7 +272,9 @@ unsafe fn zeroed<T>(n: usize, populate: bool) -> &'static [T] {
     // SAFETY: an anonymous mapping at an address of the kernel's choosing
     // touches no memory of ours.
     let p = unsafe { crate::mmap(std::ptr::null_mut(), len, PROT_READ_WRITE, flags, -1, 0) };
-    assert!(p as isize != -1, "cannot map {len} bytes for the table");
+    if p as isize == -1 {
+        fail(&format!("cannot map {len} bytes for the term table"));
+    }
     // SAFETY: the mapping is `len` bytes, page aligned, zeroed, used for
     // nothing else and never unmapped; the caller vouches for `T`.
     unsafe { std::slice::from_raw_parts(p.cast(), n) }
@@ -272,9 +293,12 @@ impl Table {
         let ids = 1 + words + threads * ID_BLOCK as usize;
         // The binding limit on ids: a posting holds the partition-local term
         // number (id / 64) in 16 bits, so ids stay under 2^22. The id field of
-        // a value is the same 22 bits (`ID_MASK`); that of a BOOL step (30
-        // bits) is looser. 50,000 queries hold at most 400,000 words.
-        assert!(ids <= MAX_IDS, "too many query words: {words}");
+        // a value is the same 22 bits (`ID_MASK`); that of a BOOL step (30 bits) is looser. 50,000
+        // queries hold at most 400,000 words.
+        if ids > MAX_IDS {
+            let most = MAX_IDS - 1 - threads * ID_BLOCK as usize;
+            fail(&format!("too many query words: {words}, at most {most}"));
+        }
         // SAFETY: zero bytes are valid atomic integers, which is all a
         // `Bucket` holds; it needs 64-byte alignment, less than a page.
         // The buckets are touched all over; the per-id arrays only where ids are.
@@ -293,6 +317,7 @@ impl Table {
     }
 
     /// The link to the first phrase anchored at term `id`, or `NONE`.
+    #[inline]
     pub fn head(&self, id: u32) -> u32 {
         self.heads[id as usize].load(Relaxed).wrapping_sub(1)
     }
@@ -334,19 +359,12 @@ impl Table {
         }
     }
 
-    /// The value of the token `token` (of key `key` if it is short), by
-    /// probing: for long tokens and overflowed buckets. A long token is told
-    /// apart from other long tokens with the same key by its bytes, compared
-    /// with the term's in `queries.txt` (`text`).
+    /// The value of any token, by probing: for long tokens and overflowed
+    /// buckets. A long token comes with its bytes and `queries.txt`, to tell
+    /// it apart from other long tokens with the same key.
     #[cold]
     #[inline(never)]
-    fn find_slow(&self, key: Key, token: &[u8], text: &[u8]) -> u32 {
-        let long = token.len() > SHORT;
-        let key = if long {
-            Key::new(token, 0, token.len())
-        } else {
-            key
-        };
+    fn find_slow(&self, key: Key, long: Option<(&[u8], &[u8])>) -> u32 {
         let mut b = self.home(key);
         for _ in 0..self.buckets.len() {
             let bucket = &self.buckets[b];
@@ -354,8 +372,8 @@ impl Table {
                 let lo = bucket.keys[2 * j].load(Relaxed);
                 let hi = bucket.keys[2 * j + 1].load(Relaxed);
                 let v = bucket.vals[j].load(Relaxed);
-                let tail = || self.tail_eq(token, v & ID_MASK, text);
-                if lo == key.0 && hi == key.1 && (!long || tail()) {
+                let tail = |(token, text)| self.tail_eq(token, v & ID_MASK, text);
+                if lo == key.lo && hi == key.hi && long.is_none_or(tail) {
                     return v;
                 }
             }
@@ -378,7 +396,7 @@ impl Table {
             for j in 0..3 {
                 let mut lo = bucket.keys[2 * j].load(Acquire);
                 if lo == 0 {
-                    match bucket.keys[2 * j].compare_exchange(0, key.0, AcqRel, Acquire) {
+                    match bucket.keys[2 * j].compare_exchange(0, key.lo, AcqRel, Acquire) {
                         Ok(_) => {
                             if ids.start == ids.end {
                                 let block = self.next_block.fetch_add(ID_BLOCK, Relaxed);
@@ -386,7 +404,7 @@ impl Table {
                             }
                             let id = ids.next().unwrap();
                             self.text_at[id as usize].store(at as u32, Relaxed);
-                            bucket.keys[2 * j + 1].store(key.1, Relaxed);
+                            bucket.keys[2 * j + 1].store(key.hi, Relaxed);
                             // Release: whoever sees the value sees `hi` and `text_at`.
                             bucket.vals[j].store(id | 1 << USES_SHIFT, Release);
                             return (id, 4 * b + j);
@@ -394,7 +412,7 @@ impl Table {
                         Err(now) => lo = now,
                     }
                 }
-                if lo == key.0 {
+                if lo == key.lo {
                     // Another thread may have claimed the slot and not yet
                     // written its value (ids are never 0).
                     let v = loop {
@@ -404,7 +422,7 @@ impl Table {
                         }
                     };
                     let id = v & ID_MASK;
-                    if bucket.keys[2 * j + 1].load(Relaxed) == key.1
+                    if bucket.keys[2 * j + 1].load(Relaxed) == key.hi
                         && (len <= SHORT || self.tail_eq(&text[at..at + len], id, text))
                     {
                         if v >> USES_SHIFT & 0x7F < USES_CAP {
@@ -464,7 +482,8 @@ pub struct Parsed {
     pub records: Vec<u32>,
     /// `(offset in queries.txt, length)` of each step's and each phrase
     /// term's word, until `insert` turns them into term ids.
-    words: [Vec<(u32, u8)>; 2],
+    bool_words: Vec<(u32, u8)>,
+    phrase_words: Vec<(u32, u8)>,
     /// Table slots of the phrase terms, until anchors are chosen.
     slots: Vec<u32>,
 }
@@ -486,43 +505,48 @@ impl Parsed {
         span(&self.steps, &self.ends, i)
     }
 
-    /// Parses the lines of `text[from..to]` (a whole number of lines); term
+    /// Parses the lines of `text[from..to]` (a whole number of lines). Term
     /// ids are filled in by `insert`. Every line must be a query (spec 2.3);
     /// only the empty piece after the final LF is not a line.
     pub fn parse(text: &[u8], from: usize, to: usize) -> Parsed {
-        let mut p = Parsed::default();
-        // Room for the words of a typical range (about 11 bytes each).
-        p.steps.reserve((to - from) / 8);
-        p.terms.reserve((to - from) / 8);
+        // Room for the words and lines of a typical range (about 11 bytes a
+        // word and 35 a line), so the vectors seldom grow.
+        let (lines, words) = ((to - from) / 24, (to - from) / 8);
+        let mut p = Parsed {
+            order: Vec::with_capacity(lines),
+            ends: Vec::with_capacity(lines),
+            term_ends: Vec::with_capacity(lines),
+            steps: Vec::with_capacity(words),
+            bool_words: Vec::with_capacity(words),
+            terms: Vec::with_capacity(words),
+            phrase_words: Vec::with_capacity(words),
+            ..Parsed::default()
+        };
         let lines = &text[from..to];
         let lines = lines.strip_suffix(b"\n").unwrap_or(lines);
         // An empty range has no lines (splitting it would give one empty one).
         for line in lines.split(|&b| b == b'\n').take_while(|_| from < to) {
             if p.line(line, text).is_none() {
-                fail(&format!(
-                    "malformed query: {:?}",
-                    String::from_utf8_lossy(line)
-                ));
+                fail(&format!("malformed query: {}", shown(line)));
             }
         }
         p
     }
 
-    /// Parses one line (a slice of `text`, where words are recorded by their
-    /// offsets).
     fn line(&mut self, line: &[u8], text: &[u8]) -> Option<()> {
-        let words = &mut self.words;
-        let mut word = |w: &[u8], phrase: usize| {
-            let term = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-            let ok = (1..=32).contains(&w.len()) && w.iter().all(term);
-            let at = (w.as_ptr() as usize - text.as_ptr() as usize) as u32;
-            ok.then(|| words[phrase].push((at, w.len() as u8)))
+        // Words are recorded by their offset in `text`, which they are slices of.
+        let word = |w: &[u8]| {
+            let ok = (1..=32).contains(&w.len())
+                && w.iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            let at = w.as_ptr() as usize - text.as_ptr() as usize;
+            ok.then_some((at as u32, w.len() as u8))
         };
         if let Some(rest) = line.strip_prefix(b"BOOL ") {
             self.order.push(self.ends.len() as u32);
             let (mut words, mut op) = (rest.split(|&b| b == b' '), OR);
             loop {
-                word(words.next()?, 0)?;
+                self.bool_words.push(word(words.next()?)?);
                 self.steps.push(op << TERM_BITS);
                 op = match words.next() {
                     None => break,
@@ -536,16 +560,22 @@ impl Parsed {
         } else {
             let inner = line.strip_prefix(b"PHRASE \"")?.strip_suffix(b"\"")?;
             self.order.push(PHRASE | self.term_ends.len() as u32);
-            let start = self.terms.len();
             for w in inner.split(|&b| b == b' ') {
-                word(w, 1)?;
+                self.phrase_words.push(word(w)?);
                 self.terms.push(0);
             }
-            // Anchor positions are bytes (the spec allows 8 terms).
-            (self.terms.len() - start <= usize::from(u8::MAX)).then_some(())?;
+            let start = self.term_ends.last().map_or(0, |&e| e as usize);
+            if self.terms.len() - start > usize::from(u8::MAX) {
+                // Anchor positions are bytes (the spec allows 8 terms).
+                fail(&format!("phrase with more than 255 terms: {}", shown(line)));
+            }
             self.term_ends.push(self.terms.len() as u32);
         }
         Some(())
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.bool_words.len() + self.phrase_words.len()
     }
 
     /// Puts every word into the table, turning steps and phrase terms into
@@ -553,17 +583,17 @@ impl Parsed {
     pub fn insert(&mut self, table: &Table, text: &[u8]) {
         let mut ids = 0..0;
         let mut insert =
-            |&(at, len): &(u32, u8)| table.insert(text, at as usize, len as usize, &mut ids);
-        for (step, word) in self.steps.iter_mut().zip(&self.words[0]) {
-            let id = insert(word).0;
-            *step |= id;
+            |(at, len): (u32, u8)| table.insert(text, at as usize, len as usize, &mut ids);
+        for (step, &word) in self.steps.iter_mut().zip(&self.bool_words) {
+            let (id, _) = insert(word);
             if table.bools[id as usize].load(Relaxed) == 0 {
                 table.bools[id as usize].store(1, Relaxed);
             }
+            *step |= id;
         }
-        for (term, word) in self.terms.iter_mut().zip(&self.words[1]) {
-            let slot;
-            (*term, slot) = insert(word);
+        for (term, &word) in self.terms.iter_mut().zip(&self.phrase_words) {
+            let (id, slot) = insert(word);
+            *term = id;
             self.slots.push(slot as u32);
         }
     }
@@ -577,19 +607,25 @@ impl Parsed {
         for i in 0..self.term_ends.len() {
             let terms = span(&self.terms, &self.term_ends, i);
             let slots = span(&self.slots, &self.term_ends, i);
-            let words = &self.words[1][self.term_ends[i] as usize - terms.len()..];
+            let start = if i == 0 {
+                0
+            } else {
+                self.term_ends[i - 1] as usize
+            };
+            let words = &self.phrase_words[start..self.term_ends[i] as usize];
             let rank = |j: usize| (table.uses(slots[j] as usize), u8::MAX - words[j].1);
             let a = (0..terms.len()).min_by_key(|&j| rank(j)).unwrap();
             let (term, slot) = (terms[a], slots[a]);
             table.flag(slot as usize, ANCHOR);
             let link = (range as u32) << RANGE_SHIFT | self.records.len() as u32;
-            let previous = table.heads[term as usize].swap(link + 1, AcqRel);
-            let previous = previous.wrapping_sub(1);
+            let previous = table.heads[term as usize]
+                .swap(link + 1, AcqRel)
+                .wrapping_sub(1);
             let meta = a as u32 | (terms.len() as u32) << 8;
             self.records.extend_from_slice(&[previous, i as u32, meta]);
             self.records.extend_from_slice(terms);
         }
-        (self.slots, self.words) = Default::default();
+        (self.slots, self.bool_words, self.phrase_words) = Default::default();
     }
 }
 
@@ -605,34 +641,15 @@ pub struct Setup<'a> {
 }
 
 impl<'a> Setup<'a> {
-    /// The ranges of `queries.txt` (and `QUERY_PAD` zero bytes) for
-    /// `threads` threads; the table comes with `make_table`.
     pub fn new(text: &'a [u8], threads: usize) -> Setup<'a> {
         let len = text.len() - QUERY_PAD;
         let ranges = (0..=threads).map(|i| line_start(&text[..len], len * i / threads));
-        let (barrier, table) = (Barrier::new(threads), OnceLock::new());
         Setup {
             text,
             ranges: ranges.collect(),
-            barrier,
-            table,
+            barrier: Barrier::new(threads),
+            table: OnceLock::new(),
         }
-    }
-
-    /// Makes the table, sized from the words of `queries.txt`: in a line
-    /// that parses, every term follows a space (a phrase's first through its
-    /// quote), and every other word after a space is an uppercase operator.
-    /// (A line that does not parse ends the run before it inserts anything.)
-    pub fn make_table(&self) {
-        let text = &self.text[..self.text.len() - QUERY_PAD];
-        let term = |(&a, &b): (&u8, &u8)| usize::from((a == b' ') & !b.is_ascii_uppercase());
-        let words = text.iter().zip(&text[1..]).map(term).sum();
-        let _ = self.table.set(Table::new(words, self.ranges.len() - 1));
-    }
-
-    /// `queries.txt` and `QUERY_PAD` zero bytes.
-    pub fn text(&self) -> &'a [u8] {
-        self.text
     }
 
     /// Waits for every thread.
@@ -640,11 +657,28 @@ impl<'a> Setup<'a> {
         self.barrier.wait();
     }
 
-    /// Thread `i`'s share of the start-up: its queries, parsed while the
-    /// table is made, and the finished table.
+    /// The words of `queries.txt`, counted to size the table before the
+    /// parse: in a line that parses, every term follows a space (a phrase's
+    /// first through its quote), and every other word after a space is an
+    /// uppercase operator. A line that does not parse ends the run before it
+    /// inserts anything.
+    pub fn count_words(&self) -> usize {
+        let text = &self.text[..self.text.len() - QUERY_PAD];
+        let term = |(&a, &b): (&u8, &u8)| usize::from((a == b' ') & !b.is_ascii_uppercase());
+        text.iter().zip(&text[1..]).map(term).sum()
+    }
+
+    /// Makes the table for `words` words (from `count_words`).
+    pub fn make_table(&self, words: usize) {
+        let _ = self.table.set(Table::new(words, self.ranges.len() - 1));
+    }
+
+    /// Thread `i`'s share of the start-up: its queries, and the finished
+    /// table.
     pub fn run(&self, i: usize) -> (Parsed, &Table) {
         let mut mine = Parsed::parse(self.text, self.ranges[i], self.ranges[i + 1]);
         let table = self.table.wait();
+        debug_assert!(mine.word_count() <= 3 * table.buckets.len());
         mine.insert(table, self.text);
         self.wait(); // anchors read every thread's counts
         mine.choose_anchors(table, i);
@@ -652,15 +686,17 @@ impl<'a> Setup<'a> {
     }
 }
 
+/// A query line for an error message: quoted, and cut to 80 bytes.
+fn shown(line: &[u8]) -> String {
+    format!("{:?}", String::from_utf8_lossy(&line[..line.len().min(80)]))
+}
+
 /// The first line start of `text` at or after `at`.
 fn line_start(text: &[u8], at: usize) -> usize {
-    match at {
-        0 => 0,
-        _ => {
-            at + text[at - 1..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(text.len() - at)
-        }
+    let lf = text[at.max(1) - 1..].iter().position(|&b| b == b'\n');
+    if at == 0 {
+        0
+    } else {
+        lf.map_or(text.len(), |i| at + i)
     }
 }
