@@ -6,9 +6,16 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-On the scoring box (commit 1cd61cf): **20.0 ms, 18.0 MB, S 514, K 47.72**
-(run-2491c9d07251); a second run, run-237f722dfeb2, gave 20.1 ms, 17.8 MB, K 47.67. The
-reference takes 32.05 s and 228 MB. The output is byte-identical to the reference's.
+On the scoring box (commit 32b49b8, PERF.md step 57): **20.4 ms, 18.2 MB, S 532, K 46.93**
+(run-996cb0022b51); a second run, run-361c33ed2406, gave 20.9 ms, 17.9 MB, K 46.45 (median
+20.65 ms, 18.05 MB). The reference takes 32.05 s and 228 MB. The output is byte-identical
+to the reference's. M is in MB of 10^6 bytes, as the board reports it.
+
+Before the hardening of step 57 the same design ran 20.0 and 20.1 ms at S 514 (commit
+1cd61cf, step 56). S rose to 532 so that unexpected input fails loudly: every error names
+its path, value or size, and no half-written summary is left behind. The hot path did
+not change (the instruction count is the same), and the two T medians differ by less
+than the box's run-to-run noise.
 
 The idea, in three lines:
 
@@ -27,13 +34,20 @@ that skip work on purpose, so their output is wrong):
 | Read floor | map the input and count its newlines on 12 threads, nothing else | 14.6 ms | run-8ea2db5074de |
 | Ingest only | v6, parse everything, report nothing | 21.3 ms | run-d570a81674c0 |
 | Report after ingest | v3 to v5 whole: the report phase after the ingest barrier added about 11 ms | 31.8-34.6 ms | run-f4376824385c |
-| This version | reports while parsing, reads with `pread` | 20.0 ms | run-2491c9d07251 |
+| This version | reports while parsing, reads with `pread` | 20.4 ms | run-996cb0022b51 |
+
+## How to run
+
+`ingest [data_dir] [out_dir]` reads `data_dir/requests.log` and writes
+`out_dir/summary.txt`; both default to the harness's `/data` and `/out`. With Docker:
+`docker build -t track-a . && docker run --rm -v "$PWD/data:/data:ro" -v "$PWD/out:/out" track-a`.
 
 ## Approach
 
 One Rust binary, `src/main.rs`, no crates. Eleven worker threads read and parse the log
 and report its hours while they parse; the main thread writes the output. PERF.md has the
-history and the measurements behind each choice (v8 is this design).
+history and the measurements behind each choice; this design is v8, steps 42 to 57
+(PERF.md's Labels section maps the step, version and build names).
 
 **Reading in pieces.** The file is cut into 128 KB pieces, which workers take in file
 order. A worker reads its piece with `pread` into its own buffer: from the byte before

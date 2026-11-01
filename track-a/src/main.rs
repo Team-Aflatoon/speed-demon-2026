@@ -155,9 +155,11 @@ enum Task {
     Stop,
 }
 
-/// Per hour, a worker's open block: next slot and end.
+/// Per hour, a worker's open block, as (next slot, end): both are indices into that
+/// hour's log, and the block is full when they meet.
 type Open = [(usize, usize); HOURS];
-/// Some lines to parse: (bytes, start of the first line, end of the last).
+/// Some lines to parse, as (bytes, start, end): the buffer, the offset in it of the first
+/// line's first byte, and the offset just past the last line's newline.
 type Lines = (*const u8, usize, usize);
 
 /// Everything the workers share.
@@ -354,6 +356,8 @@ impl<'a> Job<'a> {
         } else {
             end - at
         };
+        // An error here is dropped on purpose: the hint only stays unknown (0), and `parse`
+        // reads the same line and reports the error with its value.
         let row = hour_row(&buf[from..from + 13]).map_or(0, |row| row + 1);
         self.rows[i].store(row, Relaxed);
         Ok((buf.as_ptr(), from, to))
@@ -644,7 +648,8 @@ unsafe fn parse_latency(p: *const u8) -> (u32, usize) {
 }
 
 /// The row (0 to 71) of a `YYYY-MM-DDTHH` hour, or an error outside the spec's span. The
-/// span runs from 2026-10-30T18 over the end of October (31 days) into November.
+/// span runs from 2026-10-30T18 over the end of October (31 days) into November; its
+/// start is hardcoded here and in `stamp` (see `HOURS`).
 fn hour_row(t: &[u8]) -> io::Result<usize> {
     let num = |r: Range<usize>| t[r].iter().fold(0, |a, &d| a * 10 + d as i64 - 48);
     let day = num(8..10) + if num(5..7) == 11 { 31 } else { 0 };
@@ -658,7 +663,8 @@ fn hour_row(t: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// The output's `YYYY-MM-DDTHH:00:00Z ` for hour row `row`, padded to 32 bytes.
+/// The output's `YYYY-MM-DDTHH:00:00Z ` for hour row `row`, padded to 32 bytes. The
+/// span start is hardcoded here and in `hour_row` (see `HOURS`).
 fn stamp(row: usize) -> [u8; 32] {
     let (day, hour) = (30 + (row + 18) / 24, (row + 18) % 24);
     let (month, day) = if day > 31 { (11, day - 31) } else { (10, day) };

@@ -2,13 +2,15 @@
 
 ## Summary
 
-**19% fewer instructions moved the board 0%; moving 11 ms of work off the critical path
-moved it 25%.**
+**19% fewer instructions did not help on the board (v5 even ran about 9% slower than v3);
+moving 11 ms of work off the critical path made it 25% faster.**
 
-Final: step 56, commit 1cd61cf: pread pieces + per-hour reports while parsing, verified by
-exact counts. Board: 20.0 ms, 18.0 MB, K 47.72 (run-2491c9d07251) and 20.1 ms, 17.8 MB,
-K 47.67 (run-237f722dfeb2), median 20.05 ms, 17.9 MB; S 514; reference 32.05 s, 228 MB.
-Decisive steps (all board runs):
+Final: step 57, commit 32b49b8: pread pieces + per-hour reports while parsing, verified by
+exact counts. Board: 20.4 ms, 18.2 MB, K 46.93 (run-996cb0022b51) and 20.9 ms, 17.9 MB,
+K 46.45 (run-361c33ed2406), median 20.65 ms, 18.05 MB; S 532; reference 32.05 s, 228 MB.
+Before that hardening, step 56 (commit 1cd61cf) ran 20.0 and 20.1 ms at S 514; S rose
+so that unexpected input fails loudly (errors with their path, value or size, no
+half-written output), on an unchanged hot path. Decisive steps (all board runs):
 
 1. v1 Rust rewrite (mmap, 12 workers): 46.1 ms, 47.5 MB (run-a288ae43d4e8).
 2. v2 per-hour 4-byte logs + counting sort, THP off: 33.0 ms, 25.8 MB (run-078b64667d1c);
@@ -20,7 +22,8 @@ Decisive steps (all board runs):
    if a line came late: 24.5 ms, 19.5 MB (run-d96b1571240a).
 5. pread vs mmap, two correct builds back to back: 24.5 → 20.7 ms (run-5450dc2d90d1 vs
    run-cbad326faf08).
-6. Simplification and review fixes, same output: S 530 → 514 at the same T (step 56).
+6. Simplification, same output: S 530 → 514 at the same T (step 56); then hardening
+   against unexpected input, S 514 → 532 at the same instruction count (step 57).
 
 Lesson: on the box, phase structure and kernel work (faults, barriers) set T; local
 instruction counts did not (v3 to v5: 1,358M → 1,099M instructions, 31.8 → 34.6 ms).
@@ -34,9 +37,11 @@ of this track passed.
 
 - **T**: wall time from exec to exit. A board row's T is what the board reported for that
   run ID; every other T is measured on this laptop and marked "(local)".
-- **M**: the run's cgroup `memory.peak`. Board rows are the board's; local values are
-  marked "(local)". Up to step 31 a local M is `bench/bench.sh`'s, which includes about
-  5 MB of shell in the container; from v7 (step 32) on, a local M is `memory.peak` minus
+- **M**: the run's cgroup `memory.peak`. Board figures are the board's, in MB of 10^6
+  bytes (bytes / 10^6, as the board reports it). Local figures, in the tables and in the
+  text, are in MiB (2^20 bytes: our scripts print KiB), even where older text says "MB";
+  in the tables they are marked "(local)". Up to step 31 a local M is `bench/bench.sh`'s,
+  which includes about 5 MiB of shell in the container; from v7 (step 32) on, a local M is `memory.peak` minus
   the container's own baseline, i.e. the program's share only.
 - **S**: code lines counted by `static_axes.py` (scc after default rustfmt, Dockerfile
   included); **D**: 1 + dependencies, always 1 here.
@@ -48,12 +53,13 @@ of this track passed.
   P-cores with turbo off.
 - **Box noise**: repeated runs of one build differed by at most **3.5%**: v3 31.8 / 32.8 ms
   (run-f4376824385c, run-3d15bb7568d0), a20 20.2 / 20.9 ms (run-97875b283660,
-  run-b471d3e70c35), step 56 20.0 / 20.1 ms (run-2491c9d07251, run-237f722dfeb2). One
+  run-b471d3e70c35), step 56 20.0 / 20.1 ms (run-2491c9d07251, run-237f722dfeb2), step 57
+  20.4 / 20.9 ms (run-996cb0022b51, run-361c33ed2406). One
   outlier is set aside: v2 at 44.2 ms (run-60abe77e7171) against 33.0 and 32.6 ms.
-- **Local T and M cells**: a value appears only where that step was measured on its own,
-  as the A/B pair that decided it (this step against the one before, same session); "—"
-  where the decision rested on other evidence, which the row then gives (instruction
-  counts, faults, single-core times).
+- **Local T and M cells**: a pair "x vs y" is the A/B that decided the step (this step
+  against the one before, same session); a single value marked "(local median)" is the
+  median of that build's own runs, with no A/B partner; "—" where the decision rested on other
+  evidence, which the row then gives (instruction counts, faults, single-core times).
 
 ## Labels
 
@@ -61,7 +67,7 @@ of this track passed.
 - **v1 to v8** are the versions submitted in turn: v1 step 8, v2 step 14, v3 step 18, v4
   step 25, v5 step 28, v6 step 31 (never run whole on the board), v7 step 41; v8 is the
   pread line that followed, submitted as a13 (step 48), a19 (51), a20 (53) and finally
-  step 56 (commit 1cd61cf).
+  step 56 (commit 1cd61cf, before hardening) and step 57 (commit 32b49b8, final).
 - **a12 to a21** are board builds of the v8 work: a12 v7's mmap reading with steps 42-46
   (step 47); a13 the same reading with pread (step 48); **a14** a12 plus one
   `MADV_POPULATE_READ` per piece (run-d5a15d3df29a, 26.0 ms; v8 experiments); a19, a20 as
@@ -79,21 +85,21 @@ interleaved A/B runs of saved binaries, on total CPU time (`perf stat` task-cloc
 single-core runs, or (from step 19) on deterministic instruction and mispredict counts,
 and each row gives the evidence. The box ratio and its noise are in Measures.
 
-| Step | Change | Run ID | T (s) | M (MB) | Points |
+| Step | Change | Run ID | T (s) | M (MB board, MiB local) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged (the board's reference numbers) | | 32.05 | 228 | 0 |
-| 1 | Rust v1: mmap, 12 workers, per-worker endpoint hash table, per-group block chains, scalar newline and latency loops, merge by sorting all workers' names, per-hour formatting, one write | | 0.039 (local) | 37.5 (local) | |
-| 2 | AVX2 newline bitmask; loop-free SIMD latency parse; skip workers that never saw an hour when summarising | | 0.030 (local) | 37 (local) | |
-| 3 | Merge endpoint tables through one more hash table and sort the 1,842 survivors, instead of sorting 22,104 names (that phase: 5-6 ms to 0.9 ms) | | 0.029 (local) | 37 (local) | |
-| 4 | Copy names into a compact per-worker arena (compares against first occurrences in the input cost a TLB miss on most lines); check the stored hash before comparing bytes; fixed-size compares instead of `memcmp` | | 0.023 (local) | 37 (local) | |
-| 5 | Summarise into 24-byte records first, free the chains, then format in parallel: the output's page cache and the chains no longer peak together | | — | 35 (local) | |
+| 1 | Rust v1: mmap, 12 workers, per-worker endpoint hash table, per-group block chains, scalar newline and latency loops, merge by sorting all workers' names, per-hour formatting, one write | | 0.039 (local median) | 37.5 (local median) | |
+| 2 | AVX2 newline bitmask; loop-free SIMD latency parse; skip workers that never saw an hour when summarising | | 0.030 (local median) | 37 (local median) | |
+| 3 | Merge endpoint tables through one more hash table and sort the 1,842 survivors, instead of sorting 22,104 names (that phase: 5-6 ms to 0.9 ms) | | 0.029 (local median) | 37 (local median) | |
+| 4 | Copy names into a compact per-worker arena (compares against first occurrences in the input cost a TLB miss on most lines); check the stored hash before comparing bytes; fixed-size compares instead of `memcmp` | | 0.023 (local median) | 37 (local median) | |
+| 5 | Summarise into 24-byte records first, free the chains, then format in parallel: the output's page cache and the chains no longer peak together | | — | 35 (local median) | |
 | 6 | Branchless name compare: two 32-byte AVX2 compares with the bits past the length masked (interleaved A/B min 24.1 vs 25.7 ms) | | 0.0241 vs 0.0257 (local) | — | |
-| 7 | Power-of-two blocks with a separate link array (a mask instead of `% 15` per line); each hour split into four tasks by endpoint rank for balance; one sequential writer (single core 99 to 96.6 ms) | | — | 33 (local) | |
+| 7 | Power-of-two blocks with a separate link array (a mask instead of `% 15` per line); each hour split into four tasks by endpoint rank for balance; one sequential writer (single core 99 to 96.6 ms) | | — | 33 (local median) | |
 | 8 | **v1 as submitted** (commit 0ed7fba). Fewer lines for S (rank + five numbers as one tuple struct, splatted SIMD weights): 456 to 421 Rust lines; S 427. Reruns: run-1fc879b67a36, run-b114fce0b3dd (44.0 ms, 49.0 MB) | run-a288ae43d4e8 | 0.0461 | 47.5 | 71.3 |
 | 9 | Line ends found per 4 KB in bulk: both candidate newlines of each 64-byte block are stored unconditionally and the count advances by popcount, so the per-line loop has no unpredictable exit at every block boundary (single core min 94.8 vs 104.5 ms; 12 threads min 30.6 vs 32.2 ms) | | 0.0306 vs 0.0322 (local) | — | |
 | 10 | Endpoint table as one arena of records (hash, id, length, name) so a hit reads its slot and then one record; 4,096 slots (neutral within noise; kept for the smaller footprint) | | — | — | |
-| 11 | Report and write overlapped: workers report the hours in order and the main thread writes each one as soon as all earlier ones are out (buffered writes; a bounded channel caps the texts in flight; interleaved min 28.7 vs 33.9 ms under load) | | 0.0287 vs 0.0339 (local) | 36 (local) | |
-| 12 | Per-worker, per-hour logs of 4-byte records (`id << 20 \| 5xx << 19 \| latency`, latencies of 2^19 and up kept aside) in 256 KB chunks; each hour reported by counting-sorting its logs by endpoint into one array, so every group is one contiguous slice; each hour's chunks are freed (unmapped) as soon as it is reported, so the logs shrink while the output's page cache grows (CPU 128 vs 159 ms; min 22.8 vs 26.1 ms) | | 0.0228 vs 0.0261 (local) | 26 (local) | |
+| 11 | Report and write overlapped: workers report the hours in order and the main thread writes each one as soon as all earlier ones are out (buffered writes; a bounded channel caps the texts in flight; interleaved min 28.7 vs 33.9 ms under load) | | 0.0287 vs 0.0339 (local) | 36 (local median) | |
+| 12 | Per-worker, per-hour logs of 4-byte records (`id << 20 \| 5xx << 19 \| latency`, latencies of 2^19 and up kept aside) in 256 KB chunks; each hour reported by counting-sorting its logs by endpoint into one array, so every group is one contiguous slice; each hour's chunks are freed (unmapped) as soon as it is reported, so the logs shrink while the output's page cache grows (CPU 128 vs 159 ms; min 22.8 vs 26.1 ms) | | 0.0228 vs 0.0261 (local) | 26 (local median) | |
 | 13 | `prctl(PR_SET_THP_DISABLE)` at start. v1's box M was 47.5 MB against about 32 MB locally, consistent with transparent huge pages set to `always` there (Debian's default) backing malloc's per-thread arenas with 2 MB pages. Locally THP is `madvise`, so it shows nothing here; the board run of v2 is the proof: M fell from 47.5 to 25.8 MB, in line with the ~25 MB we measure locally | | — | — | |
 | 14 | **v2 as submitted** (commit 51067d3): steps 9-13. The text-buffer pool tried with step 11 was dropped here because whole-run timing could not see it (it came back in step 20, once per-phase TSC counts showed what buffer growth cost). Reruns: run-a4147923f8f1 (32.6 ms) and run-60abe77e7171 (44.2 ms, the one outlier set aside in Measures) | run-078b64667d1c | 0.0330 | 25.8 | 77.3 |
 | 15 | Timeline instrumentation (per-thread phase events, temporary build): ingest threads started 0.2-2.5 ms apart and finished 4-4.5 ms apart (static equal ranges), the endpoint merge took 0.7 ms on one thread, reporting ~8 ms with ~30% idle, the writer finishing 0.8-1.5 ms after the last report. Fix for the first two: the file is cut into ~1 MB pieces; each worker owns a contiguous run and steals from the back of others' runs when done (a shared counter over all pieces scattered every worker over every hour, 12 x 72 log chunks, and ingest took 18 ms instead of 12). Ingest now ends within 0.3-0.6 ms across threads | | — | — | |
@@ -228,12 +234,12 @@ of interleaved runs of saved binaries with the output on a tmpfs, as on the box
 own baseline (about 5 MB of shell), so both read lower than `bench/bench.sh`, which
 writes to an ext4 volume; instruction counts are from cachegrind.
 
-| Step | Change | Run ID | T (s) | M (MB) | Points |
+| Step | Change | Run ID | T (s) | M (MB board, MiB local) | Points |
 |---|---|---|---|---|---|
-| 32 | Rewrite: per-(worker, hour) logs in one `MAP_NORESERVE` reservation, a barrier, then per-hour reports (739M instructions against v6's 1,077M; wall equal to v6) | | 0.0195 (local) | 20 (local) | |
-| 33 | The main thread parses during ingest and writes afterwards, with 11 reporters, so the writer has a CPU of its own (its tail after the last report: 3 ms to 0.2 ms) | | 0.0145 (local) | — | |
+| 32 | Rewrite: per-(worker, hour) logs in one `MAP_NORESERVE` reservation, a barrier, then per-hour reports (739M instructions against v6's 1,077M; wall equal to v6) | | 0.0195 (local median) | 20 (local median) | |
+| 33 | The main thread parses during ingest and writes afterwards, with 11 reporters, so the writer has a CPU of its own (its tail after the last report: 3 ms to 0.2 ms) | | 0.0145 (local median) | — | |
 | 34 | One log per hour shared by all workers, which reserve 1 KB blocks of it with one `fetch_add`; pieces in file order; one endpoint table shared by all workers | | — | — | |
-| 35 | Speculative reporting: an hour is reported as soon as the parsed prefix is two hours past it, while parsing goes on; an exact count check, and a rerun without speculation if it fails (median 13.0 vs 14.5 ms, CPU -8%) | | 0.0130 vs 0.0145 (local) | 19.5 (local) | |
+| 35 | Speculative reporting: an hour is reported as soon as the parsed prefix is two hours past it, while parsing goes on; an exact count check, and a rerun without speculation if it fails (median 13.0 vs 14.5 ms, CPU -8%) | | 0.0130 vs 0.0145 (local) | 19.5 (local median) | |
 | 36 | Count and scatter as plain loops; the endpoint start found by one 16-byte compare (767M to 701M instructions) | | — | — | |
 | 37 | Endpoint table as a `static`, structs built from `Default`, logs as slices (S 559 to 484; 688M instructions) | | — | — | |
 | 38 | A cap on the line-end index count, so the compiler drops its bounds checks (691M to 682M) | | — | — | |
@@ -321,13 +327,13 @@ the two correct builds above.)
 The other changes from v7 to v8 are measured locally, by deterministic cachegrind counts
 and interleaved runs:
 
-| Step | Change | Run ID | T (s) | M (MB) | Points |
+| Step | Change | Run ID | T (s) | M (MB board, MiB local) | Points |
 |---|---|---|---|---|---|
 | 42 | The hour cache compared as one 16-byte SSE load (13 bytes masked) instead of two words: 679M to 657M instructions, since it frees registers in the hot loop | | — | — | |
 | 43 | Second line-end candidate as the lowest set bit once the lowest is cleared (`blsr` + `tzcnt` instead of `lzcnt` arithmetic): 663M to 654M | | — | — | |
 | 44 | The plan's condition variable is signalled only when a worker waits: about 1,900 `futex` calls fewer per run | | — | — | |
 | 45 | Names stored with the space that follows them, so one masked 64-byte compare also checks the length (no separate length compare) | | — | — | |
-| 46 | Memory released before the peak: report scratch pooled at most two, no text pooled for the last hours, the last worker unmaps the logs (and their page tables) | | — | 16.3 (local) | |
+| 46 | Memory released before the peak: report scratch pooled at most two, no text pooled for the last hours, the last worker unmaps the logs (and their page tables) | | — | 16.3 (local median) | |
 | 47 | a12 on the board: steps 42-46 on v7's mmap reading | run-5450dc2d90d1 | 0.0245 | 17.6 | 81.7 |
 | 48 | a13 on the board: the same with `pread` in 128 KB pieces; each worker frees its buffer after one of the last pieces | run-cbad326faf08 | 0.0207 | 18.5 | 83.4 |
 | 49 | Count pass tallied by the record's top 12 bits (endpoint id and 5xx flag together), one increment per record instead of a packed 64-bit add: 654M to 628M instructions | | — | — | |
@@ -337,8 +343,8 @@ and interleaved runs:
 | 53 | **a20 as submitted** (commit c8e36fb): steps 42-52, a19 plus step 52; 628M instructions, 6.2k page faults; S 530. A second board run, run-b471d3e70c35, took 20.9 ms | run-97875b283660 | 0.0202 | 17.9 | 83.76 |
 | 54 | Review fixes, no change in behaviour: rustfmt, clippy clean (precedence parentheses, `div_ceil` for the rank, two statements for the rerun's truncate and rewind), the record layout as named constants with a compile-time check, hour logs sized in whole blocks with the page alignment `madvise` needs spelled out, `# Safety` on `insert`, `if` instead of `match` on booleans; S 537 | | — | — | |
 | 55 | Simplification, same output: the hour row comes from the date directly (the span crosses only October's end, so no civil-date arithmetic) and the output stamp is made from the row, not copied from a line; one count of reported lines for the job, not one per hour; the piece count read from `rows`; single-use helpers (record decoding, the endpoint count) folded into their callers. 635M instructions (+0.4%); S 514. Local medians taken alongside step 54's build: 15.1 against 15.9 ms, within this machine's noise | | 0.0151 vs 0.0159 (local) | — | |
-| 56 | **As submitted** (commit 1cd61cf): steps 54 and 55 on a20, S 514. Two board runs: run-2491c9d07251 20.0 ms, 18.0 MB, K 47.72; run-237f722dfeb2 20.1 ms, 17.8 MB, K 47.67; median 20.05 ms, 17.9 MB | run-2491c9d07251 | 0.0200 | 18.0 | 83.94 |
-| 57 | Review fixes after step 56, same output: errors name their path, value or size (`mmap of N bytes`, the bad timestamp, the endpoint count or length, now two messages); no `summary.txt` is left behind on failure; a rerun is noted on stderr; `--locked` in the Dockerfile; `ERROR_SHIFT` in the record-layout check; `MARK` renamed `INLINE_LATENCY_LIMIT` and the parse span type `Lines`; comments on the zero-to-final store the count check rests on, on the scatter's overflow when an hour was incomplete, on `reserve`'s lifetime, and the report's stages numbered. 634M instructions (no change); S 532 | run-996cb0022b51 | 0.0204 | 18.2 | 83.57 |
+| 56 | **As submitted, before hardening** (commit 1cd61cf): steps 54 and 55 on a20, S 514. Two board runs: run-2491c9d07251 20.0 ms, 18.0 MB, K 47.72; run-237f722dfeb2 20.1 ms, 17.8 MB, K 47.67; median 20.05 ms, 17.9 MB | run-2491c9d07251 | 0.0200 | 18.0 | 83.94 |
+| 57 | **As submitted** (commit 32b49b8): step 56 hardened against unexpected input, same output: errors name their path, value or size (`mmap of N bytes`, the bad timestamp, the endpoint count or length, now two messages); no `summary.txt` is left behind on failure; a rerun is noted on stderr; `--locked` in the Dockerfile; `ERROR_SHIFT` in the record-layout check; `MARK` renamed `INLINE_LATENCY_LIMIT` and the parse span type `Lines`; comments on the zero-to-final store the count check rests on, on the scatter's overflow when an hour was incomplete, on `reserve`'s lifetime, and the report's stages numbered. 634M instructions (no change); S 532. Two board runs: run-996cb0022b51 20.4 ms, 18.2 MB, K 46.93; run-361c33ed2406 20.9 ms, 17.9 MB, K 46.45; median 20.65 ms, 18.05 MB, against step 56's 20.05 ms, within the box's noise | run-996cb0022b51 | 0.0204 | 18.2 | 83.57 |
 
 The reading decision rests on all the runs, not one pair: every build that maps the input
 took 24.5 ms or more (v7 24.5, a12 24.5, a14 26.0), every build that preads it 22.7 ms
