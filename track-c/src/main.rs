@@ -36,8 +36,9 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
-    // PROBE p0: exec + exit floor. An empty output, then main's own return.
+    // PROBE p1: p0 + the workers started (as `run` does) and joined, idle.
     if std::hint::black_box(true) { // PROBE
+        run::probe_threads(); // PROBE
         _ = fs::write(format!("{out}/aggregates.txt"), ""); // PROBE
         return; // PROBE
     } // PROBE

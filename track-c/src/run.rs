@@ -119,6 +119,13 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
     fail.map_or(Ok(total.into_inner().unwrap()), Err)
 }
 
+/// PROBE p1: the workers, started and joined as `run` does, each idle. // PROBE
+pub fn probe_threads() { // PROBE
+    let threads = thread::available_parallelism().map_or(1, usize::from).min(MAX_THREADS); // PROBE
+    let work = |t: usize| _ = std::hint::black_box(t); // PROBE
+    thread::scope(|s| grow(s, 0, threads, &work)); // PROBE
+} // PROBE
+
 /// Waits, yielding rather than spinning, so that a crowded machine can run
 /// the workers still busy, until `left` reaches 0.
 fn wait(left: &AtomicUsize) {
