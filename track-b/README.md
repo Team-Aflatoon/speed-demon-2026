@@ -6,9 +6,10 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-Board, median of three runs of the submitted build: **188.6 ms, 36.2 MB, K 25.46**
-(run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5), against the reference's 56.35 s and
-2.2 GB. The steps that got here are in [PERF.md](PERF.md).
+Board, median of the two runs of the submitted build (PERF.md step 15): **189.2 ms, 36.1 MB,
+K 25.33, 70.18 points** (run-3ae92ad95108, run-f30168793c18). That is about 298 times faster
+than the reference (56.35 s) in a sixtieth of its memory (2,200 MB). The steps that got here
+are in [PERF.md](PERF.md).
 
 | File | What it holds |
 |---|---|
@@ -89,8 +90,20 @@ AVX2 loads, each with a `SAFETY` note.
 - At most 2^22 query words less 1,024 per thread (50,000 queries hold at most 400,000).
 - Phrases of at most 255 terms (the spec allows 8); query terms of 1 to 32 bytes.
 - `queries.txt` under 1 GB; document ids `0, 1, 2, ...` in order, each line with one TAB.
-- At most 16 threads (12 are used).
+- At most 16 threads (12 are used). Tasks that wait for others spin with `yield_now`, which
+  burns CPU if the cgroup grants fewer CPUs than `available_parallelism` reports.
 - Segments are cut to hold at most 65,536 documents, so any number of documents is fine.
+
+## Errors
+
+Each ends the run with exit code 1 and one line on stderr:
+
+- a missing or unreadable input file, with its path;
+- a malformed query line (quoted, cut to 80 bytes), or a phrase of more than 255 terms;
+- too many query words, with the count and the limit;
+- a docs.txt line without an id or exactly one TAB, or ids out of order, with the byte offset,
+  document id or line span;
+- a failed write of `results.txt` (the partial file is removed).
 
 ## Testing
 
@@ -98,8 +111,9 @@ Every build was checked against the reference's output on seeds 1 and 7 and the 
 and 202, and on 23 small cases: the spec's worked example, every hand-written case of
 `tests/test_b_index.py`, generated tiny and sample seeds, and random cases with long tokens,
 terms sharing their first 12 bytes, a line longer than a read buffer, op words as terms and NOT
-emptying a set. The 23 also run in three stress builds with tiny read buffers, chunks and
-segments (and one with at most 100 documents per segment), which exercise every boundary path,
+emptying a set. The 23 also run in three stress builds that shrink `PIECE` (scan.rs) to 1 KB or 4 KB and
+`CHUNK_BYTES` and `SEGMENT_BYTES` (main.rs) to 4 KB and 64 KB, one of them also
+`MAX_SEGMENT_DOCS` (scan.rs) to 100, which exercise every boundary path,
 and seed 1 was repeated 100 times in one container with no differing output.
 
 ## Dependencies

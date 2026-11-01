@@ -100,6 +100,7 @@ pub struct Table {
 }
 
 const ID_BLOCK: u32 = 1024;
+/// The binding limit on term ids (see `Table::new`).
 const MAX_IDS: usize = 1 << 22;
 
 impl Table {

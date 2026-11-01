@@ -2,15 +2,15 @@
 
 ## Summary
 
-**Final: v4.2 as submitted (step 14).** Board, median of three runs: 188.6 ms, 36.2 MB, K 25.46
-(run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5); the reference takes 56.35 s and 2.2 GB.
+**Final: v4.2 as submitted (step 15).** Board, median of its two runs: 189.2 ms, 36.1 MB, K 25.33
+(run-3ae92ad95108, run-f30168793c18); the reference takes 56.35 s and 2,200 MB.
 
 | Step | Board T | M | Run |
 |---|---|---|---|
 | v1: index only the query terms; a throwaway index per 4,096 documents, every query answered per batch | 309 ms | 59.7 MB | run-7450e3d4343b |
 | v2-v3: memory, not time (THP off, bitmap stripes); local CPU gains of 5-10% never showed on the box | ~303 ms | 39.1 MB | run-43f854129993, run-d53081aa4120 |
 | v4 redesign: phrases checked during the scan at a rare anchor chosen by query frequency (no positions, no re-reads); postings once per 8 MB segment; one task queue | 184.3 ms | 35.8 MB | run-64a666bd15fb |
-| v4.1-v4.2: every capacity provable for any valid input; table size changed nothing | 188.6 ms | 36.2 MB | run-1ca61642aede, run-0778bc8cbf5f, step 14 |
+| v4.1-v4.2: every capacity provable for any valid input; table size changed nothing (4 MB and 2 MB tables) | 190.6 ms; 193.2 ms | 37.0 MB; 35.3 MB | run-1ca61642aede; run-0778bc8cbf5f |
 
 Lesson: ten tuning steps moved the board 3%; removing repeated work (84 query passes,
 candidate re-reads) moved it 39%. Every Track B board run is a correct build; no probes were
@@ -24,40 +24,41 @@ cache, cgroup `memory.peak`) on an i7-14650HX laptop, with T the mean of the mid
 runs. The laptop was shared with other jobs, so its absolute timings drift by ±15% or more from
 hour to hour. Every decision under about 10% was therefore made from interleaved A/B runs of the
 two builds (median of 7 to 9 runs each, plus the cgroup's CPU time), and those numbers are given
-per step. Compare a step's A/B with its parent, not its local T with another row's. M is in MB
-of 2^20 bytes throughout, as the cgroup and the board report it.
+per step. Compare a step's A/B with its parent, not its local T with another row's. Board M is in
+MB of 10^6 bytes (the board reports the cgroup's `memory.peak` bytes / 10^6); local memory
+figures come from the bench's KiB / 1024 and are in MiB.
 
 Points are 50 × log10(K), which reproduces the board's figures (K 25.45 is 70.29 points, K 25.25
-is 70.11, up to the rounding of K). Rows 7 and 10 ("≈ … (computed)"), row 12 (from its board K of 25.26)
-and row 14 (from the median K of its three runs, 25.46) were worked out from K; the other points
-are read off the board.
+is 70.11, up to the rounding of K). Rows 7 and 10 ("≈ … (computed)"), row 12 (from its board K of 25.26),
+row 14 (the median K of its three runs, 25.46) and row 15 (the median of 25.54 and 25.12) were
+worked out from K; the other points are read off the board.
 
-| Step | Change | Run ID | T (s) | M (MB) | Points |
+| Step | Change | Run ID | T (s) | M (MB; local MiB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged (board reference figures) | | 56.35 | 2,200 | 0 |
 | 1 | Rust, no crates. Query terms only, in one hash table. Corpus memory-mapped and cut into 3 MB blocks for 12 threads. A 4,096-document index per batch (sparse `u16` lists, plus bitmaps for terms seen in more than 64 documents), every query answered per batch, answers merged under a per-query mutex. Phrases verified by re-tokenizing each candidate document. | | 0.325 (local) | 58 (local) | |
 | 2 | Phrases verified around occurrences of the longest term instead of re-tokenizing the whole document (phrase work was about 100 ms of 300 per thread). Per-batch presence bitset, so absent terms resolve from L1. Query steps in one flat array. Token lookups hashed and prefetched one document at a time, then resolved. | | 0.235 (local) | 55 (local) | |
 | 3 | Bitmask lexer: 64 bytes per step with AVX2, events visited by trailing-zero count instead of a byte-at-a-time loop that mispredicted at every token boundary. AVX2 first/last-byte search for phrase anchors. One state word per term (dense slot or last document) instead of two arrays. | | 0.200 (local) | 55 (local) | |
 | 4 | Dense bitmaps written transposed during the scan (one L1-resident stretch per 64 documents) and transposed back per batch. Term state words prefetched between resolving and recording. Small BOOL results kept as sorted lists. A/B against step 3: 176 vs 185 ms. **This is v1.** | run-7450e3d4343b (rerun run-67ffb0644a3e: 0.3061 s) | 0.3091 | 59.7 | 64.3 |
-| 5 | A worker's first batch is a 512-document warm-up. Until a worker has seen a batch, every term is still a list, and twelve full all-list batches at once set the memory peak; the promotion threshold scales with the batch size. Output buffer cut from 1 MB to 64 KB. A/B: 183 vs 198 ms, CPU 1,855 vs 1,925 ms, M 50.9 vs 56.1 MB. Transparent huge pages were then switched off with `prctl`. On the board, v2 and v3 show box M ≈ local M, so THP was not inflating Track B's memory much (unlike Tracks A and D). | | 0.183 (local) | 51 (local) | |
+| 5 | A worker's first batch is a 512-document warm-up. Until a worker has seen a batch, every term is still a list, and twelve full all-list batches at once set the memory peak; the promotion threshold scales with the batch size. Output buffer cut from 1 MB to 64 KB. A/B: 183 vs 198 ms, CPU 1,855 vs 1,925 ms, M 50.9 vs 56.1 MiB. Transparent huge pages were then switched off with `prctl`. On the board, v2 and v3 show box M ≈ local M, so THP was not inflating Track B's memory much (unlike Tracks A and D). | | 0.183 (local) | 51 (local) | |
 | 6 | Query parse in two passes: parse every line first, then insert the 155,000 words into a table pre-sized from the word count, prefetching the slot of the word 16 places ahead. The serial parse had been waiting on a cache miss per insert and per rehash. A/B: 179.5 vs 183.9 ms, CPU 1,800 vs 1,845 ms. | | 0.180 (local) | 52 (local) | |
 | 7 | BOOL accumulator simplified back to borrowed term or scratch bitmap: OR/NOT apply a list's bits directly, AND spreads it into a mask. It is faster than the step-4 sorted-list accumulator and 50 lines shorter. A/B: 184 vs 192 ms, CPU 1,832 vs 1,888 ms. **This is v2.** | run-43f854129993 | 0.3157 | 52.5 | ≈ 64.7 (computed) |
-| 8 | Term table slots shrunk from 24 to 16 bytes (first 12 bytes of the term inline, id and length packed into one word; longer terms are confirmed against their text), so four slots share a cache line and the table is 2 MB instead of 3. A/B against v2: 207.8 vs 215.0 ms, CPU 1,986 vs 2,008 ms, M 0.7 MB lower: a small win, within noise. (The local T of 0.20 looks worse than step 7's only because it was measured on a busier machine.) | | 0.20 (local) | 51 (local) | |
-| 9 | Dense bits written into a one-word-per-term stripe for the current 64 documents and flushed into the bitmaps every 64 documents, instead of into a full transposed copy of every bitmap. It stays as L1-friendly as step 4, drops a ~770 KB buffer per thread and the per-batch transpose. A/B: M 38.7 vs 50.9 MB, 194 vs 202 ms median, CPU 1,956 vs 1,897 ms (within noise). M is now under the 44 MB cap of the memory axis. | | 0.19 (local) | 40 (local) | |
+| 8 | Term table slots shrunk from 24 to 16 bytes (first 12 bytes of the term inline, id and length packed into one word; longer terms are confirmed against their text), so four slots share a cache line and the table is 2 MB instead of 3. A/B against v2: 207.8 vs 215.0 ms, CPU 1,986 vs 2,008 ms, M 0.7 MiB lower: a small win, within noise. (The local T of 0.20 looks worse than step 7's only because it was measured on a busier machine.) | | 0.20 (local) | 51 (local) | |
+| 9 | Dense bits written into a one-word-per-term stripe for the current 64 documents and flushed into the bitmaps every 64 documents, instead of into a full transposed copy of every bitmap. It stays as L1-friendly as step 4, drops a ~770 KB buffer per thread and the per-batch transpose. A/B: M 38.7 vs 50.9 MiB, 194 vs 202 ms median, CPU 1,956 vs 1,897 ms (within noise). M is now under the 44 MB cap of the memory axis. | | 0.19 (local) | 40 (local) | |
 | 10 | Line count, no behaviour change: `query.rs` folded into `main.rs`, `Answer::merge` reduced to a sort of at most 20 ids. S down 7 lines, to 993 as the board counts it. **This is v3.** | run-d53081aa4120 (reruns run-4f979d5ac144: 0.3021 s, 39.7 MB; run-a5f9c82b0e45: 0.3070 s) | 0.3035 | 39.1 | ≈ 65.9 (computed) |
 | 11 | Clean-room redesign, adopted whole (see "v4" below): phrases checked during the scan against each document's token ids, so they need no index; postings built once per 8 MB segment; BOOL queries answered once per segment instead of once per batch; corpus read with `pread`; parallel query parse into a lock-free table. Board: 184.3 vs ~302 ms, K 25.45 vs 20.87; S 993 → 1,364. **This is v4.** | run-64a666bd15fb | 0.1843 | 35.8 | 70.29 |
 | 12 | Provable safety for any valid input (see "v4.1" below): segments bisected so none holds more than 65,536 documents; the term table sized from an estimate with a fallback (reverted in step 13); insert prefetch; S 1,347. Within noise of v4; a half-size table (run-0778bc8cbf5f: 0.1932 s, 35.3 MB) too. **This is v4.1.** | run-1ca61642aede | 0.1906 | 37.0 | 70.12 |
 | 13 | Clarity: v4.1's estimate, probe limit, fallback table and `calloc` dropped (table size is not a lever, and the table sized for every word can never fill up); start-up moved into `query::Setup`. S 1,317. | run-d4d593bc34cf | 0.1896 | 36.6 | 70.11 |
-| 14 | As submitted: static linking (`+crt-static`), revised comments and messages, and a simplification pass (S 1,316 → 1,269, the insert prefetch removed); output byte-identical on seeds 1, 7, 101 and 202. Three board runs (0.1887, 0.1876, 0.1886 s; median shown). After them: optional `[data] [out]` arguments, error messages with positions, `--locked`; output unchanged. **This is v4.2, the final version.** | run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5 | 0.1886 | 36.2 | 70.29 |
-| 15 | The judge-review error paths on top of step 14, same output: input errors name their byte offset, document id or line span; query lines in messages are quoted and cut to 80 bytes; a failed write removes the partial results.txt; optional `[data] [out]` arguments; `--locked`. S 1,269 → 1,299. **As submitted (701dd4f).** | run-3ae92ad95108 | 0.1860 | 36.1 | 70.36 |
+| 14 | v4.2 before the error-path round: static linking (`+crt-static`), revised comments, and a simplification pass (S 1,316 → 1,269, the insert prefetch removed); output byte-identical on seeds 1, 7, 101 and 202. Three board runs (0.1887, 0.1876, 0.1886 s; median shown). | run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5 | 0.1886 | 36.2 | 70.29 |
+| 15 | Errors for unseen input: every input error names its byte offset, document id or line span; query lines in messages are quoted and cut to 80 bytes; a failed write removes the partial results.txt; optional `[data] [out]` arguments; `--locked`. S rose from 1,269 to 1,299 only for this, so that a holdout the program cannot handle fails loudly and says where; output is unchanged. Two board runs (0.1860, 0.1923 s; median shown). **This is v4.2 as submitted (701dd4f).** | run-3ae92ad95108, run-f30168793c18 | 0.1892 | 36.1 | 70.18 |
 
 **What the board says.** Board T stayed at 302-316 ms from v1 to v3: the local gains of
 steps 5-10 (a few percent each in A/B) are within the board's run-to-run spread. The board win
 was memory: 59.7 MB → 39.1 MB, which puts the memory axis at its cap.
 
 v2 against v1, interleaved on a quiet machine (9 runs each): 181.3 vs 183.2 ms median, CPU 1,815
-vs 1,808 ms, M 51.9 vs 56.4 MB. v3 against v2, interleaved (9 runs each, busy machine): 223 vs
-239 ms median, CPU 2,215 vs 2,361 ms, M 38.6 vs 51.4 MB.
+vs 1,808 ms, M 51.9 vs 56.4 MiB. v3 against v2, interleaved (9 runs each, busy machine): 223 vs
+239 ms median, CPU 2,215 vs 2,361 ms, M 38.6 vs 51.4 MiB.
 
 We measured memory before cutting it. The cgroup's `memory.stat` after the run shows about 48 MB
 anonymous, about 1.3 MB kernel, 0.8 MB page tables and **0 bytes of file pages**, even after
@@ -163,12 +164,12 @@ Local figures are from `bench/bench.sh b` or a dev runner with the same cpuset; 
 
 | Step | Change | Local T | M |
 |---|---|---|---|
-| a | First correct build, 16 MB segments | 121-127 ms | 54.6 MB |
-| b | Scanner arrays grown on demand instead of zero-filled to a worst-case size (9.4 MB across 12 threads); dense term ids instead of table-slot ids (the seen bitset shrinks from 32 to 9.5 KB per thread, per-partition metadata from 2 MB to 0.6 MB) | 118-135 ms | 44.3-44.8 MB |
-| c | 8 MB segments: chunk streams and postings halve. Eval cost hardly depends on the segment size (15.7% of CPU at 8 MB, 14.0% at 32 MB) | 125-132 ms | 35.0-36.1 MB |
+| a | First correct build, 16 MB segments | 121-127 ms | 54.6 MiB |
+| b | Scanner arrays grown on demand instead of zero-filled to a worst-case size (9.4 MB across 12 threads); dense term ids instead of table-slot ids (the seen bitset shrinks from 32 to 9.5 KB per thread, per-partition metadata from 2 MB to 0.6 MB) | 118-135 ms | 44.3-44.8 MiB |
+| c | 8 MB segments: chunk streams and postings halve. Eval cost hardly depends on the segment size (15.7% of CPU at 8 MB, 14.0% at 32 MB) | 125-132 ms | 35.0-36.1 MiB |
 | d | Eval: no lookups once an AND or NOT has emptied the result; a dense first term filters the list instead of merging with it | eval CPU 257 to 246 ms | |
 | e | Eval: AND/NOT of two lists through an L1 mask (`sift`) instead of a branch-free merge, whose steps depend on each other | 103-112 ms; eval CPU 246 to ~190 ms | |
-| f | Scan: local slices instead of fields (no reloads of vector headers after every store, fewer bounds checks), token ids per region instead of a per-document vector, a dummy id for misses so recording a token is branch-free | 101-106 ms; scan CPU ~880 to ~820 ms | 35.4-36.1 MB |
+| f | Scan: local slices instead of fields (no reloads of vector headers after every store, fewer bounds checks), token ids per region instead of a per-document vector, a dummy id for misses so recording a token is branch-free | 101-106 ms; scan CPU ~880 to ~820 ms | 35.4-36.1 MiB |
 
 CPU split of step f (sum over 12 threads, about 1.2 s): scan ~820 ms, eval ~190, build ~75,
 waiting ~10; the parallel query parse takes 5.5-6.4 ms of wall time before the scan starts.
@@ -194,7 +195,7 @@ Prefetch batch size and hint, the table's size and first probe, the union thresh
   83. The two extra per-token list writes cost about what the skipped postings and sort saved. Dropped.
 - **Fewer page faults, on the board** (next3). Reads tokenized in 16 KB runs of whole lines, so the
   per-token arrays shrink from ~340 to ~40 KB per thread; `queries.txt` read without a growth copy;
-  output buffers pre-sized. Minor faults 9.5k → 8.2k and M 36 → 31.6 MB, but 190.8 ms
+  output buffers pre-sized. Minor faults 9.5k → 8.2k and board M 36.1 → 31.6 MB, but 190.8 ms
   (run-f833acb4171c, K 25.13), the same as v4.2, and M already scored its cap. Not adopted.
 - **Term table size, on the board.** Two v4.1 builds that differ only in the table: room for 1.5
   times the estimated distinct terms (2 MB, load 0.58; run-0778bc8cbf5f, 193.2 ms, 35.3 MB) and

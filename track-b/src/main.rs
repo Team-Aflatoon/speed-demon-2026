@@ -117,16 +117,16 @@ struct Shared<'a> {
 }
 
 fn run(data: &str, out_dir: &str) {
-    let mut queries = std::fs::read(format!("{data}/queries.txt"))
-        .unwrap_or_else(|e| fail(&format!("queries.txt: {e}")));
+    let (query_path, docs_path) = (format!("{data}/queries.txt"), format!("{data}/docs.txt"));
+    let mut queries =
+        std::fs::read(&query_path).unwrap_or_else(|e| fail(&format!("{query_path}: {e}")));
     if queries.len() >= MAX_QUERY_BYTES {
-        fail("queries.txt is larger than 1 GB");
+        fail(&format!("{query_path} is larger than 1 GB"));
     }
     queries.extend_from_slice(&[0; QUERY_PAD]);
     let queries = &queries[..];
-    let file =
-        File::open(format!("{data}/docs.txt")).unwrap_or_else(|e| fail(&format!("docs.txt: {e}")));
-    let segments = plan(&file);
+    let file = File::open(&docs_path).unwrap_or_else(|e| fail(&format!("{docs_path}: {e}")));
+    let segments = plan(&file, &docs_path);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS);
@@ -180,12 +180,12 @@ fn many<T: Default>(n: usize) -> Vec<T> {
 
 /// Cuts `docs.txt` into segments at line starts, of about `SEGMENT_BYTES`
 /// and at most `MAX_SEGMENT_DOCS` documents.
-fn plan(file: &File) -> Vec<Segment> {
+fn plan(file: &File, path: &str) -> Vec<Segment> {
     let meta = file.metadata();
-    let len = meta.map_or_else(|e| fail(&format!("docs.txt: {e}")), |m| m.len());
+    let len = meta.map_or_else(|e| fail(&format!("{path}: {e}")), |m| m.len());
     let mut last = [0u8; 1];
     if len > 0 && (read_full(file, &mut last, len - 1) != 1 || last[0] != b'\n') {
-        fail("docs.txt must end with an LF");
+        fail(&format!("{path} must end with an LF"));
     }
     if len == 0 {
         return Vec::new();

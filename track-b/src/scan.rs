@@ -60,9 +60,12 @@ pub struct Scanner<'a> {
 #[derive(Default)]
 struct Doc {
     local: u32,
+    /// Invariant: the region index of the document's first token, so its
+    /// tokens are `ids[first..]` up to the current token.
     first: usize,
     /// The distinct BOOL terms so far: `fresh[..n_fresh]` (sized like `ids`).
     fresh: Vec<u32>,
+    /// Invariant: at most the document's token count, and 0 between documents.
     n_fresh: usize,
     /// Tokens (region indexes) that anchor phrases.
     hits: Vec<u32>,
