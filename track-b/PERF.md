@@ -188,6 +188,12 @@ table lookups 766, + per-document recording 870, + writing the postings 960.
 - `_MM_HINT_T1` instead of `_MM_HINT_T0`: worse.
 - Union-to-bitmap thresholds of 1/32, 1/64 and 1/128 of the documents instead of 1/16: the
   same.
+- **Hot terms straight to bitmaps, on the board.** Terms with a bitmap in segment 0 (179 on seed 1) were
+  flagged hot: the scan set their bits per 64-document row instead of emitting postings, and the build
+  ORed those rows in, cutting postings from ~21.1M to ~13.6M pairs. Correct on every check, but the
+  box measured 197.2 ms (run-ff23bf5cc8f4, 38.3 MB, K 24.66) against v4.2's 184-193 ms, and S rose by
+  83. The two extra per-token list writes cost about what the skipped postings and sort saved. Dropped.
+  The simplified v4.2 itself ran 188.7 ms, 36.0 MB, K 25.45 on the board (run-6a7f77612f9d).
 - **Term table size, on the board.** Two v4.1 builds that differ only in the table: room for 1.5
   times the estimated distinct terms (2 MB, load 0.58; run-0778bc8cbf5f, 193.2 ms, 35.3 MB) and
   3 times (4 MB, load 0.29; run-1ca61642aede, 190.6 ms, 37.0 MB). Both are within the board's
