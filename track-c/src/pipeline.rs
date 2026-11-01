@@ -1,7 +1,6 @@
-//! The parallel engine: the workers split regions.csv, then all of
+//! The parallel engine: the first workers split regions.csv, then all of
 //! them claim chunks of records.csv until none are left. All shared state
-//! (the region map, the name table and its pair bitset) is lock-free but
-//! for names over 24 bytes (see `Names`), and
+//! (the region map, the name table and its pair bitset) is lock-free, and
 //! no worker ever waits on another's progress except for regions.csv at the
 //! start. Each worker keeps its own aggregates, summed at the end.
 //!
@@ -18,6 +17,9 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::thread::{self, Scope};
 
+/// The most workers that fault in the name tables: one per 2 MiB stretch of
+/// them (see `map::touch`).
+const TOUCHERS: usize = 4;
 /// Stack size for workers, which need about 40 KiB.
 const STACK: usize = 256 << 10;
 /// Bytes read past a chunk's nominal end to find its real end, at first
@@ -66,7 +68,7 @@ pub fn run(
     regions: (&Regions, Mapped),
 ) -> Result<Vec<Agg>, Fail> {
     let ((file, len), piece) = (records, piece.max(1));
-    let names = Names::new(slots).unwrap_or_else(|e| die(&format!("memory: {e}")));
+    let names = Names::new(slots, len).unwrap_or_else(|e| die(&format!("memory: {e}")));
     let chunks = len.div_ceil(piece).max(1);
     let quotes = (0..chunks).map(|_| AtomicU64::new(0)).collect();
     let (next, fail) = (AtomicUsize::new(0), AtomicU8::new(0));
@@ -80,18 +82,24 @@ pub fn run(
         quotes,
         fail,
     };
-    let (waiting, total) = (
-        AtomicUsize::new(threads),
-        Mutex::new(vec![Agg::EMPTY; GROUPS]),
-    );
+    // Before records start, the first workers fault in the name tables (see
+    // `Names::touch`) while the others split regions.csv; one worker alone
+    // does both.
+    let touchers = (threads / 3).clamp(1, TOUCHERS);
+    let parsers = (threads - touchers).max(1);
+    let waiting = AtomicUsize::new(touchers + parsers);
+    let total = Mutex::new(vec![Agg::EMPTY; GROUPS]);
     let work = |t: usize| {
-        // Before records start, each worker faults in its share of the name
-        // tables (see `Names::touch`) and parses its share of regions.csv.
-        shared.names.touch(t, threads);
-        if let Err(e) = regions.0.parse(regions.1, t, threads) {
-            die(e);
+        if t < touchers {
+            shared.names.touch(t, touchers);
+            waiting.fetch_sub(1, Release);
         }
-        waiting.fetch_sub(1, Release);
+        if let Some(part) = t.checked_sub(touchers).or((threads == 1).then_some(0)) {
+            if let Err(e) = regions.0.parse(regions.1, part, parsers) {
+                die(e);
+            }
+            waiting.fetch_sub(1, Release);
+        }
         // Yield rather than spin, so that a crowded machine can run the
         // workers still parsing; on a quiet one this returns at once.
         while waiting.load(Acquire) > 0 {

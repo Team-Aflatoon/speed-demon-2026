@@ -3,7 +3,7 @@
 //! order of first appearance, and are listed in code order at the end.
 
 use crate::map::Mapped;
-use crate::records::number;
+use crate::records::uint;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Mutex;
 
@@ -33,15 +33,8 @@ impl Regions {
         if !b.starts_with(HEADER) || b[len - 1] != b'\n' {
             return Err("regions.csv: bad header, or no LF at the end");
         }
-        let last = b[..len - 1]
-            .iter()
-            .rposition(|&c| c == b'\n')
-            .map_or(0, |i| i + 1);
-        let comma = b[last..len]
-            .iter()
-            .position(|&c| c == b',')
-            .map_or(last, |i| last + i);
-        let max = number(b, last, comma).unwrap_or(0) as usize;
+        let last = b[..len - 1].iter().rposition(|&c| c == b'\n');
+        let max = uint(b, last.map_or(0, |i| i + 1)).map_or(0, |(id, _)| id as usize);
         if max > MAX_ID {
             return Err("regions.csv: ids over 100,000,000 (the spec's are below 1,000,000)");
         }
@@ -76,8 +69,7 @@ impl Regions {
         };
         let (mut p, end) = (start(t), start(t + 1));
         while p < end {
-            let q = p + b[p..end].iter().position(|&c| c == b',').unwrap_or(end - p);
-            let id = number(b, p, q).ok_or("regions.csv: bad region id")?;
+            let (id, q) = uint(b, p).ok_or("regions.csv: bad region id")?;
             let code = &b[q + 1..q + 4];
             if b[q] != b',' || b[q + 4] != b'\n' || !code.iter().all(u8::is_ascii_uppercase) {
                 return Err("regions.csv: bad line");
