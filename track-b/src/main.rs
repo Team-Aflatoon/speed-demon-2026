@@ -2,7 +2,7 @@
 //! `/data/queries.txt` over `/data/docs.txt` and writes `/out/results.txt`.
 //!
 //! The queries are read first, so only their terms are ever indexed. The
-//! corpus is cut into segments of about 8 MB, each into chunks of 512 KB, and
+//! corpus is cut into segments of about 12 MB, each into chunks of 512 KB, and
 //! twelve threads run one queue of tasks, in this order:
 //!
 //! - scan (per chunk): tokenize, look every token up in the term table, emit
@@ -29,12 +29,12 @@ use index::{Answer, Evaluator, Part, PARTS};
 use query::{Parsed, Setup, Table, MAX_QUERY_BYTES, PHRASE, QUERY_PAD, RANGE_SHIFT};
 use scan::{parse_id, read_full, ChunkOut, Scanner, MAX_SEGMENT_DOCS};
 use std::fs::File;
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 const MAX_THREADS: usize = 12;
-const SEGMENT_BYTES: u64 = 8 << 20;
+const SEGMENT_BYTES: u64 = 12 << 20;
 const CHUNK_BYTES: u64 = 512 << 10;
 
 /// Ranges are named by `range << RANGE_SHIFT` in a u32 (see `query.rs`).
@@ -50,6 +50,9 @@ fn main() {
     run(arg(1, "/data"), arg(2, "/out"));
 }
 
+/// The path of `results.txt`, once it is created.
+static OUT: OnceLock<String> = OnceLock::new();
+
 /// Prints `msg` and exits with status 1. Every input and I/O error ends here.
 /// `exit` must not run on two threads at once, so only the first caller
 /// reports; any other thread that fails meanwhile waits for the exit.
@@ -60,12 +63,23 @@ pub fn fail(msg: &str) -> ! {
             std::thread::park();
         }
     }
+    if let Some(out) = OUT.get() {
+        let _ = std::fs::remove_file(out); // no partial results.txt
+    }
     eprintln!("track-b: {msg}");
     std::process::exit(1)
 }
 
 extern "C" {
     fn prctl(option: i32, ...) -> i32;
+    pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+}
+
+/// Starts loading the cache line at `p`, so misses can overlap.
+#[inline(always)]
+pub fn prefetch<T>(p: *const T) {
+    // SAFETY: a prefetch is only a hint; it never faults or changes memory.
+    unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast()) }
 }
 
 /// Turns transparent huge pages off for this process, so partly used 2 MB
@@ -112,7 +126,11 @@ struct Shared<'a> {
     parts: Vec<RwLock<Part>>,
     bool_answers: Vec<Mutex<Vec<Answer>>>,
     phrase_answers: Vec<Mutex<Vec<Answer>>>,
-    lines: Vec<Mutex<Vec<u8>>>,
+    /// `results.txt`, which the format tasks write in range order: range `r`
+    /// takes `out_at` once `formatted` reaches `r`, and moves it on.
+    out: File,
+    out_at: AtomicU64,
+    formatted: AtomicU32,
     scanned: Vec<AtomicU32>,
     built: Vec<AtomicU32>,
     evaluated: Vec<AtomicU32>,
@@ -120,31 +138,41 @@ struct Shared<'a> {
 
 fn run(data: &str, out_dir: &str) {
     let (query_path, docs_path) = (format!("{data}/queries.txt"), format!("{data}/docs.txt"));
-    let queries = read_queries(&query_path);
-    let queries = &queries[..];
+    let queries = map_queries(&query_path);
     let file = File::open(&docs_path).unwrap_or_else(|e| fail(&format!("{docs_path}: {e}")));
+    let out_path = format!("{out_dir}/results.txt");
+    let out = File::create(&out_path).unwrap_or_else(|e| fail(&format!("{out_path}: {e}")));
+    let _ = OUT.set(out_path);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS);
     let setup = Setup::new(queries, threads);
+    // Before any other thread starts: while the kernel maps the table's pages
+    // it holds up their starts and their allocations.
+    setup.make_table(setup.count_words());
     let parsed: Vec<OnceLock<Parsed>> = many(threads);
     // Set by this thread while the workers parse the queries.
     let shared: OnceLock<Shared> = OnceLock::new();
     std::thread::scope(|s| {
-        for i in 0..threads {
-            let (shared, setup, parsed) = (&shared, &setup, &parsed);
-            s.spawn(move || {
-                let (mine, table) = setup.run(i);
-                let shared = shared.wait();
-                *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
-                *shared.phrase_answers[i].lock().unwrap() =
-                    vec![Answer::default(); mine.term_ends.len()];
-                let _ = parsed[i].set(mine);
-                setup.wait();
-                let parsed: Vec<&Parsed> = parsed.iter().map(|p| p.get().unwrap()).collect();
-                work(shared, table, queries, &parsed);
-            });
-        }
+        let worker = |i: usize| {
+            let (mine, table) = setup.run(i);
+            let shared = shared.wait();
+            *shared.bool_answers[i].lock().unwrap() = vec![Answer::default(); mine.ends.len()];
+            *shared.phrase_answers[i].lock().unwrap() =
+                vec![Answer::default(); mine.term_ends.len()];
+            let _ = parsed[i].set(mine);
+            setup.wait();
+            let parsed: Vec<&Parsed> = parsed.iter().map(|p| p.get().unwrap()).collect();
+            work(shared, table, queries, &parsed);
+        };
+        // Starting a thread takes about 0.1 ms, so this thread and worker 0
+        // start half of them each.
+        let half = threads.div_ceil(2);
+        s.spawn(move || {
+            (half..threads).for_each(|i| drop(s.spawn(move || worker(i))));
+            worker(0);
+        });
+        (1..half).for_each(|i| drop(s.spawn(move || worker(i))));
         let segments = plan(&file, &docs_path);
         let (n, max_chunks) = (segments.len(), segments.iter().map(|s| s.chunks).max());
         let _ = shared.set(Shared {
@@ -156,42 +184,59 @@ fn run(data: &str, out_dir: &str) {
             parts: many(PARTS),
             bool_answers: many(threads),
             phrase_answers: many(threads),
-            lines: many(threads),
+            out,
+            out_at: AtomicU64::new(0),
+            formatted: AtomicU32::new(0),
             scanned: many(n),
             built: many(n),
             evaluated: many(n),
             segments,
         });
     });
-    let shared = shared.get().unwrap();
-    let out = format!("{out_dir}/results.txt");
-    let mut file = File::create(&out).unwrap_or_else(|e| fail(&format!("{out}: {e}")));
-    for lines in &shared.lines {
-        if let Err(e) = file.write_all(&lines.lock().unwrap()) {
-            let _ = std::fs::remove_file(&out); // no partial results.txt
-            fail(&format!("{out}: {e}"));
-        }
-    }
 }
 
-/// `queries.txt` and `QUERY_PAD` zero bytes, read into a buffer with room
-/// for both (appending to an exact-size one would copy the whole file).
-fn read_queries(path: &str) -> Vec<u8> {
-    use std::io::Read;
-    let mut file = File::open(path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
-    let len = file.metadata().map_or(0, |m| m.len() as usize);
-    if len >= MAX_QUERY_BYTES {
+/// `queries.txt` mapped read-only, and `QUERY_PAD` zero bytes after it: the
+/// file is mapped over a zeroed anonymous mapping a page longer, so the
+/// bytes past its end read as zero. Mapping its cached pages costs far less
+/// than copying it into a fresh buffer, whose every page faults. Never
+/// unmapped.
+fn map_queries(path: &str) -> &'static [u8] {
+    use std::os::fd::AsRawFd;
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_POPULATE: i32 = 0x8000;
+    let file = File::open(path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+    let len = file
+        .metadata()
+        .map_or_else(|e| fail(&format!("{path}: {e}")), |m| m.len());
+    if len >= MAX_QUERY_BYTES as u64 {
         fail(&format!("{path} is larger than 1 GB"));
     }
-    let mut queries = Vec::with_capacity(len + QUERY_PAD);
-    if let Err(e) = file.read_to_end(&mut queries) {
-        fail(&format!("{path}: {e}"));
+    let (len, span) = (len as usize, (len as usize).div_ceil(4096) * 4096 + 4096);
+    let flags = MAP_PRIVATE | MAP_FIXED | MAP_POPULATE;
+    let failed = |p: *mut u8| p as isize == -1;
+    // SAFETY: new mappings at an address of the kernel's choosing (the file
+    // over the start of the anonymous one) touch no memory of ours.
+    unsafe {
+        let base = mmap(
+            std::ptr::null_mut(),
+            span,
+            PROT_READ,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if failed(base)
+            || (len > 0 && failed(mmap(base, len, PROT_READ, flags, file.as_raw_fd(), 0)))
+        {
+            fail(&format!("{path}: cannot map {len} bytes"));
+        }
+        // SAFETY: `span >= len + QUERY_PAD` readable bytes, never unmapped;
+        // the inputs are read-only, so the file does not change under it.
+        std::slice::from_raw_parts(base, len + QUERY_PAD)
     }
-    if queries.len() >= MAX_QUERY_BYTES {
-        fail(&format!("{path} is larger than 1 GB"));
-    }
-    queries.extend_from_slice(&[0; QUERY_PAD]);
-    queries
 }
 
 /// `n` default values (locks, counters).
@@ -391,15 +436,20 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 }
                 let bools = sh.bool_answers[r].lock().unwrap();
                 let phrases = sh.phrase_answers[r].lock().unwrap();
-                let out = &mut sh.lines[r].lock().unwrap();
-                // A line is at most 11 numbers of up to 20 digits; most are far
-                // shorter, so this only saves the regrowth copies.
-                out.reserve(32 * parsed[r].order.len());
+                // The read buffer is no longer needed, and its pages are mapped.
+                let out = scanner.out_buf();
                 for &entry in &parsed[r].order {
                     match entry & PHRASE {
                         0 => bools[entry as usize].write(out),
                         _ => phrases[(entry & !PHRASE) as usize].write(out),
                     }
+                }
+                wait(&sh.formatted, r); // the ranges before this one took their bytes
+                let at = sh.out_at.load(Acquire);
+                sh.out_at.store(at + out.len() as u64, Release);
+                sh.formatted.fetch_add(1, Release);
+                if let Err(e) = sh.out.write_all_at(out, at) {
+                    fail(&format!("{}: {e}", OUT.get().unwrap()));
                 }
                 continue;
             }
