@@ -314,13 +314,18 @@ fn schedule(segments: &[Segment], ranges: usize) -> Vec<Task> {
 const AHEAD: usize = 4;
 
 /// Waits until `count` reaches `n`; the Acquire pairs with the Release of
-/// the tasks that counted themselves done, so their writes are visible. It
-/// spins with `PAUSE`, which leaves the core to its other hardware thread:
-/// every hardware thread runs one worker, so there is nothing to yield to,
-/// and a `sched_yield` per turn would only cost the sibling thread time.
+/// the tasks that counted themselves done, so their writes are visible.
+/// Most waits are short, so it first spins with `PAUSE`, which leaves the
+/// core to its other hardware thread, and only then yields to the kernel.
 fn wait(count: &AtomicU32, n: usize) {
-    while (count.load(Acquire) as usize) < n {
-        std::hint::spin_loop();
+    for spins in 0.. {
+        if count.load(Acquire) as usize >= n {
+            return;
+        }
+        match spins < 2000 {
+            true => std::hint::spin_loop(),
+            false => std::thread::yield_now(),
+        }
     }
 }
 
