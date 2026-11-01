@@ -116,13 +116,15 @@ impl<'a> Parser<'a> {
         if b[end] == b'\n' && b[end - 1] == b'\r' {
             return Err(end - 1);
         }
-        self.quotes.resize(self.quotes.len().max(end / 64 + 2), [0; 2]);
+        let blocks = self.quotes.len().max(end / 64 + 2);
+        self.quotes.resize(blocks, [0; 2]);
         let (mut at, mut carry) = ((start, 0), 0);
         self.state = [0; 2];
         for window in (start & !63..end).step_by(WINDOW) {
             let last = (window + WINDOW).min(end);
             // SAFETY: main checked that the CPU has PCLMULQDQ.
-            let (n, records) = unsafe { self.scan(b, [window, last + usize::from(last == end)], carry) };
+            let span = [window, last + usize::from(last == end)];
+            let (n, records) = unsafe { self.scan(b, span, carry) };
             // Five separators a record, and at most four commas of the next.
             carry = n.checked_sub(5 * records).filter(|&c| c < 5).ok_or(at.0)?;
             let (table, map) = self.tables;
@@ -135,10 +137,11 @@ impl<'a> Parser<'a> {
             self.seps.copy_within(5 * records..n, 0);
         }
         // `at.0` is one past `end` after a record ended by an added LF.
-        (carry == 0 && at.0.min(end) == end).then_some(self.state[1]).ok_or(at.0)
+        let whole = carry == 0 && at.0.min(end) == end;
+        whole.then_some(self.state[1]).ok_or(at.0)
     }
 
-    /// Makes the masks of the blocks of `b[window..last]`, notes each
+    /// Makes the masks of the blocks of `b[from..last]`, notes each
     /// block's quotes, and lists its separators in `self.seps` after the
     /// `n` there; returns how many there are then, and how many records
     /// they end.
@@ -146,11 +149,11 @@ impl<'a> Parser<'a> {
     /// # Safety
     /// The CPU must have PCLMULQDQ (see `prefix_xor`).
     #[target_feature(enable = "pclmulqdq")]
-    unsafe fn scan(&mut self, b: &[u8], [window, last]: [usize; 2], mut n: usize) -> (usize, usize) {
-        let (first, mut records, state) = (window / 64, 0, &mut self.state);
-        let blocks = (last - window).div_ceil(64);
+    unsafe fn scan(&mut self, b: &[u8], [from, last]: [usize; 2], mut n: usize) -> (usize, usize) {
+        let (first, mut records, state) = (from / 64, 0, &mut self.state);
+        let blocks = (last - from).div_ceil(64);
         for (k, quotes) in self.quotes[first..first + blocks].iter_mut().enumerate() {
-            let o = window + 64 * k;
+            let o = from + 64 * k;
             let [quote, comma, lf] = masks(b, o);
             let inside = prefix_xor(quote) ^ state[0];
             state[0] = ((inside as i64) >> 63) as u64; // bit 63, broadcast
@@ -206,9 +209,11 @@ fn join((table, b, _): Ctx, map: &[AtomicU8], records: &[Record], out: &mut Loca
     for f in records {
         // SAFETY (both): the map has at least one entry (regions sized it),
         // and a name starts within its record.
-        let group = unsafe { map.get_unchecked((f.region as usize).min(map.len() - 1)) }.load(Relaxed);
+        let entry = (f.region as usize).min(map.len() - 1);
+        let group = unsafe { map.get_unchecked(entry) }.load(Relaxed);
         let [id, cents, text] = f.nums;
-        merge(&mut out.aggs[usize::from(group)], &[id, cents, text, cents, cents]);
+        let agg = &mut out.aggs[usize::from(group)];
+        merge(agg, &[id, cents, text, cents, cents]);
         let id = table.find(&f.key, unsafe { b.get_unchecked(f.name as usize..) });
         out.pairs.push(id, group);
     }
@@ -369,7 +374,8 @@ fn digits(words: [u64; 3], lens: [usize; 3]) -> Option<[u64; 3]> {
     unsafe {
         let [w0, w1, w2] = words.map(|w| w as i64);
         let [n0, n1, n2] = lens.map(|n| 64 - 8 * n as i64);
-        let v = _mm256_sub_epi8(_mm256_set_epi64x(0, w2, w1, w0), _mm256_set1_epi8(b'0' as i8));
+        let zero = _mm256_set1_epi8(b'0' as i8);
+        let v = _mm256_sub_epi8(_mm256_set_epi64x(0, w2, w1, w0), zero);
         // The lengths in range: shifts from 0 to 56 bits, the amount's to 32.
         let shifts = _mm256_set_epi64x(0, n2, n1, n0);
         let long = _mm256_cmpgt_epi64(shifts, _mm256_set_epi64x(0, 32, 56, 56));
@@ -377,10 +383,12 @@ fn digits(words: [u64; 3], lens: [usize; 3]) -> Option<[u64; 3]> {
         // (`& 63` changes no count left, but spares the shift its case for
         // counts of 64 or more, which give 0.)
         let shifts = _mm256_and_si256(shifts, _mm256_set1_epi64x(63));
-        let d = _mm256_and_si256(_mm256_sllv_epi64(v, shifts), _mm256_set_epi64x(0, DOT, -1, -1));
-        let ok = _mm256_andnot_si256(bad, _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d));
-        let ten = 10 | 1 << 8;
-        let weights = _mm256_set_epi16(0, 0, 0, 0, ten, 1, ten, ten, ten, ten, ten, ten, ten, ten, ten, ten);
+        let keep = _mm256_set_epi64x(0, DOT, -1, -1);
+        let d = _mm256_and_si256(_mm256_sllv_epi64(v, shifts), keep);
+        let digit = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let ok = _mm256_andnot_si256(bad, digit);
+        let t = 10 | 1 << 8;
+        let weights = _mm256_set_epi16(0, 0, 0, 0, t, 1, t, t, t, t, t, t, t, t, t, t);
         let pairs = _mm256_maddubs_epi16(d, weights);
         let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(100 | 1 << 16));
         let high = _mm256_mul_epu32(fours, _mm256_set_epi64x(0, 1_000, 10_000, 10_000));
@@ -398,5 +406,6 @@ fn digits(words: [u64; 3], lens: [usize; 3]) -> Option<[u64; 3]> {
 #[cold]
 fn number(digits: &[u8]) -> Option<u64> {
     let digits = (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)).then_some(digits)?;
-    Some(digits.iter().fold(0, |v: u64, &d| v.saturating_mul(10).saturating_add(u64::from(d - b'0'))))
+    let step = |v: u64, &d: &u8| v.saturating_mul(10).saturating_add(u64::from(d - b'0'));
+    Some(digits.iter().fold(0, step))
 }

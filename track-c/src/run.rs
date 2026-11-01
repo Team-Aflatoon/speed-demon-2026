@@ -158,7 +158,8 @@ fn read(file: &File, rest: usize, from: usize, piece: usize, buffer: &mut Vec<u8
         let read = file.read_exact_at(&mut buffer[..want], from as u64);
         let b = &buffer[..or_die(read.map(|_| want), "records.csv")];
         // The header line: an optional BOM, then an optional CR before its LF.
-        let header = &"\u{feff}id,name,note,region_id,amount".as_bytes()[3 * usize::from(b.first() != Some(&0xEF))..];
+        let bom = 3 * usize::from(b.first() != Some(&0xEF));
+        let header = &"\u{feff}id,name,note,region_id,amount".as_bytes()[bom..];
         let crlf = usize::from(b.get(header.len()) == Some(&b'\r'));
         let lf = b.starts_with(header) && b.get(header.len() + crlf) == Some(&b'\n');
         let start = match from {
@@ -242,7 +243,8 @@ impl Regions {
         let (mut p, end) = (start(t), start(t + 1));
         while p < end {
             let (line, mut id) = (p, 0);
-            if let Some((value, digits)) = b.get(p..p + 8).and_then(|w| id_of(w.try_into().unwrap())) {
+            let swar = b.get(p..p + 8).and_then(|w| id_of(w.try_into().unwrap()));
+            if let Some((value, digits)) = swar {
                 (id, p) = (value, p + digits);
             }
             while b[p].is_ascii_digit() && id < self.map.len() {
@@ -292,7 +294,8 @@ fn id_of(w: [u8; 8]) -> Option<(usize, usize)> {
     const ONES: u64 = 0x0101_0101_0101_0101;
     let (w, commas) = (u64::from_le_bytes(w), u64::from_le_bytes(w) ^ 0x2C * ONES);
     let n = ((commas.wrapping_sub(ONES) & !commas & 0x80 * ONES).trailing_zeros() / 8) as usize;
-    let digits = (1..8).contains(&n).then(|| (w << (64 - 8 * n) | 0x30 * ONES >> (8 * n)) ^ 0x30 * ONES)?;
+    let low = |n: usize| (w << (64 - 8 * n) | 0x30 * ONES >> (8 * n)) ^ 0x30 * ONES;
+    let digits = (1..8).contains(&n).then(|| low(n))?;
     // Every byte at most 9, then pairs, fours and the eight combined.
     ((digits | digits.wrapping_add(0x76 * ONES)) & 0x80 * ONES == 0).then_some(())?;
     let v = digits.wrapping_mul(10 << 8 | 1) >> 8 & 0x00FF_00FF_00FF_00FF;

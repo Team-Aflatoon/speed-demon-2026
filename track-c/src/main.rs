@@ -113,20 +113,22 @@ extern "C" {
 }
 
 /// `n` values of `T` in a new private mapping, page-aligned and never
-/// unmapped: the first bytes of the file `fd`, copy-on-write (its pages are
+/// unmapped: the first bytes of the file `fd`, read-only (its pages are
 /// already in the page cache, so this costs page-table entries, not copies),
 /// or with `fd` -1 zeroed pages that are only backed by memory once touched.
 ///
 /// # Safety
 /// The bytes must make valid `T`s: zero bytes for a fresh mapping (true for
-/// integers and atomics, the only callers' types), any for `u8`.
+/// integers and atomics, the only callers' types), any for `u8`; and a
+/// file's mapping must never be written.
 pub unsafe fn mapped<T>(n: usize, fd: i32) -> &'static mut [T] {
     // MAP_PRIVATE, and for no file MAP_ANONYMOUS | MAP_NORESERVE (address
     // space without a promise of memory: most of it is never touched).
-    let how = if fd < 0 { 0x02 | 0x20 | 0x4000 } else { 0x02 };
-    // SAFETY: a new readable, writable mapping, which aliases nothing of ours.
+    // PROT_READ | PROT_WRITE without a file, PROT_READ with one.
+    let [how, prot] = if fd < 0 { [0x4022, 3] } else { [0x02, 1] };
+    // SAFETY: a new mapping, which aliases nothing of ours.
     let bytes = (n * size_of::<T>()).max(1);
-    let base = unsafe { mmap(std::ptr::null_mut(), bytes, 3, how, fd, 0) };
+    let base = unsafe { mmap(std::ptr::null_mut(), bytes, prot, how, fd, 0) };
     if base as isize == -1 {
         die(&format!("mmap: {}", std::io::Error::last_os_error()));
     }

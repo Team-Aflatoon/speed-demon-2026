@@ -56,7 +56,8 @@ impl Key {
     /// What a slot holds for this key, in `W`-word slots: the name words,
     /// then `meta` (see `Table`).
     fn slot<const W: usize>(&self) -> [u64; W] {
-        let meta = u64::from(self.tag) | if W == 2 { (self.w[1] ^ mix(self.w[0])) << 8 } else { 0 };
+        let low = (self.w[1] ^ mix(self.w[0])) << 8;
+        let meta = u64::from(self.tag) | if W == 2 { low } else { 0 };
         std::array::from_fn(|j| if j == W - 1 { meta } else { self.w[j] })
     }
 }
@@ -189,9 +190,11 @@ impl Table {
         // SAFETY: the caller's promise.
         let l = unsafe { self.words.get_unchecked(at..at + 8) };
         let metas = [0, 1, 2, 3].map(|j| l[2 * j + 1].load(Acquire));
-        let hit = (0..4).rev().fold(4, |hit, j| if metas[j] == meta { j } else { hit });
+        let first = |hit, j: usize| if metas[j] == meta { j } else { hit };
+        let hit = (0..4).rev().fold(4, first);
         let found = hit < 4 && l[2 * (hit & 3)].load(Relaxed) == w;
-        (if found { hit } else { 4 }, metas.iter().all(|&m| m.wrapping_add(1) > 1))
+        let full = metas.iter().all(|&m| m.wrapping_add(1) > 1);
+        (if found { hit } else { 4 }, full)
     }
 
     /// The id of a name of more than `INLINE` bytes, given as `name`.
@@ -206,7 +209,7 @@ impl Table {
         if lens.len() == huge {
             crate::die("more than 16,384 distinct names over 24 bytes");
         }
-        lens.push(unescaped(name));
+        lens.push((name.len() - name.iter().filter(|&&c| c == b'"').count() / 2) as u64);
         ids.insert(name.into(), short + long + lens.len() - 1);
         short + long + lens.len() - 1
     }
@@ -285,11 +288,12 @@ impl Table {
         // Each id's unescaped name length: its length less half its quote
         // bytes, since inside the delimiting quotes every quote byte is half
         // of a `""`. 0 for an empty slot.
+        let short_slot = |w0: u64, m: u64| [w0, m >> 8 ^ mix(w0), 0, m];
         let lens: [u64; BUCKET] = std::array::from_fn(|j| {
             let (id, word) = (bucket * BUCKET + j, |k: usize| self.words[k].load(Relaxed));
             let j = id.wrapping_sub(short); // a long slot's index, if `id` is one
             let [w0, w1, w2, meta] = match id {
-                _ if id < short => [word(2 * id), word(2 * id + 1) >> 8 ^ mix(word(2 * id)), 0, word(2 * id + 1)],
+                _ if id < short => short_slot(word(2 * id), word(2 * id + 1)),
                 _ if j < long => std::array::from_fn(|k| word(2 * short + 4 * j + k)),
                 _ => return 1 << 32 | huge.as_ref().and_then(|h| h.1.get(j - long)).unwrap_or(&0),
             };
@@ -321,10 +325,6 @@ fn quote_bytes(w: u64) -> u32 {
     (!(((x & LOW7) + LOW7) | x | LOW7)).count_ones()
 }
 
-/// The unescaped length of a quoted field's raw bytes (see `Table::count`).
-fn unescaped(raw: &[u8]) -> u64 {
-    (raw.len() - raw.iter().filter(|&&c| c == b'"').count() / 2) as u64
-}
 
 /// Phase 2's bitset: a bit per (id in a bucket, group).
 pub type Bits = [u64; BUCKET * 256 / 64];
@@ -355,7 +355,8 @@ impl Pairs {
         let blocks = len / 11 / (BLOCK - 2) + buckets + 1;
         let arena: &mut [u16] = unsafe { crate::mapped(blocks * BLOCK, -1) };
         crate::populate(&arena[..touch.min(arena.len())]);
-        Pairs { cur: vec![0; buckets], arena, n: 0 }
+        let cur = vec![0; buckets];
+        Pairs { cur, arena, n: 0 }
     }
 
     #[inline(always)]
@@ -385,7 +386,8 @@ impl Pairs {
             // The next block (another core wrote it) loads while this one is
             // counted.
             let next = (link * BLOCK).wrapping_sub(BLOCK);
-            (crate::prefetch(self.arena, next), crate::prefetch(self.arena, next + 32));
+            crate::prefetch(self.arena, next);
+            crate::prefetch(self.arena, next + 32);
             // Four at a time: a quarter of the loop's instructions were its own.
             let four = self.arena[at + 2..p].chunks_exact(4);
             let rest = four.remainder();
