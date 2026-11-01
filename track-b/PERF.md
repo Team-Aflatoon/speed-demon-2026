@@ -2,10 +2,16 @@
 
 ## Summary
 
-**Final: v4.2 as submitted (step 15).** Board, median of its two runs: 189.2 ms, 36.1 MB, K 25.33
-(run-3ae92ad95108, run-f30168793c18); the reference takes 56.35 s and 2,200 MB.
+**Final: v5 (step 16, commit f3edcde).** Board run run-407d7d7d6411: 125.9 ms, 36.1 MB, K 30.21,
+74.01 points (50 log10 K); the reference takes 56.35 s and 2,200 MB. It won because the v4.2
+scan spent about 120-190 instructions on every token; a branch-free term table (three keys in a
+cache line) and a leaner token loop cut the instructions by 35% and the mispredicts by 53% (see
+"v5" below). Output is byte-identical to v4.2's.
 
-Final repository state (commit eba990a; since 701dd4f only error paths, comments and docs changed, output identical, S 1299): run-9316371871a2, 186.5 ms, 36.6 MB, K 25.51. Three runs of this code: 186.0, 186.5 and 192.3 ms, median 186.5 ms.
+Previous final, v4.2 as submitted (step 15): board, median of its two runs, 189.2 ms, 36.1 MB,
+K 25.33 (run-3ae92ad95108, run-f30168793c18).
+
+v4.2's final repository state (commit eba990a; since 701dd4f only error paths, comments and docs changed, output identical, S 1299): run-9316371871a2, 186.5 ms, 36.6 MB, K 25.51. Three runs of this code: 186.0, 186.5 and 192.3 ms, median 186.5 ms.
 
 | Step | Board T | M | Run |
 |---|---|---|---|
@@ -13,10 +19,13 @@ Final repository state (commit eba990a; since 701dd4f only error paths, comments
 | v2-v3: memory, not time (THP off, bitmap stripes); local CPU gains of 5-10% never showed on the box | ~303 ms | 39.1 MB | run-43f854129993, run-d53081aa4120 |
 | v4 redesign: phrases checked during the scan at a rare anchor chosen by query frequency (no positions, no re-reads); postings once per 8 MB segment; one task queue | 184.3 ms | 35.8 MB | run-64a666bd15fb |
 | v4.1-v4.2: every capacity provable for any valid input; table size changed nothing (4 MB and 2 MB tables) | 190.6 ms; 193.2 ms | 37.0 MB; 35.3 MB | run-1ca61642aede; run-0778bc8cbf5f |
+| v4.2 as submitted: error paths for unseen input, static linking | 189.2 ms (median of 186.0 and 192.3) | 36.1 MB | run-3ae92ad95108, run-f30168793c18 |
+| **v5: a cheaper per-token scan** (branch-free cache-line term table, leaner token loop, token-index document ends, cheaper setup); same design, same output | **125.9 ms** | **36.1 MB** | run-407d7d7d6411 |
 
 Lesson: ten tuning steps moved the board 3%; removing repeated work (84 query passes,
-candidate re-reads) moved it 39%. Every Track B board run is a correct build; no probes were
-run.
+candidate re-reads) moved it 39%. Then, with the design fixed, rewriting the per-token path so
+the compiler could keep it in registers cut the board time by about a third again (v5). Every Track B board run is
+a correct build; no probes were run.
 
 ## Steps
 
@@ -33,7 +42,8 @@ figures come from the bench's KiB / 1024 and are in MiB.
 Points are 50 × log10(K), which reproduces the board's figures (K 25.45 is 70.29 points, K 25.25
 is 70.11, up to the rounding of K). Rows 7 and 10 ("≈ … (computed)"), row 12 (from its board K of 25.26),
 row 14 (the median K of its three runs, 25.46) and row 15 (the median of 25.54 and 25.12) were
-worked out from K; the other points are read off the board.
+worked out from K; the other points are read off the board. Row 16 is one board run: its 74.01
+points are 50 log10 of its K of 30.21.
 
 | Step | Change | Run ID | T (s) | M (MB; local MiB) | Points |
 |---|---|---|---|---|---|
@@ -53,6 +63,7 @@ worked out from K; the other points are read off the board.
 | 13 | Clarity: v4.1's estimate, probe limit, fallback table and `calloc` dropped (table size is not a lever, and the table sized for every word can never fill up); start-up moved into `query::Setup`. S 1,317. | run-d4d593bc34cf | 0.1896 | 36.6 | 70.11 |
 | 14 | v4.2 before the error-path round: static linking (`+crt-static`), revised comments, and a simplification pass (S 1,316 → 1,269, the insert prefetch removed); output byte-identical on seeds 1, 7, 101 and 202. Three board runs (0.1887, 0.1876, 0.1886 s; median shown). | run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5 | 0.1886 | 36.2 | 70.29 |
 | 15 | Errors for unseen input: every input error names its byte offset, document id or line span; query lines in messages are quoted and cut to 80 bytes; a failed write removes the partial results.txt; optional `[data] [out]` arguments; `--locked`. S rose from 1,269 to 1,299 only for this, so that a holdout the program cannot handle fails loudly and says where; output is unchanged. Two board runs (0.1860, 0.1923 s; median shown). **This is v4.2 as submitted (701dd4f).** | run-3ae92ad95108, run-f30168793c18 | 0.1892 | 36.1 | 70.18 |
+| 16 | v5 (see "v5: a cheaper per-token scan" below): term table of three-key buckets probed branch-free; per-token loop in two passes (key and prefetch, then look up and record); document ends found by token index in the lexer; document-local scratch; galloping union and prefetched term entries in eval; cheaper setup. Local: instructions 9,554 M to 6,172 M (-35%), mispredicts -53%, CPU -34%. S 1,299 to 1,562. **This is v5 (f3edcde).** | run-407d7d7d6411 | 0.1259 | 36.1 | 74.01 |
 
 **What the board says.** Board T stayed at 302-316 ms from v1 to v3: the local gains of
 steps 5-10 (a few percent each in A/B) are within the board's run-to-run spread. The board win
@@ -247,3 +258,142 @@ too. v4.2 was also checked on the audit seeds 101 and 202 and by a 100-run repea
   written.
 - Memory was found by accounting, not guessing: printing every buffer's capacity showed zero-
   filled worst-case scratch arrays and slot-indexed per-term arrays as the two big items.
+
+## v5: a cheaper per-token scan
+
+v4.2 sat at 184-193 ms on the board, and its time had tracked local CPU (about local CPU x 1.9 /
+12). The design was not the limit any more: the scan ran at about 120-190 instructions per
+token. Cachegrind showed most of them in bounds checks, iterator plumbing and register spills,
+and a branch mispredict on about half the tokens inside the table probe. v5 keeps the v4
+design (queries first into a lock-free term table, `pread` and an AVX2 lexer, postings per 8 MB
+segment in 64 partitions, BOOL answered per segment, phrases checked during the scan at a rare
+anchor, one task queue) and rewrites the per-token path. The output is byte-identical to v4.2's.
+
+**Board:** run-407d7d7d6411, T 125.9 ms, M 36.1 MB, K 30.21, 74.01 points, against v4.2's
+186.0-192.3 ms, 36.1-36.6 MB, K 25.1-25.5.
+
+**What S cost against what T gained.** S rose from 1,299 to 1,562 (+263 lines, about -2.7% K).
+T fell from 186-192 ms to 125.9 ms, which took K up by 18% (against 25.5, the best v4.2 run).
+The longer code paid for itself several times over.
+
+### What changed, and why
+
+In order of effect:
+
+1. **Term table: buckets of three 16-byte keys in one cache line, probed branch-free**
+   (`query.rs`: `Bucket`, `Lookup::find_short`). A token of up to 16 bytes is its own key
+   (bytes or-ed with 0x20, zero padded), so no two tokens share one. A longer token keeps 15
+   bytes and puts `0x80 | length` in byte 15, which no short key has; two long tokens with
+   the same key are told apart by comparing the rest of their bytes (the slow path). A bucket
+   holds three keys and four values in 64 bytes. The probe is two AVX2 compares, a 64-entry
+   table (`SLOT`) from the match bits to the slot, and one load. The fourth value is the miss
+   value; it carries `OVERFLOW` when some term had to move on to a later bucket, and only a
+   miss in such a bucket takes the slow path. The hash is CRC-32C (two instructions). This
+   step alone took local CPU from 1,096 to 939 ms.
+2. **The per-token loop rewritten for the compiler** (`scan.rs`: `Scanner::region`,
+   `Doc::record`). Pass A builds each key in an XMM register (load 16 bytes, or 0x20, and
+   `MASKS[len]`) and makes a `Probe`: the key plus a pointer to its home bucket, null for a
+   long token. It prefetches the bucket, 64 tokens at a time. Pass B looks the tokens up and
+   records them in runs that end at a batch or at a document boundary, so there is no
+   boundary test per token. Its counters live in locals, and its stores are unchecked behind
+   one capacity assert per run. The table's buckets and mask are copied into a `Lookup` value,
+   so the loop keeps them in registers instead of reloading them after every store.
+3. **The lexer finds document ends by token index.** At each LF it counts the tokens before
+   it, from the start mask. It flattens starts and ends into one alternating list (one loop
+   instead of two, 24 positions written unconditionally), and it skips the prefix XOR on the
+   94% of blocks with no LF or TAB.
+4. **Document-local `ids`, `fresh` and `hits`**, grown to the longest document instead of
+   region-sized: -4 MB, which brought memory back under v4.2's.
+5. **Eval:** a galloping union when one list is 16 times longer than the other (most merged
+   elements were in such unions). `filter` and `set_bits` index unchecked after one check of
+   the sorted list's last element. Each query prefetches the term entries of the query four
+   ahead (the `offsets` load was eval's hottest instruction).
+6. **Setup** (serial before the scan, about 6.5 ms down to about 4.7 ms locally): the table
+   and its per-id arrays come from `mmap(MAP_POPULATE)`, because the allocator zeroes
+   64-byte-aligned memory with one thread; a term's query-use count lives in its value word,
+   so there is no separate per-id frequency array whose lines all twelve threads incremented;
+   segments are planned on the main thread while the workers parse; `queries.txt` is read into
+   a padded buffer without the regrowth copy that appending the padding forced.
+7. Smaller items: the build loops run over each stream directly (no `flatten()` chain);
+   emission goes into a fixed-length stream slice; waits spin on `PAUSE` (which leaves the
+   core to the other hardware thread) before yielding; output buffers are pre-sized; worker
+   scratch is not freed at exit (each unmap would flush every core's TLB).
+
+### Measurements (local)
+
+Interleaved A/B in one container (cpuset 0-11, the box's 6 cores x 2 threads), `perf stat`
+task-clock; v4.2 against v5:
+
+| Seed | Build | Wall median (min) | CPU median (min) |
+|---|---|---|---|
+| 1 (15 runs each) | v4.2 | 108.4 ms (106.1) | 1,093 ms (1,062) |
+| 1 | v5 | 79.3 ms (75.5) | 722 ms (698) |
+| 7 (7 runs each) | v4.2 | 109.0 ms (107.2) | 1,100 ms (1,086) |
+| 7 | v5 | 78.8 ms (75.2) | 742 ms (697) |
+
+That is 33-34% less CPU and 27-29% less wall time. Local memory is 35.5-36.3 MiB (37.2-38.0
+MB by the bench's `memory.peak`), under the 44 MB cap of the memory axis. The board then
+measured 125.9 ms, at the low end of the 125-140 ms that v4.2's time-to-CPU relation had
+predicted before the run.
+
+Instruction counts (cachegrind; mispredicts from its branch simulator):
+
+| Input | v4.2 | v5 |
+|---|---|---|
+| Seed 1, full | 9,554 M instructions, 39.6 M mispredicts | 6,172 M (-35%), 18.6 M (-53%) |
+| First 32 MB of seed 1, all queries | 1,311 M, 5.6 M | 878 M, 3.3 M |
+
+CPU split of v5 (perf, local): lookup and record about 25-29%, eval about 15%, finish
+(emission and phrase checks) about 10%, lex about 9-13%, build about 6%, the kernel copy for
+`pread` about 3-4%, waiting 1-6%.
+
+### Measured and dropped (v5)
+
+- **Driver-based BOOL eval.** When the result must lie inside a small set (the smallest term
+  ANDed after the last OR), test only its documents against every term. Correct, but eval's
+  share fell by only about 5% (about 1% of the run) for 60 more lines. Removed.
+- **`mmap` of `docs.txt` with `MADV_POPULATE_READ` per chunk** (no copy, no page faults).
+  Correct, but the same CPU locally (720 vs 725 ms) and slightly worse wall time: the
+  page-table work costs what the copy saved. v4.2 kept `pread` because mmap measured 15%
+  slower on the box in Track A, and this gave no reason to change that. Not adopted.
+- Dense-bitmap threshold of 1/32 and 1/64 of the segment instead of 1/16: within noise.
+- 256 KB chunks instead of 512 KB, and splitting a segment's scans around the previous
+  segment's build and answers: they moved the waiting between phases but not the wall time.
+- Prefetching buckets ahead in the query inserts, and a use-count cap of 31 instead of 63
+  (same anchors on seed 1): insert time unchanged (about 1.4 ms, bound by cross-core misses).
+- Starting threads as a tree (4 started by the main thread, each starting 2): no measurable
+  change. Removed to keep S down.
+
+### Correctness
+
+- Seeds 1, 7, 101 and 202: byte-identical to the reference.
+- The 23 fuzz cases: the spec's example, the hand-written cases of `tests/test_b_index.py`,
+  long tokens of 12/13/17/32/33+ bytes, terms sharing prefixes, a line longer than a read
+  piece, op words as terms, NOT emptying a set, tiny and sample seeds.
+- The same 23 cases, plus seed 1, in three stress builds that take every boundary path:
+  1 KB pieces, 4 KB chunks, 64 KB segments and 3-token batches; 4 KB pieces and at most 100
+  documents per segment; 1 KB pieces and 1-token batches.
+- A build whose hash takes only 8 values, so that every bucket overflows into long chains,
+  passes the 23 cases.
+- 300 runs of seed 1 in one container as uid 65534: 0 differing outputs.
+
+### Limits (as v4.2, plus)
+
+- Query terms are 1-32 bytes (the grammar); corpus tokens of any length are handled (17+
+  bytes by the slow path).
+- A term's use count has seven bits. `USES_CAP + MAX_THREADS <= 127` is asserted at compile
+  time.
+- The table has a slot for every query word, so it never fills; a probe for a missing token
+  in a full chain is bounded by the bucket count.
+- At most 2^22 term ids, 2^16 documents per segment, 12 threads (as before).
+
+### Risks on the box
+
+- The local A/B is on a shared laptop with cpuset 0-11; only the whole build was measured on
+  the board (one run, 125.9 ms). The `mmap(MAP_POPULATE)` setup, the `PAUSE` spins and the
+  bucket prefetch were each chosen locally and not isolated on the box, whose page-fault
+  path and L2 differ.
+- The probe needs AVX2, BMI2 and SSE4.2 (x86-64-v3, as before); the build refuses to compile
+  without AVX2.
+- The `mmap` of the corpus stays rejected on the strength of Track A's box measurement, not
+  a Track B one.
