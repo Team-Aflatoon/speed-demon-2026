@@ -1,25 +1,25 @@
 //! The parallel engine. The workers first build the region map and fault in
 //! the name table, then claim chunks of records.csv until none are left
 //! (phase 1), then claim name buckets until none are left (phase 2, see
-//! names.rs). A worker waits on the others only twice: for the start-up
-//! work, and at the end of phase 1.
+//! names.rs). A worker waits on the others only twice: for the region map,
+//! and at the end of phase 1.
 //!
 //! Choosing the chunk cuts is where the quote-parity problem lives; see `run`.
 
-use crate::names::{Counts, Pairs, Table};
-use crate::parse::{header, merge, Agg, Fail, Local, Parser, Res, Span, EMPTY, PAD};
-use crate::regions::Regions;
-use crate::{die, GROUPS};
+use crate::names::{Bits, Counts, Pairs, Table};
+use crate::parse::{merge, Agg, Local, Parser, Res, Span, EMPTY, PAD};
+use crate::{die, or_die, GROUPS};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, Scope};
 
 /// The most worker threads (the scoring machine gives us twelve).
 const MAX_THREADS: usize = 12;
-/// Pieces regions.csv is parsed in at start-up.
-const REGION_PARTS: usize = 32;
+/// Start-up tasks: pieces of regions.csv to parse, then of the name table
+/// to fault in.
+const PARTS: usize = 32;
 /// Stack size for workers, which need about 40 KiB; a small stack can never
 /// be given a huge page.
 const STACK: usize = 256 << 10;
@@ -27,27 +27,13 @@ const STACK: usize = 256 << 10;
 /// (records average 61 bytes); a longer last record doubles it until found.
 const SLACK: usize = 1 << 10;
 
-/// One output line's numbers: the parser's (see `Agg`), then phase 2's.
+/// One output line's numbers: the parser's (see `Agg`), then phase 2's (see
+/// `Table::count`).
 pub type Total = (Agg, Counts);
+pub type Totals = Vec<Total>;
 
-/// Everything the workers share. Chunk c covers nominally the `piece` bytes
-/// from `c * piece` (see `read`); `next` is the next one to claim, and
-/// `quotes[c]` the quote bytes found in chunk c. `fail` is the worst failure
-/// so far.
-pub struct Shared<'a> {
-    file: &'a File,
-    len: usize,
-    piece: usize,
-    pub regions: &'a Regions,
-    pub table: Table,
-    next: AtomicUsize,
-    quotes: Vec<AtomicU64>,
-    fail: Mutex<Option<Fail>>,
-}
-
-/// Counts the whole file with one worker per CPU (at most 12), in chunks of
-/// nominally `piece` bytes, with a name table of `slots` short slots: totals
-/// by group.
+/// Counts the whole file, `len` bytes, with one worker per CPU (at most
+/// 12), in chunks of nominally `piece` bytes: totals by group.
 ///
 /// records.csv is cut into chunks just after an LF that is followed by a
 /// digit or a BOM byte. By spec 2.2 no quoted value holds a digit or a
@@ -57,50 +43,62 @@ pub struct Shared<'a> {
 /// quotes precede it, so once every chunk has an even number of quotes before
 /// it, each one did start outside quotes, right after a terminator, and was
 /// parsed exactly as one sequential pass would have parsed it. If not, this
-/// returns `Fail::Malformed`, and the caller retries with a single chunk.
-pub fn run(piece: usize, slots: usize, file: &File, regions: &Regions) -> Res<Vec<Total>> {
-    let threads = thread::available_parallelism().map_or(1, usize::from).min(MAX_THREADS);
-    let len = file.metadata().map_or(0, |m| m.len()) as usize; // main has checked it
-    let table = Table::new(slots).unwrap_or_else(|e| die(&format!("memory: {e}")));
-    let quotes = (0..len.div_ceil(piece).max(1)).map(|_| AtomicU64::new(0)).collect();
-    let (next, fail) = (AtomicUsize::new(0), Mutex::new(None));
-    let sh = Shared { file, len, piece, regions, table, next, quotes, fail };
-    // The start-up tasks: parse each piece of regions.csv, then fault in each
-    // stretch of the name table. Whichever workers are up first claim them,
-    // and none waits for the last thread to start, only for the region map
-    // (faulting in only saves the first lookups their page faults).
-    let stretches = sh.table.stretches();
-    let (next_task, pending) = (AtomicUsize::new(0), AtomicUsize::new(REGION_PARTS));
-    let (parsing, next_bucket) = (AtomicUsize::new(threads), AtomicUsize::new(0));
+/// returns the offset of a chunk cut it could not prove, and the caller
+/// retries with a single chunk.
+pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Totals> {
+    let threads = thread::available_parallelism().map_or(1, usize::from);
+    let threads = threads.min(MAX_THREADS);
+    let (table, chunks) = (Table::new(), len.div_ceil(piece).max(1));
+    let buckets = table.buckets();
+    let quotes: Vec<AtomicU64> = (0..chunks).map(|_| AtomicU64::new(0)).collect();
+    // Shared counters: the next chunk, start-up task and name bucket to
+    // claim, start-up tasks to wait for, workers still in phase 1.
+    let [chunk, task, bucket] = [0, 0, 0].map(AtomicUsize::new);
+    let (pending, parsing) = (AtomicUsize::new(PARTS), AtomicUsize::new(threads));
+    // The lowest offset where the file broke the grammar, if it did. No
+    // chunk is claimed after that.
+    let fail = Mutex::new(None::<usize>);
+    let failed = |at: usize| {
+        chunk.store(usize::MAX / 2, Relaxed);
+        let mut fail = fail.lock().unwrap();
+        *fail = Some(fail.map_or(at, |old| old.min(at)));
+    };
     let all_pairs: Vec<OnceLock<Pairs>> = (0..threads).map(|_| OnceLock::new()).collect();
     let total = Mutex::new(vec![(EMPTY, [0; 2]); GROUPS]);
-    let buckets = sh.table.buckets();
     let work = |t: usize| {
-        let pairs = Pairs::new(buckets, len).unwrap_or_else(|e| die(&format!("memory: {e}")));
+        // The start-up tasks go to whichever workers are up first, so that
+        // none waits for the last thread to start, only for the region map.
         loop {
-            match next_task.fetch_add(1, Relaxed) {
-                k if k < REGION_PARTS => regions.parse(k, REGION_PARTS, &pending),
-                k if k < REGION_PARTS + stretches => sh.table.touch(k - REGION_PARTS),
+            match task.fetch_add(1, Relaxed) {
+                k if k < PARTS => regions.parse(k, &pending),
+                k if k < 2 * PARTS => table.touch(k - PARTS, PARTS),
                 _ => break,
             }
         }
-        // Most of this worker's pairs, at 2 bytes for a record of about 61:
-        // faulted in now, while the start-up tasks finish.
-        pairs.touch(len / 32 / threads);
-        wait(&pending);
+        // Most of this worker's pairs, at 2 bytes for a record of about 61,
+        // are faulted in now.
+        let pairs = Pairs::new(buckets, len, len / 64 / threads);
         let aggs = [EMPTY; GROUPS];
+        let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
         let mut local = Local { aggs, pairs };
-        sh.work(&mut local);
+        wait(&pending);
+        while let Some(c) = Some(chunk.fetch_add(1, Relaxed)).filter(|&c| c < chunks) {
+            let span = read(file, len - c * piece, c * piece, piece, &mut buffer);
+            match parser.chunk(&buffer, span, &mut local) {
+                Ok(n) => quotes[c].store(n, Relaxed),
+                Err(at) => failed(c * piece + at),
+            }
+        }
         _ = all_pairs[t].set(local.pairs);
         parsing.fetch_sub(1, Release);
         wait(&parsing);
         // Phase 2, unless phase 1 failed somewhere; then nothing is counted.
         let mut counts = [[0; GROUPS]; 2];
-        if !sh.failed() {
+        if fail.lock().unwrap().is_none() {
             let all: Vec<&Pairs> = all_pairs.iter().filter_map(OnceLock::get).collect();
-            let mut bits = Box::new([0; 1024]);
-            while let Some(b) = Some(next_bucket.fetch_add(1, Relaxed)).filter(|&b| b < buckets) {
-                sh.table.count(&all, b, &mut bits, &mut counts);
+            let mut bits: Box<Bits> = Box::new([0; 1024]);
+            while let Some(b) = Some(bucket.fetch_add(1, Relaxed)).filter(|&b| b < buckets) {
+                table.count(&all, b, &mut bits, &mut counts);
             }
         }
         let mut total = total.lock().unwrap();
@@ -111,13 +109,13 @@ pub fn run(piece: usize, slots: usize, file: &File, regions: &Regions) -> Res<Ve
     };
     thread::scope(|s| grow(s, 0, threads, &work));
     let mut before = 0;
-    for (c, q) in sh.quotes.iter().enumerate() {
+    for (c, q) in quotes.iter().enumerate() {
         if before % 2 == 1 {
-            sh.fail(Fail::Malformed(c * piece));
+            failed(c * piece);
         }
         before += q.load(Relaxed);
     }
-    let fail = sh.fail.into_inner().unwrap();
+    let fail = fail.into_inner().unwrap();
     fail.map_or(Ok(total.into_inner().unwrap()), Err)
 }
 
@@ -141,74 +139,40 @@ fn grow<'s, F: Fn(usize) + Sync>(s: &'s Scope<'s, '_>, t: usize, n: usize, work:
     work(t);
 }
 
-impl Shared<'_> {
-    /// Phase 1 for one worker: claims, reads and parses chunks until none
-    /// are left (or some worker has failed: see `fail`).
-    fn work(&self, local: &mut Local) {
-        let (mut parser, mut buffer) = (Parser::new(), Vec::new());
-        let claim = || Some(self.next.fetch_add(1, Relaxed)).filter(|&c| c < self.quotes.len());
-        while let Some(c) = claim() {
-            let span = self.read(c, &mut buffer);
-            match parser.chunk(self, &buffer, span, local) {
-                Ok(quotes) => self.quotes[c].store(quotes, Relaxed),
-                Err(Fail::Malformed(at)) => self.fail(Fail::Malformed(c * self.piece + at)),
-                Err(f) => self.fail(f),
-            }
-        }
-    }
-
-    /// Notes a failure, keeping the worst: a malformed file (with its lowest
-    /// offset) over a full name table. No chunk is claimed after one.
-    #[cold]
-    fn fail(&self, f: Fail) {
-        self.next.store(usize::MAX / 2, Relaxed);
-        let mut fail = self.fail.lock().unwrap();
-        *fail = match (*fail, f) {
-            (Some(Fail::Malformed(a)), Fail::Malformed(b)) => Some(Fail::Malformed(a.min(b))),
-            (Some(Fail::Malformed(a)), Fail::Full) => Some(Fail::Malformed(a)),
-            _ => Some(f),
+/// Reads the chunk of nominally `piece` bytes at `from` of records.csv, of
+/// which `rest` bytes are left from there, into `buffer` with pread, rather than mapping the file: on the scoring
+/// box the page faults, page-table set-up and tear-down of a 200 MB mapping
+/// cost more than copying the bytes. Returns where in `buffer` the chunk
+/// starts and ends, with `PAD` zero bytes after it, and whether it ends the
+/// file.
+///
+/// The chunk runs from the first record boundary at or after `from` to the
+/// first at or after `from + piece` (the first chunk from the end of the
+/// header line, the last one to the end of the file). A boundary is just
+/// past an LF that is followed by a digit or a BOM byte: a guess, checked as
+/// `run` says. Both ends are found from the file's bytes alone, so
+/// neighbouring chunks always agree on the cut between them.
+fn read(file: &File, rest: usize, from: usize, piece: usize, buffer: &mut Vec<u8>) -> Span {
+    let (nominal, mut want) = (piece.min(rest), (piece + SLACK).min(rest));
+    loop {
+        buffer.resize(want + PAD, 0);
+        let read = file.read_exact_at(&mut buffer[..want], from as u64);
+        let b = &buffer[..or_die(read.map(|_| want), "records.csv")];
+        // The header line: an optional BOM, then an optional CR before its LF.
+        let header = &"\u{feff}id,name,note,region_id,amount".as_bytes()[3 * usize::from(b.first() != Some(&0xEF))..];
+        let crlf = usize::from(b.get(header.len()) == Some(&b'\r'));
+        let lf = b.starts_with(header) && b.get(header.len() + crlf) == Some(&b'\n');
+        let start = match from {
+            0 if lf => Some(header.len() + crlf + 1),
+            0 => die("records.csv: no header line"),
+            _ => cut(b, 0),
         };
-    }
-
-    /// Whether some worker has failed.
-    fn failed(&self) -> bool {
-        self.fail.lock().unwrap().is_some()
-    }
-
-    /// Reads chunk c into `buffer` with pread, rather than mapping the file:
-    /// on the scoring box the page faults, page-table set-up and tear-down of
-    /// a 200 MB mapping cost more than copying the bytes. Returns where in
-    /// `buffer` the chunk starts and ends, with `PAD` zero bytes after it,
-    /// and whether it ends the file.
-    ///
-    /// The chunk runs from the first record boundary at or after `c * piece`
-    /// to the first at or after `(c + 1) * piece` (chunk 0 from the end of
-    /// the header, the last one to the end of the file). A boundary is just
-    /// past an LF that is followed by a digit or a BOM byte: a guess, checked
-    /// as `run` says. Both ends are found from the file's bytes alone, so
-    /// neighbouring chunks always agree on the cut between them.
-    fn read(&self, c: usize, buffer: &mut Vec<u8>) -> Span {
-        let from = c * self.piece;
-        let rest = self.len - from;
-        let nominal = self.piece.min(rest);
-        let mut want = (nominal + SLACK).min(rest);
-        loop {
-            buffer.resize(want + PAD, 0);
-            if let Err(e) = self.file.read_exact_at(&mut buffer[..want], from as u64) {
-                die(&format!("records.csv: {e}"));
-            }
-            let start = match c {
-                0 => Some(header(buffer).unwrap_or_else(|| die("records.csv: no header line"))),
-                _ => cut(&buffer[..want], 0),
-            };
-            // The last chunk ends at the end of the file, where no cut is.
-            let end = cut(&buffer[..want], nominal).or((want == rest).then_some(want));
-            if let Some(end) = end {
-                buffer[end..end + PAD].fill(0);
-                return (start.unwrap_or(end).min(end), end, end == rest);
-            }
-            want = (2 * want).min(rest);
+        // The last chunk ends at the end of the file, where no cut is.
+        if let Some(end) = cut(b, nominal).or((want == rest).then_some(want)) {
+            buffer[end..end + PAD].fill(0);
+            return (start.unwrap_or(end).min(end), end, end == rest);
         }
+        want = (2 * want).min(rest);
     }
 }
 
@@ -217,5 +181,115 @@ impl Shared<'_> {
 /// LF at its very end is not taken: the caller reads further and asks again.
 fn cut(b: &[u8], from: usize) -> Option<usize> {
     let at = |i: usize| b[i] == b'\n' && (b[i + 1].is_ascii_digit() || b[i + 1] == 0xEF);
-    (from..b.len().saturating_sub(1)).find(|&i| at(i)).map(|i| i + 1)
+    let lf = (from..b.len().saturating_sub(1)).find(|&i| at(i))?;
+    Some(lf + 1)
+}
+
+/// regions.csv: a direct-indexed map from region id to group, filled by the
+/// workers in parallel at start-up. Group 0 is `_UNMATCHED`; countries get
+/// 1..=255 in order of first sight, and are listed in code order at the end.
+/// Any line that is not `id,CCC` stops the program with its byte offset.
+pub struct Regions {
+    /// The lines after the header line.
+    lines: &'static [u8],
+    /// Group by region id, one byte each. The last entry is a 0 that every
+    /// larger id is clamped to (see `parse`), so a lookup never branches.
+    pub map: &'static [AtomicU8],
+    /// Group by country code index (`AAA` = 0); 0 until the code is seen,
+    /// and the groups handed out so far, held while handing out a new one.
+    codes: (Vec<AtomicU8>, Mutex<u8>),
+}
+
+impl Regions {
+    /// Maps the file and sizes the map by the id on its last line, the
+    /// largest, since spec 2.3 lists ids unique and ascending (`parse`
+    /// rejects any id above it, so a file out of order cannot overrun).
+    pub fn open(path: &str) -> Self {
+        let f = or_die(File::open(path), path);
+        let len = or_die(f.metadata(), path).len() as usize;
+        // SAFETY: any bytes are valid `u8`s.
+        let file: &[u8] = unsafe { crate::mapped(len, std::os::fd::AsRawFd::as_raw_fd(&f)) };
+        let lines = file.strip_prefix(b"region_id,country\n").unwrap_or(b"");
+        if lines.last() != Some(&b'\n') {
+            die(&format!("{path}: bad header, or no LF at its end"));
+        }
+        let last = lines[..lines.len() - 1].iter().rposition(|&c| c == b'\n');
+        let last = last.map_or(0, |p| p + 1);
+        let max = lines[last..].iter().take_while(|c| c.is_ascii_digit());
+        let max = max.fold(0, |n, &c| (n * 10 + usize::from(c - b'0')).min(1 << 27));
+        // SAFETY: zero is a valid AtomicU8.
+        let map = unsafe { crate::mapped(max + 2, -1) };
+        let codes = (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect();
+        let codes = (codes, Mutex::new(0));
+        Regions { lines, map, codes }
+    }
+
+    /// Adds share `t` of `PARTS` of the lines `id,CCC\n`, then counts it off
+    /// `left`. A share runs from the first line start at or after its nominal
+    /// start to the next share's.
+    fn parse(&self, t: usize, left: &AtomicUsize) {
+        let b = self.lines;
+        let start = |k: usize| match k * b.len() / PARTS {
+            0 => 0,
+            p => p + b[p - 1..].iter().position(|&c| c == b'\n').unwrap(), // the last byte is an LF
+        };
+        let (mut p, end) = (start(t), start(t + 1));
+        while p < end {
+            let (line, mut id) = (p, 0);
+            if let Some((value, digits)) = b.get(p..p + 8).and_then(|w| id_of(w.try_into().unwrap())) {
+                (id, p) = (value, p + digits);
+            }
+            while b[p].is_ascii_digit() && id < self.map.len() {
+                (id, p) = (id * 10 + usize::from(b[p] - b'0'), p + 1);
+            }
+            let code = b.get(p + 1..p + 4).unwrap_or(b"");
+            let ok = p > line && id < self.map.len() - 1 && b[p] == b',';
+            if !ok || b.get(p + 4) != Some(&b'\n') || !code.iter().all(u8::is_ascii_uppercase) {
+                die(&format!("regions.csv byte {line}: not `id,CCC` in order"));
+            }
+            let code = code.iter().fold(0, |c, &l| c * 26 + usize::from(l - b'A'));
+            self.map[id].store(self.group_of(code), Relaxed);
+            p += 5;
+        }
+        left.fetch_sub(1, Release);
+    }
+
+    /// The group of country code `code`, handing it the next one if new.
+    fn group_of(&self, code: usize) -> u8 {
+        let (codes, groups) = &self.codes;
+        if codes[code].load(Relaxed) == 0 {
+            let mut groups = groups.lock().unwrap();
+            // Another worker may have handed this code a group meanwhile.
+            if codes[code].load(Relaxed) == 0 {
+                let next = groups.checked_add(1);
+                *groups = next.unwrap_or_else(|| die("regions.csv: over 255 countries"));
+                codes[code].store(*groups, Relaxed);
+            }
+        }
+        codes[code].load(Relaxed)
+    }
+
+    /// `(code, group)` for every country seen, in code order.
+    pub fn countries(&self) -> impl Iterator<Item = (String, u8)> + '_ {
+        let letters = |c: usize| [c / 676, c / 26 % 26, c % 26].map(|l| (b'A' + l as u8) as char);
+        let seen = self.codes.0.iter().map(|g| g.load(Relaxed)).enumerate();
+        let seen = seen.filter(|&(_, g)| g != 0);
+        seen.map(move |(c, g)| (letters(c).iter().collect(), g))
+    }
+}
+
+/// The id a line starts with and its length, read off the line's first
+/// eight bytes `w`, if it is 1 to 7 digits followed by a comma: the digits
+/// right-aligned with '0's below them, then checked and converted eight at
+/// once. Anything else is left to the caller's loop, one byte at a time.
+fn id_of(w: [u8; 8]) -> Option<(usize, usize)> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let (w, commas) = (u64::from_le_bytes(w), u64::from_le_bytes(w) ^ 0x2C * ONES);
+    let n = ((commas.wrapping_sub(ONES) & !commas & 0x80 * ONES).trailing_zeros() / 8) as usize;
+    let digits = (1..8).contains(&n).then(|| (w << (64 - 8 * n) | 0x30 * ONES >> (8 * n)) ^ 0x30 * ONES)?;
+    // Every byte at most 9, then pairs, fours and the eight combined.
+    ((digits | digits.wrapping_add(0x76 * ONES)) & 0x80 * ONES == 0).then_some(())?;
+    let v = digits.wrapping_mul(10 << 8 | 1) >> 8 & 0x00FF_00FF_00FF_00FF;
+    let v = v.wrapping_mul(100 << 16 | 1) >> 16 & 0x0000_FFFF_0000_FFFF;
+    Some(((v.wrapping_mul(10_000 << 32 | 1) >> 32) as usize, n))
 }
