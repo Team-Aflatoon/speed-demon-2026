@@ -386,11 +386,7 @@ impl Pairs {
             // counted.
             let next = (link * BLOCK).wrapping_sub(BLOCK);
             (crate::prefetch(self.arena, next), crate::prefetch(self.arena, next + 32));
-            // Four at a time: a quarter of the loop's instructions were its own.
-            let four = self.arena[at + 2..p].chunks_exact(4);
-            let rest = four.remainder();
-            four.for_each(|e| e.iter().for_each(|&e| f(e)));
-            rest.iter().for_each(|&e| f(e));
+            self.arena[at + 2..p].iter().for_each(|&e| f(e));
             p = link * BLOCK;
         }
     }
