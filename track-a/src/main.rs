@@ -1,20 +1,21 @@
 //! Track A (Ingest): for every (UTC hour, endpoint) group of an HTTP request log, the
 //! request count, nearest-rank p50/p95/p99 latency and the 5xx count and rate.
 //!
-//! Twelve threads read the log in pieces, in file order, and parse each into one 4-byte record
+//! Workers read the log in pieces, in file order, and parse each into one 4-byte record
 //! per line appended to that hour's log. Speculating that lines come at most a little
 //! late, an hour is closed once the parsed prefix of the file is two hours past it, and
 //! reported as soon as every piece handed out before that is parsed, while parsing goes
 //! on. So a report never races a writer: the hour's log is final. It is counting-sorted
 //! by endpoint, so every group is one slice, three ranks give the percentiles, the log is
-//! freed, and the text is written once all earlier hours are out, by whichever thread
-//! completes that order. A line of a closed hour proves the speculation wrong: the run is
+//! freed, and the main thread writes the text once all earlier hours are out (and parses
+//! pieces in between). A line of a closed hour proves the speculation wrong: the run is
 //! then redone with every hour reported at the end. README.md explains the design;
 //! PERF.md has the measurements.
 
 use std::arch::x86_64::*;
 use std::io::{Seek, Write};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering::*};
+use std::sync::mpsc::{self, TryRecvError::Empty};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::{cell::UnsafeCell, fmt::Display, fs::File, os::unix::fs::FileExt, ptr, slice, thread};
 
@@ -49,12 +50,14 @@ const MAX_LINE: usize = 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1;
 const SCAN: usize = 4096;
 /// Readable bytes the parser may touch past a line's start (more than MAX_LINE).
 const SLACK: usize = 256;
-/// Threads, the main one included, each parsing, reporting and writing: the box has 12
-/// CPUs.
-const THREADS: usize = 12;
+/// Parsing and reporting threads; the main thread writes, and parses in between. The box
+/// has 12 CPUs.
+const WORKERS: usize = 11;
 
-// From <sys/mman.h>, <sys/prctl.h> and <malloc.h>; their constants are spelled out
-// where they are used.
+// From <sys/mman.h>, <sys/prctl.h> and <malloc.h>.
+const READ_WRITE: i32 = 1 | 2;
+const PRIVATE_ANONYMOUS_NORESERVE: i32 = 0x02 | 0x20 | 0x4000;
+const MADV_DONTNEED: i32 = 4;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
@@ -64,7 +67,7 @@ extern "C" {
 }
 
 fn main() {
-    // SAFETY: process-wide hints that touch no memory of ours; refusal is harmless.
+    // SAFETY: two process-wide hints that touch no memory of ours; refusal is harmless.
     // PR_SET_THP_DISABLE (41): transparent huge pages (`always` on stock Debian) would back
     // the sparse logs with mostly empty 2 MB pages, all charged to the memory peak.
     // M_MMAP_THRESHOLD (-3) fixed at 128 KB: glibc would otherwise raise it after the
@@ -79,10 +82,13 @@ fn main() {
     let out = format!("{}/summary.txt", args.next().as_deref().unwrap_or("/out"));
     let input = File::open(&input).unwrap_or_else(|e| die(format!("{input}: {e}")));
     let mut out = File::create(&out).unwrap_or_else(|e| die(format!("{out}: {e}")));
-    if !Job::new(&input, true).run(&out) {
+    if !Job::new(&input, true).run(&mut out) {
         eprintln!("ingest: a line came after its hour closed, or a crowded hour; redoing");
-        out.set_len(0).and_then(|_| out.rewind()).unwrap_or_else(|e| die(e));
-        Job::new(&input, false).run(&out);
+        out.set_len(0).unwrap_or_else(|e| die(e));
+        out.rewind().unwrap_or_else(|e| die(e));
+        if !Job::new(&input, false).run(&mut out) {
+            die("the rerun failed");
+        }
     }
 }
 
@@ -98,13 +104,31 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().expect("no worker panics")
 }
 
+/// Reserves room for `len` atomics `T`, zeroed; pages cost nothing until first touched.
+/// The slice is `'static` only in name: the last worker of the job unmaps it (see
+/// `work`), and after that nothing reads it.
+fn reserve<T>(len: usize) -> &'static [T] {
+    let (bytes, flags) = (len * size_of::<T>(), PRIVATE_ANONYMOUS_NORESERVE);
+    // SAFETY: a fresh mapping at an address of the kernel's choosing, so no existing
+    // memory is affected; failure is reported as MAP_FAILED (-1). Zero bytes are a valid
+    // atomic integer.
+    unsafe {
+        let p = mmap(ptr::null_mut(), bytes, READ_WRITE, flags, -1, 0);
+        if p as isize == -1 {
+            die(std::io::Error::last_os_error());
+        }
+        slice::from_raw_parts(p.cast(), len)
+    }
+}
 
-/// The slots reserved in an hour's log, BLOCK at a time, so each thread appends to its
-/// own block. Each hour's count on its own cache line, so the one that threads bump does
-/// not evict another hour that other threads are using.
+/// The slots reserved in an hour's log, BLOCK at a time, so each worker appends to its
+/// own block. Each hour's count on its own cache line, so the one that workers bump does
+/// not evict another hour that other workers are using.
 #[derive(Default)]
 #[repr(align(64))]
-struct Used(AtomicUsize);
+struct Hour {
+    used: AtomicUsize,
+}
 
 /// Who does what next, under one lock.
 #[derive(Default)]
@@ -147,15 +171,13 @@ struct Job<'a> {
     /// The hours' logs, `room` slots each (see ID_SHIFT for the records).
     room: usize,
     logs: &'static [AtomicU32],
-    used: Vec<Used>,
+    hours: Vec<Hour>,
     plan: Mutex<Plan>,
     changed: Condvar,
-    /// Text buffers already written, and report scratch space, for reuse.
+    /// Text buffers the writer is done with, and report scratch space, for reuse.
     texts: Mutex<Vec<Vec<u8>>>,
     scratch: Mutex<Vec<Vec<u32>>>,
-    /// Texts of reported hours waiting for earlier ones, and the next hour to write.
-    output: Mutex<(Vec<Option<Vec<u8>>>, usize)>,
-    /// Threads done.
+    /// Workers done.
     stopped: AtomicUsize,
 }
 
@@ -167,73 +189,97 @@ impl<'a> Job<'a> {
         // bytes at most, or two if wide, with at least 46), plus each thread's last,
         // partly used block; or, speculating, less. A whole number of blocks keeps every
         // hour's log page-aligned, as madvise requires.
-        let room = (len / 20 + 1 + THREADS * BLOCK).next_multiple_of(BLOCK);
+        let room = (len / 20 + 1 + (WORKERS + 1) * BLOCK).next_multiple_of(BLOCK);
         let room = if speculate { room.min(CROWDED) } else { room };
-        // The logs: zeroed pages that cost nothing until first touched. `'static` only in
-        // name: the last thread of the job unmaps them (see `work`), after which nothing
-        // reads them.
-        // SAFETY: a fresh mapping at an address of the kernel's choosing, so no existing
-        // memory is affected; failure is reported as MAP_FAILED (-1). Zero bytes are a
-        // valid atomic integer.
-        // PROT_READ | PROT_WRITE (3); MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE (0x4022).
-        let logs = unsafe { mmap(ptr::null_mut(), HOURS * room * 4, 3, 0x4022, -1, 0) };
-        if logs as isize == -1 {
-            die(std::io::Error::last_os_error());
-        }
         Job {
             input,
             len,
             speculate,
             rows: (0..pieces).map(|_| AtomicUsize::new(0)).collect(),
             room,
-            logs: unsafe { slice::from_raw_parts(logs.cast(), HOURS * room) },
-            used: (0..HOURS).map(|_| Used::default()).collect(),
+            logs: reserve(HOURS * room),
+            hours: (0..HOURS).map(|_| Hour::default()).collect(),
             plan: Mutex::default(),
             changed: Condvar::new(),
             texts: Mutex::default(),
             scratch: Mutex::default(),
-            output: Mutex::new((vec![None; HOURS], 0)),
             stopped: AtomicUsize::new(0),
         }
     }
 
     /// Parses and reports everything, writing the hours to `out` in order. Returns
     /// whether the speculation held, i.e. whether `out` is right.
-    fn run(&self, out: &File) -> bool {
+    fn run(&self, out: &mut File) -> bool {
+        let (sender, receiver) = mpsc::channel();
         thread::scope(|s| {
-            for _ in 1..THREADS {
-                s.spawn(|| self.work(out));
+            for _ in 0..WORKERS {
+                let sender = sender.clone();
+                s.spawn(move || self.work(sender));
             }
-            self.work(out);
+            drop(sender);
+            // Hours finish out of order; each is written once all earlier ones are out.
+            // While no text waits, this thread parses pieces too, so that no CPU idles.
+            let (mut pending, mut written) = (vec![None; HOURS], 0);
+            let (mut open, mut buf) = ([(0, 0); HOURS], Vec::new());
+            loop {
+                let next = match receiver.try_recv() {
+                    Err(Empty) => match self.next_task(None, true) {
+                        Task::Piece(i, closed) => {
+                            self.piece(i, closed, &mut open, &mut buf);
+                            self.parsed(&mut lock(&self.plan), i);
+                            continue;
+                        }
+                        _ => receiver.recv().ok(),
+                    },
+                    next => next.ok(),
+                };
+                let Some((hour, text)) = next else { break };
+                pending[hour] = Some(text);
+                while let Some(mut text) = pending.get_mut(written).and_then(Option::take) {
+                    out.write_all(&text).unwrap_or_else(|e| die(e));
+                    // A few are kept for reuse, which saves faulting in fresh pages; more,
+                    // or any near the end, would only add to the memory peak.
+                    let mut texts = lock(&self.texts);
+                    if texts.len() < 4 && written + WORKERS < HOURS {
+                        text.clear();
+                        texts.push(text);
+                    }
+                    written += 1;
+                }
+            }
         });
         !lock(&self.plan).late
     }
 
-    /// One thread: parses pieces and reports hours, whichever is due, until all is done.
-    fn work(&self, out: &File) {
+    /// One worker: parses pieces and reports hours, whichever is due, until all is done.
+    fn work(&self, sender: mpsc::Sender<(usize, Vec<u8>)>) {
         let (mut open, mut buf, mut parsed) = ([(0, 0); HOURS], Vec::new(), None);
         loop {
-            match self.next_task(parsed.take()) {
+            match self.next_task(parsed.take(), false) {
                 Task::Piece(i, closed) => {
-                    // SAFETY: `read` leaves SLACK zero bytes after the piece's lines.
-                    if !unsafe { self.parse(&mut open, closed, self.read(i, &mut buf)) } {
-                        lock(&self.plan).late = true;
-                    }
+                    self.piece(i, closed, &mut open, &mut buf);
                     parsed = Some(i);
-                    // Among the last pieces, this was most likely this thread's last one:
-                    // free its buffer now, not at the memory peak at the end.
-                    if i + THREADS >= self.rows.len() {
-                        buf = Vec::new();
+                }
+                Task::Hour(h) => {
+                    // Scratch has room for any hour from the start: grown step by step, its
+                    // freed smaller copies would stay in this thread's malloc arena.
+                    let text = lock(&self.texts).pop().unwrap_or_default();
+                    let sorted = lock(&self.scratch).pop();
+                    let mut sorted = sorted.unwrap_or_else(|| vec![0; 2 * self.room]);
+                    _ = sender.send((h, self.report(h, &mut sorted, text)));
+                    // As for texts: a few are kept, more would only add to the peak.
+                    let mut scratch = lock(&self.scratch);
+                    if scratch.len() < 2 {
+                        scratch.push(sorted);
                     }
                 }
-                Task::Hour(h) => self.write(out, h, self.report(h)),
                 Task::Stop => break,
             }
         }
-        // The last thread out frees what only reports used, before the last hours are
-        // written, where the memory peaks: the scratch and the logs (with their page
-        // tables). Not after a late line: another thread may still be parsing.
-        if self.stopped.fetch_add(1, AcqRel) + 1 == THREADS && !lock(&self.plan).late {
+        // The last worker out frees what only reports used, before the writer has written
+        // the last hours, where the memory peaks: the scratch and the logs (with their
+        // page tables). Not after a late line: the main thread may still be parsing.
+        if self.stopped.fetch_add(1, AcqRel) + 1 == WORKERS && !lock(&self.plan).late {
             lock(&self.scratch).clear();
             // SAFETY: every hour is reported, so every piece is parsed and nothing reads
             // or writes the logs any more: `run` only reads the plan, a rerun has its own.
@@ -241,34 +287,34 @@ impl<'a> Job<'a> {
         }
     }
 
-    /// Writes hour `hour`'s text once all earlier hours are out, and with it any later
-    /// ones that were waiting for it (hours are reported out of order).
-    fn write(&self, out: &File, hour: usize, text: Vec<u8>) {
-        let mut output = lock(&self.output);
-        let (pending, next) = &mut *output;
-        pending[hour] = Some(text);
-        while let Some(mut text) = pending.get_mut(*next).and_then(Option::take) {
-            (&*out).write_all(&text).unwrap_or_else(|e| die(e));
-            // A few are kept for reuse, which saves faulting in fresh pages; more, or any
-            // near the end, would only add to the memory peak.
-            let mut texts = lock(&self.texts);
-            if texts.len() < 4 && *next + THREADS < HOURS {
-                text.clear();
-                texts.push(text);
-            }
-            *next += 1;
+    /// Reads and parses piece `i`; the hours below `closed` are closed.
+    fn piece(&self, i: usize, closed: usize, open: &mut Open, buf: &mut Vec<u8>) {
+        // SAFETY: `read` leaves SLACK zero bytes after the piece's lines.
+        if !unsafe { self.parse(open, closed, self.read(i, buf)) } {
+            lock(&self.plan).late = true;
+        }
+        // Among the last pieces, this was most likely this thread's last one: free its
+        // buffer now, not at the memory peak at the end.
+        if i + WORKERS >= self.rows.len() {
+            *buf = Vec::new();
+        }
+    }
+
+    /// Marks piece `i` parsed, waking any worker waiting for an hour to come due.
+    fn parsed(&self, plan: &mut Plan, i: usize) {
+        plan.parsing.retain(|&j| j != i);
+        if plan.waiting > 0 {
+            self.changed.notify_all();
         }
     }
 
     /// Marks piece `parsed` done and picks the next task: an hour whose pieces are all
-    /// parsed, else a piece, else (once all pieces are taken) it waits for an hour.
-    fn next_task(&self, parsed: Option<usize>) -> Task {
+    /// parsed, else a piece, else (once all pieces are taken) it waits for an hour. The
+    /// main thread (`writer`) takes only pieces, and stops rather than wait.
+    fn next_task(&self, parsed: Option<usize>, writer: bool) -> Task {
         let mut plan = lock(&self.plan);
         if let Some(i) = parsed {
-            plan.parsing.retain(|&j| j != i);
-            if plan.waiting > 0 {
-                self.changed.notify_all();
-            }
+            self.parsed(&mut plan, i);
         }
         loop {
             // Speculating, an hour closes once the parsed prefix reaches a line two hours
@@ -281,12 +327,14 @@ impl<'a> Job<'a> {
                 Some(row) if self.speculate => row.load(Relaxed).saturating_sub(2),
                 Some(_) => 0,
             };
-            let (pieces, closed) = (plan.next_piece, plan.closed.len());
-            plan.closed.resize(close.max(closed), pieces);
+            while plan.closed.len() < close {
+                let pieces = plan.next_piece;
+                plan.closed.push(pieces);
+            }
             let h = plan.next_hour;
             if plan.late || h == HOURS {
                 return Task::Stop;
-            } else if plan.closed.get(h).is_some_and(|&pieces| frontier >= pieces) {
+            } else if !writer && plan.closed.get(h).is_some_and(|&pieces| frontier >= pieces) {
                 plan.next_hour += 1;
                 return Task::Hour(h);
             } else if plan.next_piece < self.rows.len() {
@@ -294,6 +342,8 @@ impl<'a> Job<'a> {
                 plan.parsing.push(i);
                 plan.next_piece += 1;
                 return Task::Piece(i, plan.closed.len());
+            } else if writer {
+                return Task::Stop;
             }
             plan.waiting += 1;
             plan = self.changed.wait(plan).expect("no worker panics");
@@ -337,7 +387,7 @@ impl<'a> Job<'a> {
         // The current hour, as a cache: shards write in time order, so it rarely changes.
         // `key` holds its `YYYY-MM-DDTHH`, compared as the first 13 of 16 loaded bytes.
         let (mut key, mut row, (mut n, mut end)) = (_mm_setzero_si128(), 0, open[0]);
-        let (mut used, mut log) = (&self.used[0].0, self.logs.as_ptr());
+        let (mut hour, mut log) = (&self.hours[0], self.logs.as_ptr());
         let mut ends = [0usize; SCAN / 32];
         let (mut line, mut block) = (from, from);
         while line < to {
@@ -368,7 +418,7 @@ impl<'a> Job<'a> {
                     if row < closed {
                         return false;
                     }
-                    (key, used, (n, end)) = (stamp, &self.used[row].0, open[row]);
+                    (key, hour, (n, end)) = (stamp, &self.hours[row], open[row]);
                     log = self.logs[row * self.room..].as_ptr();
                 }
                 let (latency, space) = parse_latency(p.add(e - 16));
@@ -384,7 +434,7 @@ impl<'a> Job<'a> {
                 let wide = latency >= LOW;
                 n += (wide && n + 1 == end) as usize;
                 if n == end {
-                    n = used.fetch_add(BLOCK, Relaxed);
+                    n = hour.used.fetch_add(BLOCK, Relaxed);
                     end = n + BLOCK;
                     if end > self.room {
                         return false;
@@ -411,14 +461,9 @@ impl<'a> Job<'a> {
     /// 3. scatter pass: every latency into its endpoint's slice;
     /// 4. the hour's log pages given back;
     /// 5. per endpoint, three selections for the percentiles and its output line.
-    fn report(&self, hour: usize) -> Vec<u8> {
-        // Scratch has room for any hour from the start: grown step by step, its freed
-        // smaller copies would stay in the malloc heap.
-        let sorted = lock(&self.scratch).pop();
-        let mut sorted = sorted.unwrap_or_else(|| vec![0; 2 * self.room]);
-        let mut text = lock(&self.texts).pop().unwrap_or_default();
-        let at = hour * self.room;
-        let log = &self.logs[at..at + self.used[hour].0.load(Relaxed)];
+    fn report(&self, hour: usize, sorted: &mut Vec<u32>, mut text: Vec<u8>) -> Vec<u8> {
+        let (h, at) = (&self.hours[hour], hour * self.room);
+        let log = &self.logs[at..at + h.used.load(Relaxed)];
         let slots = || log.iter().map(|r| r.load(Relaxed));
         // Count pass by endpoint id and 5xx flag together (the record's top 12 bits), so
         // `tally[2 * id]` holds the endpoint's other responses and `tally[2 * id + 1]` its
@@ -443,8 +488,7 @@ impl<'a> Job<'a> {
         });
         // SAFETY: madvise(DONTNEED) on our own mapping, which reads as zeros afterwards;
         // nothing reads this hour's log again. If it is refused, the pages stay.
-        // MADV_DONTNEED (4).
-        unsafe { madvise(log.as_ptr() as _, size_of_val(log), 4) };
+        unsafe { madvise(log.as_ptr() as _, size_of_val(log), MADV_DONTNEED) };
         let stamp = stamp(hour);
         // Room for every line at once (untouched pages cost nothing), so the text never
         // grows by copying.
@@ -455,11 +499,6 @@ impl<'a> Job<'a> {
             let errors = tally[2 * id as usize + 1];
             put_line(&mut text, &stamp, id, &mut sorted[start..start + n], errors);
             start += n;
-        }
-        // As for texts: a few are kept, more would only add to the peak.
-        let mut scratch = lock(&self.scratch);
-        if scratch.len() < 2 {
-            scratch.push(sorted);
         }
         text
     }
@@ -513,9 +552,10 @@ fn percentiles(v: &mut [u32]) -> [u32; 3] {
     }
     // Low to high, each selection searching only above the previous one: about 1.55n
     // steps. Beyond 64 values the three ranks are distinct.
-    let (_, &mut p50, above) = v.select_nth_unstable(ranks[0]);
-    let (_, &mut p95, above) = above.select_nth_unstable(ranks[1] - ranks[0] - 1);
-    let (_, &mut p99, _) = above.select_nth_unstable(ranks[2] - ranks[1] - 1);
+    let [r50, r95, r99] = ranks;
+    let (_, &mut p50, above) = v.select_nth_unstable(r50);
+    let (_, &mut p95, above) = above.select_nth_unstable(r95 - r50 - 1);
+    let (_, &mut p99, _) = above.select_nth_unstable(r99 - r95 - 1);
     [p50, p95, p99]
 }
 
@@ -624,6 +664,10 @@ struct Name {
 }
 
 impl Name {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
     /// Whether the `len` bytes at `p` are this name. Compares 64 bytes at a time with the
     /// bits past `len + 1` masked off; only names of 64 bytes and more need a second step.
     /// Byte `len` settles the length too: a stored name is followed by a space, like the
@@ -683,7 +727,7 @@ impl Endpoints {
         let count = *lock(&self.count);
         if order.len() < count {
             *order = (1..=count as u16).collect();
-            order.sort_unstable_by_key(|&id| &self.get(id).bytes[..self.get(id).len as usize]);
+            order.sort_unstable_by_key(|&id| self.get(id).bytes());
         }
         order.clone()
     }
