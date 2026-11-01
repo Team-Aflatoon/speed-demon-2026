@@ -7,15 +7,38 @@ The task, the input files and the exact output format are in the [spec](https://
 ## Result
 
 The submitted version (commit 173a349) measured on the board as run-1d538165ea54:
-T 140.4 ms, M 70.4 MB, S 551, D 1, K 25.80 (70.58 points). The reference is 72.69 s and
-893 MB. PERF.md has every step with its board run.
+T 140.4 ms, M 70.4 MB, S 551, D 1, K 25.80 (70.58 points). The median of its five board
+runs is 142.1 ms. The reference is 72.69 s and 893 MB. PERF.md has every step with its
+board run.
+
+Where the time goes on the scoring box, from prefix probes (PERF.md):
+
+| Phase | Box time (ms) |
+|---|---|
+| First parse of graph.txt (counting) | ~10 |
+| Second parse and scatter | ~14 |
+| Counting sort and offsets | ~18 |
+| BFS renumbering, layout and in-edges | ~30 |
+| 2,000 queries | ~75 |
+
+Notable: transparent huge pages cost 14 MB on the box only, and opting out of them fixed
+it (run-bf037ba42528).
+
+## How to run
+
+    docker build -t traverse .
+    docker run --rm -v /path/to/data:/data:ro -v /path/to/out:/out traverse
+
+or, with Rust installed, `cargo build --release` and then
+`target/release/traverse [data dir] [out dir]` (by default /data and /out). The data
+directory holds `graph.txt` and `queries.txt`, and the answers go to `distances.txt`.
 
 ## Approach
 
 The whole run is one Rust binary, `src/main.rs`, with no dependencies. Most of the work
 goes into getting the graph into a compact, cache-friendly shape quickly, because that is
 what our measurements said matters: renumbering the nodes for locality alone made the
-searches 4.4x faster. The 2,000 searches themselves are short.
+searches 4.4x faster (measured in our first version, with one-way binary-heap searches). The 2,000 searches themselves are short.
 
 **Parsing.** `graph.txt` is memory-mapped (the harness has it in the page cache already, so
 this costs no copy and no charged memory) and cut into one piece per thread at line
@@ -41,7 +64,7 @@ each direction.
 over the raw graph misses the cache on almost every node. After the first build, the nodes
 are renumbered in BFS order. Every thread grows BFS regions from roots in its own share of
 the ids, claiming nodes with an atomic flag, until the regions meet. Inside a region, BFS
-rings put neighbouring streets at nearby ids. This alone made the searches about 4x faster.
+rings put neighbouring streets at nearby ids (the 4.4x above).
 Each thread copies every row as it dequeues it, so its rows come out already in new-id
 order. During the walk `rank` itself is the claim flag (a provisional thread-and-index id,
 fixed up afterwards), and the queue holds only the frontier, so the walk adds little
@@ -81,12 +104,36 @@ run, with the opt-out, measured 79.8 MB.
 
 Correctness was checked against the reference on the spec's worked example and the hand-written
 cases from the official tests, 60 random small graphs (zero and near-2^32 weights, parallel
-edges, self-loops, unreachable pairs), tiny seeds 1-8, sample seeds 1-3 and full seeds 1, 3
-and 7, with 1, 3 and 12 CPUs.
+edges, self-loops, unreachable pairs), one-edge graphs, tiny seeds 1-8, sample seeds 1-3
+and full seeds 1, 3, 7, 101 and 202, with 1, 3 and 12 CPUs, plus 100 repeated runs of
+seed 1 with identical output.
+
+## Limits
+
+- n ≤ 2^26 nodes: a head id and at least 6 bits of weight share each 32-bit edge.
+- m < 2^32 edges, since row offsets are u32.
+- Weights are u32 (0 to 2^32 - 1), as the spec says; answers stay below 2^63.
+- At most 12 threads (`MAX_THREADS`), the number the harness grants.
+- Each of the 48 searches (two directions, two widths, 12 threads) reserves address space
+  for a distance block per 128 nodes, about 0.5 GB in all at full scale. Only the blocks a
+  search touches use memory, so this relies on Linux overcommitting virtual memory.
+
+## Errors
+
+The input is trusted to follow the spec's format, and every violation that is cheap to
+detect is reported on stderr as `track-d: ...`, with the file's path where it applies,
+and exit status 1. That covers an empty or unreadable file, a missing final newline, a
+bad header, n above 2^26 or m above 2^32 - 1, a node id not below n, an edge count unlike the header's, a
+weight above 2^32 - 1, a query line that is not `s t` with both below n (with its line
+number), and an output file that cannot be written. Checking every byte of every line
+would cost the parse its speed, so a line that is malformed in other ways can still
+produce a wrong answer or abort the run.
 
 ## Dependencies
 
 None. The three libc functions used (`mmap`, `mallopt`, `prctl`) are declared by hand.
+The image builds offline (`cargo build --release --offline --locked`) into a static
+binary.
 
 ## With another 24 hours
 

@@ -2,26 +2,33 @@
 
 ## Summary
 
-- **Final:** v4 (commit 173a349), board run-1d538165ea54: T 140.4 ms, M 70.4 MB, S 551, D 1,
-  K 25.80, 70.58 points. The reference is 72.69 s and 893 MB.
+- **Final:** v4 (commit 173a349). Best board run run-1d538165ea54: T 140.4 ms, M 70.4 MB,
+  S 551, D 1, K 25.80, 70.58 points. The median of its five board runs is 142.1 ms
+  (run-bc431b72ba59, K 25.64). The reference is 72.69 s and 893 MB.
 - **v1** (bucketed CSR, BFS renumbering, bidirectional Dijkstra, 4-byte edges): 156 ms,
   93.5 MB (run-0b83abcdda4d).
 - **THP opt-out**, a box-only memory fix: 93.5 to 79.8 MB (run-bf037ba42528).
 - **32-bit searches and a leaner BFS phase:** 70.8 MB (run-184dcb5b4f5a).
-- **Box probe split**, from deliberate wrong-output probes (red on the board): d0
+- **Box probe split**, from deliberate wrong-output *probes* (red on the board): d0
   run-94d4d2fef344, d3 run-e96c9c86ab33, d4 run-148c3b623aad, d2 run-9efbc7bcc92f, d1
   run-8db29a146c98. On the box: one parse ~10 ms, second parse and scatter ~14 ms, sort
   ~18 ms, rest of the build ~30 ms, queries ~75 ms.
-- **Head-to-heads that kept v4**, all inside its 140-148 ms spread or slower: one-parse
+- **Head-to-heads that kept v4**, with full correct *candidates*: one-parse
   run-c82840f14b70, buckets run-60ca41139fe7 and run-b927b67c49d7, pread
-  run-8c76e26ef37d, clean-room rework run-2a608e748f34.
+  run-8c76e26ef37d, fewer page faults (four runs), clean-room rework run-2a608e748f34.
+  Those that gained 2-3% in T on the box were still rejected, because their extra lines
+  (S) and memory (M) cost more in K than the time earned.
+- **Box noise** reaches 17% on one build (156, 181.9 and 166.5 ms for v1), so decisions
+  used reruns.
 - **Lesson:** a local CPU win is a hypothesis until a board run confirms it.
 
 Rows marked "(local)" were measured on an i7-14650HX, cpuset 0-11, under the harness's
 sandbox flags, with `bench/bench.sh` or an equivalent fresh-container run unless the row
 says otherwise. Local M is cgroup `memory.peak` in MiB, while the board reports MB: the
-final 68 MiB locally is 71.3 MB, against the board's 70.8 MB. Rows with a run ID are board
-runs. The scoring box is roughly 1.45x slower than the local machine, and its own runs
+final 68 MiB locally is 71.3 MB, against the board's 70.4 MB. Rows with a run ID are board
+runs. A *probe* is a deliberately wrong-output build (it fails the hash and shows red on
+the board) that measures part of the pipeline; a *candidate* is a full, correct build run
+head to head against v4. The scoring box is roughly 1.45x slower than the local machine, and its own runs
 vary: two reruns of the same v1 took 181.9 and 166.5 ms against 156.0. For part of the
 work the local machine was shared with other benchmark jobs, so close calls were decided
 by interleaved A/B runs of saved binaries, by repeating a phase several times in one
@@ -58,9 +65,15 @@ and marked "(computed)".
 | 17 | Review fixes, no change in speed: rustfmt, named libc constants, SAFETY notes. One real bug fixed: `split_lines` read `text[at - 1]` at `at == 0` when the edge text is shorter than the thread count (a one-edge graph on 12 threads aborted). New one-edge cases added to the tests. S 538 to 544 (named constants) | | same (local) | 68 MiB (local) | |
 | 17 (board) | v3 with the review fixes (commit 2cfc0f4), S 544 | run-83d74bc76638 | 0.1421 | 71.1 | 70.5 (computed) |
 | 18 | A third prefetch stage in the BFS walk: the claim flags (`rank` entries at random old ids) of the heads of the row 4 places ahead. The profile put about 70% of the walk on those loads | | total CPU -2.4% / -4% (local, two interleaved A/B runs of 6-8, medians); wall about 100 vs 104 ms | 68 MiB (local) | |
-| 18 (board) | v4 as submitted, S 551 (earlier run) | run-92dc80fd3ba2 | 0.1479 | | |
-| 18 (board) | v4 resubmitted, S 551 (rerun: box noise) | run-8e593d1f06b2 | 0.1464 | | |
-| **final** (board) | **v4, the submission** (commit 173a349), S 551, K 25.80 | run-1d538165ea54 | **0.1404** | **70.4** | **70.58** |
+| 18 (board) | v4 code, restored after the probes (M not recorded) | run-92dc80fd3ba2 | 0.1479 | | |
+| 18 (board) | v4 (commit 173a349), S 551, K 25.24: rerun | run-8e593d1f06b2 | 0.1464 | 70.7 | 70.10 |
+| 18 (board) | v4 (commit 173a349), S 551, K 25.64: rerun, the median | run-bc431b72ba59 | 0.1421 | 70.4 | 70.45 |
+| 18 (board) | v4 (commit 173a349), S 551, K 25.67: rerun | run-93e2691801f2 | 0.1412 | 71.2 | 70.47 |
+| **final** (board) | **v4, the submission** (commit 173a349), S 551, K 25.80: best run | run-1d538165ea54 | **0.1404** | **70.4** | **70.58** |
+| 19 | Operator hardening, no change on valid input: errors are reported as `track-d: ...` with the path and exit status 1 (empty file, missing final newline, bad header, n above 2^26 or m above 2^32 - 1, node id not below n, edge count unlike the header, weight above 2^32 - 1, bad query line with its number, unreadable or unwritable files); the id check rides the counting pass. Optional `[data] [out]` arguments, a static binary, an offline build. S 551 to 600 | | CPU within noise of v4 (median 1219 vs 1202 ms, interleaved, heavy load) | 68 MiB (local) | |
+
+Over the five board runs of the v4 code: median 142.1 ms, middle-3 mean 143.2 ms, mean
+143.6 ms, M 70.4-71.2 MB.
 
 Where the CPU goes (local, step 18, wall ms / total CPU ms / parallel efficiency, i.e.
 CPU / (wall x 12), measured from the cgroup's `cpu.stat` at each phase boundary; a
@@ -100,6 +113,9 @@ the build was cut into prefixes and each prefix was run on the board. Each probe
 everything after one point replaced by a placeholder answer (one `0` per query), so the
 board measures T and M even though the hash fails.
 
+Rows are ordered by how much of the pipeline each probe runs (the names follow the order
+in which they were made), so each row adds one step to the one above.
+
 | Probe | Runs up to | Run ID | Box T (ms) | Box M (MB) | Local T (ms) |
 |---|---|---|---|---|---|
 | d0 | start-up only: map the file, split it, start the threads | run-94d4d2fef344 | 1.5 | 7.2 | 3.9 |
@@ -107,7 +123,7 @@ board measures T and M even though the hash fails.
 | d4 | + the second parse and the scatter | run-148c3b623aad | 24.7 | 33.0 | 19.1 |
 | d2 | + the counting sort and offsets: the whole first CSR | run-9efbc7bcc92f | 43.0 | 40.1 | 23-27 |
 | d1 | + BFS walk, layout and in-edges: the whole build, no queries | run-8db29a146c98 | 72.7 | 69.3 | 57-70 |
-| v4 | everything | run-92dc80fd3ba2 | 147.9 | | 108-127 |
+| v4 | everything (a full correct run) | run-92dc80fd3ba2 | 147.9 | | 108-127 |
 
 By difference on the box: one parse about 9.6 ms, the second parse plus scatter 13.6 ms,
 counting sort plus offsets 18.3 ms, BFS + layout + in-edges about 30 ms, and the queries
@@ -121,7 +137,7 @@ the per-bucket working set.
 Figures below are local unless a run ID is given.
 
 - **No renumbering at all.** With the file's random ids, the same searches took 4.4x longer
-  (query phase 920 ms against 210 ms of wall time in step 1). Locality, not the algorithm,
+  (step 1's one-way, binary-heap searches: query phase 920 ms against 210 ms of wall time). Locality, not the algorithm,
   is the first-order effect here.
 - **Bidirectional search balanced on queue keys.** This is the textbook choice, but a
   source with no in-edges reaches the graph only through two ~2^32 weights. The backward
@@ -169,11 +185,11 @@ Figures below are local unless a run ID is given.
 - **Reusing the first CSR's tail side array for the in-edge build** (it has the same
   size, so no fresh page faults): median CPU 1051 against 1069 ms, within noise, and M
   unchanged. Not worth the extra parameter.
-- **Smaller buckets for both bucketed builds** (box, full correct runs). With 1,024-node
+- **Smaller buckets for both bucketed builds** (candidates d7f and d8f). With 1,024-node
   buckets (run-60ca41139fe7) the box measured 151.2 ms, 70.3 MB, K 24.86. With 2,048
   (run-b927b67c49d7) it measured 141.4 ms, 70.5 MB, K 25.70. Both are v4-level or worse
   against 4,096 (141-148 ms), and the same locally. Kept 4,096.
-- **Reading graph.txt with `pread` instead of `mmap`** (box, full correct run,
+- **Reading graph.txt with `pread` instead of `mmap`** (candidate d10,
   run-8c76e26ef37d: T 143.7 ms, M 70.4 MB, K 25.38). Each thread read its piece in 128 KiB
   chunks into one buffer, carrying the partial last line forward. On track A the same
   change cut box T by 15%. Here it landed inside v4's 141-148 ms spread, and the same
@@ -186,22 +202,23 @@ Figures below are local unless a run ID is given.
   6% faster, yet the box measured it 12-16% slower than v4. Kept v4. Lesson, again: on this
   box a local CPU win is only a hypothesis until a board run confirms it.
 - **Fewer page faults** (box, full correct runs, two each). Track A's largest box wins came
-  from cutting page faults, and v4 takes ~32K minor faults per run, so two variants reused
-  buffers across phases: d11 hands each finished phase's arrays to the next (32.1K → 22.5K
-  faults; run-dbc41ae6803b 137.8 ms, run-827ac63d50c0 142.4 ms, both 73 MB), and d12 adds
-  huge pages on the big build arrays only (13.7K faults; run-457ba7431807 140.9 ms,
-  run-3662b39214de 136.3 ms, 72.5-73.1 MB). Mean T 140.1 and 138.6 ms against v4's ~143.6
-  ms over its runs: a 2-3% gain, but +2.5 MB of M and S 551 → 589/609 cancel it (K 25.15-25.60
-  against v4's 25.24-25.80). Kept v4.
-- **One parse for the first CSR** (box probe d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
+  from cutting page faults, and v4 takes ~32K minor faults per run, so two candidates
+  reused buffers across phases: d11 hands each finished phase's arrays to the next (32.1K →
+  22.5K
+  faults; run-dbc41ae6803b 137.8 ms, run-827ac63d50c0 142.4 ms, both 73 MB), and candidate
+  d12 adds huge pages on the big build arrays only (13.7K faults; run-457ba7431807 140.9
+  ms, run-3662b39214de 136.3 ms, 72.5-73.1 MB). Mean T 140.1 and 138.6 ms against v4's
+  143.6 ms (the mean of its five runs; median 142.1): a 2-3% gain, but +2.5 MB of M and
+  S 551 → 589/609 cancel it (K 25.15-25.60 against v4's 25.24-25.80). Kept v4.
+- **One parse for the first CSR** (candidate d6, run-c82840f14b70: T 140.3 ms, M 71.4 MB).
   Each thread scatters into its own per-bucket runs, sized from its share of the text
   with a spill list for overflow, and a counting sort per bucket writes the final CSR
   straight from the runs. Locally that phase took 30% less CPU (105-124 against 146-198
   ms), and the whole run 2-3% less. On the box the full run came in at 140.3 against
   v4's 141-148 ms, inside the box's run-to-run spread. It needs a second build function,
   because the in-edges must stay in place to keep their phase under the memory peak:
-  S 551 to 662, so K would fall (25.09 against 25.69). Dropped.
-- **Interleaving out- and in-edge rows behind one offset array** (the lead's idea, -5 MiB):
+  S 551 to 662, so K would fall (25.09 against v4's median 25.64). Dropped.
+- **Interleaving out- and in-edge rows behind one offset array** (our idea, -5 MiB):
   not tried in the end. Building it within the current peak needs an in-place serial
   expansion of the edge array, and compressed offsets had already shown that the extra
   row arithmetic costs more in T than the saved memory earns in M.

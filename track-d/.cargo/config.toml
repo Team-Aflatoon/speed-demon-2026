@@ -1,3 +1,4 @@
-# Haswell-class baseline (AVX2, BMI2): matches the scoring box without depending on the build host.
+# Haswell-class baseline (AVX2, BMI2) for the scoring box, without depending on the build
+# host, and a static binary, so the run never pays for the dynamic loader.
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]

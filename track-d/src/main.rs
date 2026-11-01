@@ -6,6 +6,14 @@
 //!    cache lines instead of one per node. The walk lays out the forward graph in the
 //!    new order as it goes; transposing that gives the in-edges (`build_csr` again).
 //! 3. Answer the queries on all threads, each with a bidirectional Dijkstra.
+//!
+//! Where things are, in file order: errors and input (`fail`, `map_file`, `number`,
+//! `split_lines`); the thread team (`Team`, `parallel`); the graph (`Text`, `Csr`,
+//! `build_csr`); the renumbering (`bfs_layout`); the searches (`RadixHeap`, `Distances`,
+//! `Side`, `distance`); and `main`, which reads, builds, answers and writes.
+//!
+//! Usage: `traverse [data dir] [out dir]`, by default /data and /out. Input that breaks
+//! the format's rules is reported on stderr with exit status 1 (see README, "Errors").
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -26,11 +34,23 @@ const MAP_PRIVATE: i32 = 2;
 const M_MMAP_THRESHOLD: i32 = -3;
 const PR_SET_THP_DISABLE: i32 = 41;
 
+/// At most this many threads, the number the scoring harness grants.
+const MAX_THREADS: usize = 12;
+
+/// Reports a problem with the input or the files on stderr and exits with status 1.
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("track-d: {message}");
+    std::process::exit(1)
+}
+
 /// Maps a whole file read-only. The harness prewarms /data into the page cache, so this
 /// costs neither a copy nor memory charged to us.
 fn map_file(path: &str) -> std::io::Result<&'static [u8]> {
     let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
+    if len == 0 {
+        fail(format_args!("{path} is empty"));
+    }
     // SAFETY: a private read-only mapping of a file on a read-only mount; it stays valid
     // after `file` is closed and is never unmapped, hence 'static.
     let fd = file.as_raw_fd();
@@ -251,25 +271,36 @@ impl EdgeSource for Csr {
 /// Builds the CSR of n nodes holding the edge `map(u, v)` = (tail, head), of weight w,
 /// for every edge (u, v, w) of `source`. No atomic read-modify-write is needed: pass 1
 /// counts edges per (thread, bucket of 4096 tails), pass 2 writes each edge into its
-/// thread's private run of its bucket (with the tail's low bits alongside, in `low`),
-/// and finally every bucket is counting-sorted by tail on its own thread.
+/// thread's private run of its bucket, and finally every bucket is counting-sorted by
+/// tail on its own thread. `low[i]` holds the tail of `edges[i]` within its bucket (its
+/// low 12 bits), the one thing the packed edge lacks for that sort; it is dropped after.
 fn build_csr(
     source: &impl EdgeSource,
     parts: usize,
     n: usize,
     map: impl Fn(usize, usize) -> (usize, usize) + Sync,
 ) -> Csr {
-    // Bits left for the weight once a head id below n is stored.
+    // Bits left for the weight once a head id below n is stored (main checks n <= 2^26).
     let weight_bits = 32 - (usize::BITS - (n.max(2) - 1).leading_zeros());
-    assert!(weight_bits >= 6, "too many nodes for 32-bit edges");
+    assert!(weight_bits >= 6, "n = {n} exceeds 2^26");
     let escape = (1u64 << weight_bits) - 1;
     const BUCKET_BITS: u32 = 12; // a bucket's histogram stays in L1
     let buckets = (n >> BUCKET_BITS) + 1;
+    // Pass 1: count. It also notes the largest id seen, checked against n before any id
+    // is used as an index (the clamp keeps a bad id from panicking first).
     let counts = parallel(vec![(); parts], |k, ()| {
-        let mut count = vec![0u32; buckets];
-        source.each(k, parts, |u, v, _| count[map(u, v).0 >> BUCKET_BITS] += 1);
-        count
+        let (mut count, mut top) = (vec![0u32; buckets], 0);
+        source.each(k, parts, |u, v, _| {
+            top = top.max(u).max(v);
+            count[(map(u, v).0 >> BUCKET_BITS).min(buckets - 1)] += 1;
+        });
+        (count, top)
     });
+    if let Some(top) = counts.iter().map(|c| c.1).max().filter(|&top| top >= n) {
+        fail(format_args!(
+            "graph.txt: node id {top} is not below n = {n}"
+        ));
+    }
     // Each thread's cursor per bucket: bucket start plus what earlier threads put there.
     let mut cursors = vec![vec![0u32; buckets]; parts];
     let mut bucket_start = vec![0u32; buckets + 1];
@@ -278,11 +309,12 @@ fn build_csr(
         bucket_start[b] = at;
         for k in 0..parts {
             cursors[k][b] = at;
-            at += counts[k][b];
+            at += counts[k].0[b];
         }
     }
     bucket_start[buckets] = at;
-    // calloc'd: the writers fault the pages in. Relaxed atomic stores are plain stores.
+    // Pass 2: scatter. The arrays are calloc'd, so the writers fault the pages in, and
+    // relaxed atomic stores compile to plain stores.
     let (mut edges, mut low) = (vec![0u32; at as usize], vec![0u16; at as usize]);
     let (edge_cells, low_cells) = (as_atomic(&mut edges), as_atomic(&mut low));
     let escaped = parallel(cursors, |k, mut cursor| {
@@ -295,6 +327,9 @@ fn build_csr(
             low_cells[*slot as usize].store((x & ((1 << BUCKET_BITS) - 1)) as u16, Relaxed);
             *slot += 1;
             if w >= escape {
+                if w > u32::MAX as u64 {
+                    fail(format_args!("graph.txt: weight {w} is above 2^32 - 1"));
+                }
                 escaped.push((x as u32, y as u32, w as u32));
             }
         });
@@ -304,8 +339,8 @@ fn build_csr(
     escapes.sort_unstable();
     escapes.dedup_by_key(|e| (e.0, e.1));
 
-    // Counting-sort every bucket by tail; its histogram is also that bucket's offsets.
-    // Buckets are disjoint, so the arrays are split between threads.
+    // Pass 3: counting-sort every bucket by tail; its histogram is also that bucket's
+    // offsets. Buckets are disjoint, so the arrays are split between threads.
     let mut off = vec![0u32; n + 1];
     let mut work = Vec::with_capacity(buckets);
     let (mut rest_e, mut rest_l, mut rest_o) = (&mut edges[..], &low[..], &mut off[1..]);
@@ -365,9 +400,18 @@ fn prefetch<T>(data: &[T]) {
 ///
 /// A thread copies each row as it dequeues it, so its rows come out already in new-id
 /// order and placing them is one sequential, renaming copy. To keep this phase's memory
-/// down, `rank` itself is the claim flag: 0 while unclaimed, then `(k << 27 | i) + 1` for
-/// thread k's i-th node until the threads' counts are known. Degrees are kept in a byte
-/// each (255 means "see `wide`"), and the BFS queue holds only the frontier.
+/// down, `rank` itself is the claim flag: 0 while unclaimed, then
+/// `(k << THREAD_SHIFT | i) + 1` for thread k's i-th node until the threads' counts are
+/// known. Degrees are kept in a byte each (255 means "see `wide`"), and the BFS queue
+/// holds only the frontier.
+///
+/// Stages: (1) the walk, in parallel; (2) each thread's first new id and first edge, from
+/// the walk sizes; (3) the provisional ids made final, in parallel; (4) the rows copied
+/// into the old graph's arrays with heads renamed, in parallel; (5) the escapes renamed.
+/// Bits for a thread's own node index in a provisional id; enough because main checks
+/// n <= 2^26, and the thread number above them stays below 2^5.
+const THREAD_SHIFT: u32 = 27;
+
 fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let n = g.rows();
     let mut rank = vec![0u32; n];
@@ -380,8 +424,7 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let walks = parallel(vec![(); threads], |k, ()| {
         let (mut queue, mut degrees, mut wide, mut rows) =
             (VecDeque::new(), Vec::new(), Vec::new(), Vec::new());
-        // i < 2^27 always: `build_csr` asserts n <= 2^26 (at least 6 weight bits).
-        let mut next = (k << 27) as u32 + 1;
+        let mut next = (k << THREAD_SHIFT) as u32 + 1;
         for root in k * n / threads..(k + 1) * n / threads {
             if claim(root, next) {
                 queue.push_back(root as u32);
@@ -416,7 +459,7 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
                 }
             }
         }
-        (degrees, wide, rows)
+        (degrees, wide, rows) // each walk: degree bytes, degrees >= 255, copied rows
     });
     // Thread k's nodes take the next run of new ids and its rows the next run of edges.
     let starts: Vec<_> = walks
@@ -431,8 +474,8 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     parallel(ranges, |_, nodes| {
         for v in nodes {
             let id = ids[v].load(Relaxed) - 1;
-            let first = starts[id as usize >> 27].0 as u32;
-            ids[v].store(first + (id & ((1 << 27) - 1)), Relaxed);
+            let first = starts[id as usize >> THREAD_SHIFT].0 as u32;
+            ids[v].store(first + (id & ((1 << THREAD_SHIFT) - 1)), Relaxed);
         }
     });
     // Every row has been copied out, so the old arrays (same sizes) take the new graph:
@@ -657,7 +700,7 @@ fn distance<T: Width>(g: [&Csr; 2], [f, b]: &mut [Side<T>; 2], s: usize, t: usiz
     Some(best.try_into().unwrap_or(-1)) // u64::MAX (no path) is the one value i64 cannot hold
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     // Fix glibc's mmap threshold at 1 MiB. Left dynamic, it grows after the first big free,
     // and later big buffers then come from arenas that never give memory back, so every
     // finished build phase would stay in the peak. Also opt out of transparent huge pages:
@@ -668,24 +711,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mallopt(M_MMAP_THRESHOLD, 1 << 20);
         prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64);
     }
-    let threads = available_parallelism().map_or(1, usize::from).min(12);
+    let threads = available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_THREADS);
     Team::start(threads);
-    let text = map_file("/data/graph.txt")?;
-    let mut i = 0;
-    let n = number(text, &mut i) as usize;
-    number(text, &mut i); // m: the edge count is implied by the lines themselves
-    let text = Text(split_lines(&text[i..], threads));
+    let mut args = std::env::args().skip(1);
+    let data = args.next().unwrap_or_else(|| "/data".into());
+    let out = args.next().unwrap_or_else(|| "/out".into());
+    let path = format!("{data}/graph.txt");
+    let text = map_file(&path).unwrap_or_else(|e| fail(format_args!("cannot read {path}: {e}")));
+    // O(1) checks that keep the parser inside the text: a final LF ends every number.
+    if text.last() != Some(&b'\n') {
+        fail(format_args!("{path} does not end with a newline"));
+    }
+    let header = text.iter().position(|&c| c == b'\n').unwrap_or(0);
+    let head = std::str::from_utf8(&text[..header]).unwrap_or("");
+    let mut fields = head.split(' ');
+    let mut field = || fields.next().and_then(|f| f.parse::<usize>().ok());
+    let (Some(n), Some(m), None) = (field(), field(), field()) else {
+        fail(format_args!("{path}: the first line is not `n m`"))
+    };
+    if n > 1 << 26 {
+        fail(format_args!("{path}: n = {n} exceeds 2^26")); // the 32-bit edges' limit
+    }
+    if m > u32::MAX as usize {
+        fail(format_args!("{path}: m = {m} exceeds 2^32 - 1")); // the row offsets' limit
+    }
+    let text = Text(split_lines(&text[header + 1..], threads));
 
     let first = build_csr(&text, threads, n, |u, v| (u, v));
+    let edges = first.edges.len();
+    if edges != m {
+        fail(format_args!(
+            "{path}: {edges} edge lines, but the header says {m}"
+        ));
+    }
     let (rank, fwd) = bfs_layout(first, threads);
-    let node = |id: &str| id.parse().map(|id: usize| rank[id] as usize);
-    let queries = std::fs::read_to_string("/data/queries.txt")?
-        .lines()
-        .map(|line| {
-            let (s, t) = line.split_once(' ').ok_or("bad line in queries.txt")?;
-            Ok((node(s)?, node(t)?))
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let path = format!("{data}/queries.txt");
+    let lines = std::fs::read_to_string(&path);
+    let lines = lines.unwrap_or_else(|e| fail(format_args!("cannot read {path}: {e}")));
+    let id = |f: &str| f.parse::<usize>().ok().filter(|&id| id < n);
+    let mut queries = Vec::new();
+    for (k, line) in lines.lines().enumerate() {
+        match line.split_once(' ').map(|(s, t)| (id(s), id(t))) {
+            Some((Some(s), Some(t))) => queries.push((rank[s] as usize, rank[t] as usize)),
+            _ => fail(format_args!("{path}:{}: not `s t` below n = {n}", k + 1)),
+        }
+    }
     drop(rank);
     let bwd = build_csr(&fwd, threads, n, |u, v| (v, u));
 
@@ -704,10 +776,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             answers[q].store(answer.expect("64-bit distances always fit"), Relaxed);
         }
     });
-    let out: String = answers
+    let answers: String = answers
         .iter()
         .map(|a| format!("{}\n", a.load(Relaxed)))
         .collect();
-    std::fs::write("/out/distances.txt", out)?;
-    Ok(())
+    let path = format!("{out}/distances.txt");
+    std::fs::write(&path, answers)
+        .unwrap_or_else(|e| fail(format_args!("cannot write {path}: {e}")));
 }
