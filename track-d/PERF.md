@@ -2,8 +2,13 @@
 
 ## Summary
 
-- **Final:** v4 (commit 173a349). Best board run run-1d538165ea54: T 140.4 ms, M 70.4 MB,
-  S 551, D 1, K 25.80, 70.58 points. The median of its five board runs is 142.1 ms
+- **Final, as submitted:** step 19 (commit 13b0490), the v4 algorithm hardened against
+  bad input. Board runs: run-79d73088c3c3 143.1 ms, 71.3 MB, K 25.16, and run-053708dfffa2
+  148.6 ms, 70.5 MB, K 24.75; median 145.9 ms, K 24.96. S rose 551 → 600 because the
+  program now fails loudly, with a clear message, on a malformed input it has not seen,
+  instead of panicking or answering wrongly.
+- **Best algorithmic build, before hardening:** v4 (step 18, commit 173a349), best run
+  run-1d538165ea54 at 140.4 ms, 70.4 MB, K 25.80; median of its five runs 142.1 ms
   (run-bc431b72ba59, K 25.64). The reference is 72.69 s and 893 MB.
 - **v1** (bucketed CSR, BFS renumbering, bidirectional Dijkstra, 4-byte edges): 156 ms,
   93.5 MB (run-0b83abcdda4d).
@@ -24,9 +29,9 @@
 
 Rows marked "(local)" were measured on an i7-14650HX, cpuset 0-11, under the harness's
 sandbox flags, with `bench/bench.sh` or an equivalent fresh-container run unless the row
-says otherwise. Local M is cgroup `memory.peak` in MiB, while the board reports MB: the
-final 68 MiB locally is 71.3 MB, against the board's 70.4 MB. Rows with a run ID are board
-runs. A *probe* is a deliberately wrong-output build (it fails the hash and shows red on
+says otherwise. Memory units: the board reports M in MB, meaning 10^6 bytes of cgroup
+`memory.peak`; local figures are MiB (2^20 bytes). So the final 68 MiB locally is 71.3 MB,
+and the board measured 70.4-71.3 MB. Rows with a run ID are board runs. A *probe* is a deliberately wrong-output build (it fails the hash and shows red on
 the board) that measures part of the pipeline; a *candidate* is a full, correct build run
 head to head against v4. The scoring box is roughly 1.45x slower than the local machine, and its own runs
 vary: two reruns of the same v1 took 181.9 and 166.5 ms against 156.0. For part of the
@@ -69,11 +74,15 @@ and marked "(computed)".
 | 18 (board) | v4 (commit 173a349), S 551, K 25.24: rerun | run-8e593d1f06b2 | 0.1464 | 70.7 | 70.10 |
 | 18 (board) | v4 (commit 173a349), S 551, K 25.64: rerun, the median | run-bc431b72ba59 | 0.1421 | 70.4 | 70.45 |
 | 18 (board) | v4 (commit 173a349), S 551, K 25.67: rerun | run-93e2691801f2 | 0.1412 | 71.2 | 70.47 |
-| **final** (board) | **v4, the submission** (commit 173a349), S 551, K 25.80: best run | run-1d538165ea54 | **0.1404** | **70.4** | **70.58** |
-| 19 | Operator hardening, no change on valid input: errors are reported as `track-d: ...` with the path and exit status 1 (empty file, missing final newline, bad header, n above 2^26 or m above 2^32 - 1, node id not below n, edge count unlike the header, weight above 2^32 - 1, bad query line with its number, unreadable or unwritable files); the id check rides the counting pass. Optional `[data] [out]` arguments, a static binary, an offline build. S 551 to 600 | run-053708dfffa2 | 0.1486 | 70.5 | 69.68 |
+| 18 (board) | v4 (commit 173a349), S 551, K 25.80: its best run, the best algorithmic build before hardening | run-1d538165ea54 | 0.1404 | 70.4 | 70.58 |
+| 19 | Operator hardening, no change on valid input: errors are reported as `track-d: ...` with the path and exit status 1 (empty file, missing final newline, bad header, n above 2^26 or m above 2^32 - 1, node id not below n, edge count unlike the header, weight above 2^32 - 1, bad query line with its number, unreadable or unwritable files); the id check rides the counting pass. Optional `[data] [out]` arguments, a static binary, an offline build. S 551 to 600 | | same CPU as v4 (local) | 68 MiB (local) | |
+| 19 (board) | step 19 as submitted (commit 13b0490), S 600, K 24.75 | run-053708dfffa2 | 0.1486 | 70.5 | 69.68 |
+| **final** (board) | **step 19 as submitted** (commit 13b0490), S 600, K 25.16; the median of its two runs is 145.9 ms, K 24.96 | run-79d73088c3c3 | **0.1431** | **71.3** | **70.04** |
+| 20 | Polish, no change on valid input: `fail` lets only its first caller report (team threads can fail at once); a line with fewer than three numbers fails with a byte offset instead of an index panic, checked on the parser's byte-at-a-time path only; team threads start through `Builder::spawn`; a `Walk` struct names the walk's results; doc fixes. S 618 (+18 over step 19) | | same (local) | 68 MiB (local) | |
 
 Over the five board runs of the v4 code: median 142.1 ms, middle-3 mean 143.2 ms, mean
-143.6 ms, M 70.4-71.2 MB.
+143.6 ms, M 70.4-71.2 MB. Over the two runs of the submitted step 19: 143.1 and 148.6 ms,
+median 145.9 ms.
 
 Where the CPU goes (local, step 18, wall ms / total CPU ms / parallel efficiency, i.e.
 CPU / (wall x 12), measured from the cgroup's `cpu.stat` at each phase boundary; a
@@ -141,27 +150,27 @@ Figures below are local unless a run ID is given.
   is the first-order effect here.
 - **Bidirectional search balanced on queue keys.** This is the textbook choice, but a
   source with no in-edges reaches the graph only through two ~2^32 weights. The backward
-  side then settled the whole main body before the forward side moved: 0.33 s and 185 MB.
+  side then settled the whole main body before the forward side moved: 0.33 s and 185 MiB.
   Taking turns fixed it.
 - **Second CSR built from the first one in memory (at step 5).** It saved 8 ms of parsing
-  but kept both graphs alive at once: +24 MB, so the K change was about zero. Step 7 does
+  but kept both graphs alive at once: +24 MiB, so the K change was about zero. Step 7 does
   the same thing with a far smaller footprint (moving rows needs no sort and no side array).
 - **Plain-store claims in the BFS**, deduplicating the rare double claim afterwards. It
   made no measurable difference to the load-then-swap claim, which is exact and simpler.
 - **Transparent huge pages** via `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`: no gain in the
-  query or build phases, and +17 MB of peak.
-- **Binary heap instead of the radix heap**: 7 MB less memory but about 8% slower overall.
+  query or build phases, and +17 MiB of peak.
+- **Binary heap instead of the radix heap**: 7 MiB less memory but about 8% slower overall.
 - **Occupancy bitmask in the radix heap** (`trailing_zeros` instead of scanning 65 bucket
   headers): no measurable change.
-- **Smaller distance blocks** (32 or 64 nodes): 2-3 MB less, no change in T, not kept.
+- **Smaller distance blocks** (32 or 64 nodes): 2-3 MiB less, no change in T, not kept.
 - **Shared distance pairs** (`[forward, backward]` per node, so the meeting test reads the
   same line): the query phase went from 44 to 48 ms, because each side's own distances
   got half as dense.
-- **Compressed offsets** (a u32 per 16 rows plus a u16 per row): 6 MB less, but the
+- **Compressed offsets** (a u32 per 16 rows plus a u16 per row): 6 MiB less, but the
   layout went 7 ms slower and the queries 2 ms. Rejected.
 - **In-edges read off the near-symmetric out-edges** (the lightest reverse weight as a u16
   next to each out-edge, plus a sorted list for the ~3% one-way edges), replacing the
-  transposed CSR: 8 MB less, but building it took 16 ms against 10, and the filtered,
+  transposed CSR: 8 MiB less, but building it took 16 ms against 10, and the filtered,
   chained iteration made backward searches 11 ms slower. Rejected.
 - **Pruning pushes by the other side's smallest key** (correct: from a node the other side
   has not settled, at least that much is left): no measurable change.
@@ -170,7 +179,7 @@ Figures below are local unless a run ID is given.
   speedup, so they were set aside then. In v3, with memory the target, they came back
   with an exact 64-bit retry (step 14): no T change, 5 MiB less.
 - **`malloc_trim(0)` before the queries, smaller distance blocks and heap buffers**: no
-  change in M. The query phase's extra memory is the real per-search data (about 0.5 MB
+  change in M. The query phase's extra memory is the real per-search data (about 0.5 MiB
   for each of the 24 searches at their largest).
 - **A 32-bit tail side array** (which drops the atomic-type trait): 9 fewer lines, but the
   transpose was about 2 ms slower. Reverted.
@@ -228,6 +237,6 @@ Figures below are local unless a run ID is given.
 - In a parallel scatter, a locked read-modify-write per element costs more than the parse
   itself, because each one is a full fence. Per-thread cursors into private runs remove it.
 - glibc's dynamic mmap threshold quietly turns "freed" into "still resident". Pinning it
-  took 40 MB off the peak with one call.
+  took 40 MiB off the peak with one call.
 - For the memory axis, what counts is the peak of the live set per phase. Ordering frees
   (and translating the queries before the transpose) mattered as much as compact layouts.

@@ -18,7 +18,8 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicUsize};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread::available_parallelism;
 
@@ -37,11 +38,20 @@ const PR_SET_THP_DISABLE: i32 = 41;
 /// At most this many threads, the number the scoring harness grants.
 const MAX_THREADS: usize = 12;
 
-/// Reports a problem with the input or the files on stderr and exits with status 1.
+/// Reports a problem with the input or the files on stderr and exits with status 1. Team
+/// threads can hit a bad input at once: the first caller reports, the rest wait for the
+/// exit, so exactly one message is printed.
 fn fail(message: impl std::fmt::Display) -> ! {
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    while FAILED.swap(true, AcqRel) {
+        std::thread::park(); // a later caller: wait here for the first one's exit
+    }
     eprintln!("track-d: {message}");
     std::process::exit(1)
 }
+
+/// Where graph.txt is mapped, so the parser can report a malformed line's byte offset.
+static GRAPH_START: AtomicUsize = AtomicUsize::new(0);
 
 /// Maps a whole file read-only. The harness prewarms /data into the page cache, so this
 /// costs neither a copy nor memory charged to us.
@@ -88,7 +98,12 @@ fn number(text: &[u8], i: &mut usize) -> u64 {
     }
     let mut x = 0;
     loop {
-        let c = text[*i];
+        // Only long numbers and the last bytes of a piece get here, so this check is off
+        // the hot path. Running off the piece means a line had fewer than three numbers.
+        let Some(&c) = text.get(*i) else {
+            let at = text.as_ptr() as usize + *i - GRAPH_START.load(Relaxed);
+            fail(format_args!("graph.txt: too few numbers near byte {at}"))
+        };
         *i += 1;
         if c < b'0' {
             return x;
@@ -134,12 +149,14 @@ impl Team {
             done,
         }));
         for k in 1..size {
-            std::thread::spawn(move || loop {
+            let member = move || loop {
                 team.start.wait();
                 let job = team.job.lock().unwrap().expect("a job is set before start");
                 job(k);
                 team.done.wait();
-            });
+            };
+            let spawned = std::thread::Builder::new().spawn(member);
+            spawned.unwrap_or_else(|e| fail(format_args!("starting thread {k}: {e}")));
         }
         TEAM.set(team).ok();
     }
@@ -314,7 +331,8 @@ fn build_csr(
     }
     bucket_start[buckets] = at;
     // Pass 2: scatter. The arrays are calloc'd, so the writers fault the pages in, and
-    // relaxed atomic stores compile to plain stores.
+    // relaxed atomic stores compile to plain stores. `low[i]` is the low 12 bits of edge
+    // i's tail, its position within its bucket.
     let (mut edges, mut low) = (vec![0u32; at as usize], vec![0u16; at as usize]);
     let (edge_cells, low_cells) = (as_atomic(&mut edges), as_atomic(&mut low));
     let escaped = parallel(cursors, |k, mut cursor| {
@@ -327,6 +345,7 @@ fn build_csr(
             low_cells[*slot as usize].store((x & ((1 << BUCKET_BITS) - 1)) as u16, Relaxed);
             *slot += 1;
             if w >= escape {
+                // escape < 2^26, so every weight above 2^32 - 1 arrives here.
                 if w > u32::MAX as u64 {
                     fail(format_args!("graph.txt: weight {w} is above 2^32 - 1"));
                 }
@@ -339,8 +358,8 @@ fn build_csr(
     escapes.sort_unstable();
     escapes.dedup_by_key(|e| (e.0, e.1));
 
-    // Pass 3: counting-sort every bucket by tail; its histogram is also that bucket's
-    // offsets. Buckets are disjoint, so the arrays are split between threads.
+    // Pass 3: sort each bucket by tail, with a counting sort whose histogram is also the
+    // bucket's offsets. Buckets are disjoint, so the arrays are split between threads.
     let mut off = vec![0u32; n + 1];
     let mut work = Vec::with_capacity(buckets);
     let (mut rest_e, mut rest_l, mut rest_o) = (&mut edges[..], &low[..], &mut off[1..]);
@@ -392,6 +411,20 @@ fn prefetch<T>(data: &[T]) {
     unsafe { _mm_prefetch::<_MM_HINT_T0>(data.as_ptr() as *const i8) };
 }
 
+/// Bits for a thread's own node index in a provisional id; enough because main checks
+/// n <= 2^26, and the thread number above them stays below 2^5.
+const THREAD_SHIFT: u32 = 27;
+
+/// What one thread's BFS walk leaves behind, in its dequeue order: each node's degree in
+/// a byte (255 means "the next entry of `wide`"), the degrees of 255 or more, and a copy of
+/// each node's row of packed edges.
+#[derive(Default)]
+struct Walk {
+    degrees: Vec<u8>,
+    wide: Vec<u32>,
+    rows: Vec<u32>,
+}
+
 /// Renumbers the nodes in BFS order and returns `rank` (old id -> new id) with the
 /// graph laid out in that order. Each thread walks its own share of the old ids and
 /// grows a BFS region from every one not yet claimed, so the first regions spread until
@@ -408,10 +441,6 @@ fn prefetch<T>(data: &[T]) {
 /// Stages: (1) the walk, in parallel; (2) each thread's first new id and first edge, from
 /// the walk sizes; (3) the provisional ids made final, in parallel; (4) the rows copied
 /// into the old graph's arrays with heads renamed, in parallel; (5) the escapes renamed.
-/// Bits for a thread's own node index in a provisional id; enough because main checks
-/// n <= 2^26, and the thread number above them stays below 2^5.
-const THREAD_SHIFT: u32 = 27;
-
 fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let n = g.rows();
     let mut rank = vec![0u32; n];
@@ -422,8 +451,7 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
         ids[v].load(Relaxed) == 0 && ids[v].compare_exchange(0, id, Relaxed, Relaxed).is_ok()
     };
     let walks = parallel(vec![(); threads], |k, ()| {
-        let (mut queue, mut degrees, mut wide, mut rows) =
-            (VecDeque::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut queue, mut walk) = (VecDeque::new(), Walk::default());
         let mut next = (k << THREAD_SHIFT) as u32 + 1;
         for root in k * n / threads..(k + 1) * n / threads {
             if claim(root, next) {
@@ -446,10 +474,10 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
                     }
                 }
                 let row = g.row(u as usize);
-                rows.extend_from_slice(row);
-                degrees.push(row.len().min(255) as u8);
+                walk.rows.extend_from_slice(row);
+                walk.degrees.push(row.len().min(255) as u8);
                 if row.len() >= 255 {
-                    wide.push(row.len() as u32);
+                    walk.wide.push(row.len() as u32);
                 }
                 for &e in row {
                     if claim((e >> g.weight_bits) as usize, next) {
@@ -459,13 +487,14 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
                 }
             }
         }
-        (degrees, wide, rows) // each walk: degree bytes, degrees >= 255, copied rows
+        walk
     });
     // Thread k's nodes take the next run of new ids and its rows the next run of edges.
     let starts: Vec<_> = walks
         .iter()
         .scan((0, 0), |at, w| {
-            Some(std::mem::replace(at, (at.0 + w.0.len(), at.1 + w.2.len())))
+            let next = (at.0 + w.degrees.len(), at.1 + w.rows.len());
+            Some(std::mem::replace(at, next))
         })
         .collect();
     let ranges = (0..threads)
@@ -485,13 +514,13 @@ fn bfs_layout(g: Csr, threads: usize) -> (Vec<u32>, Csr) {
     let mask = (1 << weight_bits) - 1;
     parallel(
         walks.into_iter().zip(starts).collect(),
-        |_, ((degrees, wide, rows), (first, at))| {
-            let (mut w, mut end) = (wide.into_iter(), at as u32);
-            for (i, &d) in degrees.iter().enumerate() {
+        |_, (walk, (first, at))| {
+            let (mut w, mut end) = (walk.wide.into_iter(), at as u32);
+            for (i, &d) in walk.degrees.iter().enumerate() {
                 end += if d < 255 { d as u32 } else { w.next().unwrap() };
                 off_cells[first + i].store(end, Relaxed);
             }
-            for (i, &e) in rows.iter().enumerate() {
+            for (i, &e) in walk.rows.iter().enumerate() {
                 edge_cells[at + i].store(
                     ids[(e >> weight_bits) as usize].load(Relaxed) << weight_bits | e & mask,
                     Relaxed,
@@ -720,6 +749,7 @@ fn main() {
     let out = args.next().unwrap_or_else(|| "/out".into());
     let path = format!("{data}/graph.txt");
     let text = map_file(&path).unwrap_or_else(|e| fail(format_args!("cannot read {path}: {e}")));
+    GRAPH_START.store(text.as_ptr() as usize, Relaxed);
     // O(1) checks that keep the parser inside the text: a final LF ends every number.
     if text.last() != Some(&b'\n') {
         fail(format_args!("{path} does not end with a newline"));

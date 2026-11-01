@@ -6,10 +6,14 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-The submitted version (commit 173a349) measured on the board as run-1d538165ea54:
-T 140.4 ms, M 70.4 MB, S 551, D 1, K 25.80 (70.58 points). The median of its five board
-runs is 142.1 ms. The reference is 72.69 s and 893 MB. PERF.md has every step with its
-board run.
+The submitted version is PERF step 19 (commit 13b0490): the v4 algorithm, hardened
+against bad input. Its board runs are run-79d73088c3c3 (143.1 ms, 71.3 MB, K 25.16) and
+run-053708dfffa2 (148.6 ms, 70.5 MB, K 24.75), median 145.9 ms, with S 600 and D 1. S rose
+from 551 because the program now fails loudly, with a clear message, on a malformed input
+it has not seen, instead of panicking or answering wrongly. The best algorithmic build,
+before hardening, is v4 (PERF step 18, commit 173a349): best run run-1d538165ea54 at
+140.4 ms, 70.4 MB, K 25.80, and a median of 142.1 ms over its five runs. The reference
+is 72.69 s and 893 MB. MB means 10^6 bytes, as on the board; local figures are MiB.
 
 Where the time goes on the scoring box, from prefix probes (PERF.md):
 
@@ -38,7 +42,8 @@ directory holds `graph.txt` and `queries.txt`, and the answers go to `distances.
 The whole run is one Rust binary, `src/main.rs`, with no dependencies. Most of the work
 goes into getting the graph into a compact, cache-friendly shape quickly, because that is
 what our measurements said matters: renumbering the nodes for locality alone made the
-searches 4.4x faster (measured in our first version, with one-way binary-heap searches). The 2,000 searches themselves are short.
+searches 4.4x faster (measured in our first version, with one-way binary-heap searches).
+The 2,000 searches themselves are short.
 
 **Parsing.** `graph.txt` is memory-mapped (the harness has it in the page cache already, so
 this costs no copy and no charged memory) and cut into one piece per thread at line
@@ -123,8 +128,10 @@ seed 1 with identical output.
 The input is trusted to follow the spec's format, and every violation that is cheap to
 detect is reported on stderr as `track-d: ...`, with the file's path where it applies,
 and exit status 1. That covers an empty or unreadable file, a missing final newline, a
-bad header, n above 2^26 or m above 2^32 - 1, a node id not below n, an edge count unlike the header's, a
-weight above 2^32 - 1, a query line that is not `s t` with both below n (with its line
+bad header, n above 2^26 or m above 2^32 - 1, a node id not below n, a weight above
+2^32 - 1, a line with fewer than three numbers (with a byte offset near it), an edge
+count unlike the header's (checked once the first graph is built, since the lines are
+counted by building it), a query line that is not `s t` with both below n (with its line
 number), and an output file that cannot be written. Checking every byte of every line
 would cost the parse its speed, so a line that is malformed in other ways can still
 produce a wrong answer or abort the run.
