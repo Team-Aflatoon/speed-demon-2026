@@ -6,7 +6,7 @@
 
 use crate::fail;
 use crate::index::PARTS;
-use crate::query::{Lookup, Parsed, Probe, Table, BOOL_TERM, ID_MASK, NONE, RANGE_SHIFT, SHORT};
+use crate::query::{Key, Parsed, Table, ANCHOR, BOOL_TERM, NONE, RANGE_SHIFT};
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -17,10 +17,10 @@ compile_error!("track-b needs AVX2: build with -C target-cpu=x86-64-v3 (see .car
 /// Bytes per `pread`. Reading into a small reused buffer measured 15% faster
 /// than `mmap` on the scoring box (Track A), whose page-fault path is slow.
 const PIECE: usize = 128 << 10;
-/// Slack after the data, so 64-byte vector loads and 16-byte key loads stay
+/// Slack after the data, so 64-byte vector loads and 12-byte key loads stay
 /// inside the buffer; whatever they read past the data is masked off.
 const PAD: usize = 64;
-/// Tokens hashed, with their buckets prefetched, before the first is resolved,
+/// Tokens hashed, with their slots prefetched, before the first is resolved,
 /// so that the cache misses of rare words overlap.
 const BATCH: usize = 64;
 /// Documents are numbered from 0 in each segment and stored as `u16`.
@@ -46,38 +46,29 @@ pub struct Scanner<'a> {
     queries: &'a [u8],
     parsed_ranges: &'a [&'a Parsed],
     buf: Vec<u8>,
-    /// Per token of the region being scanned: its start and end (one past)
-    /// at `bounds[2k]` and `bounds[2k + 1]`.
-    bounds: Vec<u32>,
-    /// Per line of the region: one past its last token.
+    /// Per token of the region being scanned: start, end (one past) and term id.
+    starts: Vec<u32>,
+    ends: Vec<u32>,
+    ids: Vec<u32>,
+    /// LF positions of the region.
     lfs: Vec<u32>,
     doc: Doc,
 }
 
-/// A run of tokens of one document: their probes, their
-/// bounds (start, end) in the buffer, and the region index of the first.
-struct Run<'r> {
-    probes: &'r [Probe],
-    bounds: &'r [u32],
-    first: usize,
-}
-
-/// The document being scanned: number `local` in its segment, whose first
-/// token is token `first` of the region. The arrays are indexed by token
-/// within the document and grow to its length (see `Doc::record`).
+/// The document being scanned: number `local` in its segment, and the run of
+/// the region's tokens from `first`.
 #[derive(Default)]
 struct Doc {
     local: u32,
+    /// Invariant: the region index of the document's first token, so its
+    /// tokens are `ids[first..]` up to the current token.
     first: usize,
-    /// The term id of each token so far (0 for no query term).
-    ids: Vec<u32>,
-    /// The distinct BOOL terms so far: `fresh[..n_fresh]`.
+    /// The distinct BOOL terms so far: `fresh[..n_fresh]` (sized like `ids`).
     fresh: Vec<u32>,
     /// Invariant: at most the document's token count, and 0 between documents.
     n_fresh: usize,
-    /// Tokens that anchor phrases: `hits[..n_hits]`, likewise.
+    /// Tokens (region indexes) that anchor phrases.
     hits: Vec<u32>,
-    n_hits: usize,
     /// Bitset over term ids: BOOL terms already in `fresh`.
     seen: Vec<u64>,
 }
@@ -88,18 +79,20 @@ impl<'a> Scanner<'a> {
         queries: &'a [u8],
         parsed_ranges: &'a [&'a Parsed],
     ) -> Scanner<'a> {
-        let seen = vec![0; table.ids().div_ceil(64)]; // a bit per id (see `Doc::record`)
+        let seen = vec![0; table.ids() / 64 + 1]; // one more id: `Table::miss`
         let doc = Doc {
             seen,
             ..Doc::default()
         };
-        let (buf, bounds, lfs) = Default::default();
+        let (buf, starts, ends, ids, lfs) = Default::default();
         Scanner {
             table,
             queries,
             parsed_ranges,
             buf,
-            bounds,
+            starts,
+            ends,
+            ids,
             lfs,
             doc,
         }
@@ -123,18 +116,17 @@ impl<'a> Scanner<'a> {
         // that is the end of the previous chunk's last line.
         let (mut off, mut len, mut skip) = (from.saturating_sub(1), 0, from > 0);
         let mut known = false; // whether `doc.local` is set
-        let mut buf = std::mem::take(&mut self.buf); // put back on return
         loop {
-            if buf.len() < len + PIECE + PAD {
-                buf.resize(len + PIECE + PAD, 0);
+            if self.buf.len() < len + PIECE + PAD {
+                self.buf.resize(len + PIECE + PAD, 0);
             }
-            let n = read_full(file, &mut buf[len..len + PIECE], off + len as u64);
+            let n = read_full(file, &mut self.buf[len..len + PIECE], off + len as u64);
             len += n;
             let mut start = 0;
             if skip {
-                match buf[..len].iter().position(|&b| b == b'\n') {
+                match self.buf[..len].iter().position(|&b| b == b'\n') {
                     Some(i) => (start, skip) = (i + 1, false),
-                    None if n == 0 => break,
+                    None if n == 0 => return,
                     None => {
                         (off, len) = (off + len as u64, 0);
                         continue;
@@ -145,7 +137,7 @@ impl<'a> Scanner<'a> {
             // ends at the first LF from there.
             let last = (to - 1).saturating_sub(off) as usize;
             let last_lf = match last < len {
-                true => buf[last..len].iter().position(|&b| b == b'\n'),
+                true => self.buf[last..len].iter().position(|&b| b == b'\n'),
                 false => None,
             };
             let (end, done) = if off + start as u64 >= to {
@@ -153,13 +145,13 @@ impl<'a> Scanner<'a> {
             } else if let Some(i) = last_lf {
                 (last + i + 1, true)
             } else {
-                let lf = buf[start..len].iter().rposition(|&b| b == b'\n');
+                let lf = self.buf[start..len].iter().rposition(|&b| b == b'\n');
                 (lf.map_or(start, |i| start + i + 1), n == 0)
             };
             if end > start {
                 if !known {
                     let at = off + start as u64;
-                    out.first = parse_id(&buf[start..end], at);
+                    out.first = parse_id(&self.buf[start..end], at);
                     let local = out.first.checked_sub(first);
                     let id = out.first;
                     let ascending =
@@ -167,66 +159,54 @@ impl<'a> Scanner<'a> {
                     self.doc.local = local.unwrap_or_else(ascending);
                     known = true;
                 }
-                self.region(&buf, start, end, out);
+                self.region(start, end, out);
             }
             if done {
-                break;
+                return;
             }
-            buf.copy_within(end..len, 0);
+            self.buf.copy_within(end..len, 0);
             (off, len) = (off + end as u64, len - end);
         }
-        self.buf = buf;
     }
 
     /// Finds the tokens and LFs of `buf[start..end]` (whole lines, the first
     /// of them document `first`); returns how many of each.
-    fn lex(&mut self, buf: &[u8], start: usize, end: usize, first: u32) -> (usize, usize) {
-        let (mut bounds, mut lines, mut tabs) = (0, 0, 0);
+    fn lex(&mut self, start: usize, end: usize, first: u32) -> (usize, usize) {
+        let (mut tokens, mut token_ends, mut lines, mut tabs) = (0, 0, 0, 0);
         // `in_id` is all ones while inside a line's "id TAB" prefix: every line
         // starts there, an LF enters it and the TAB leaves it, so a prefix XOR
         // of the LF and TAB bits marks it and the ids never become tokens.
         let (mut in_id, mut carry) = (!0u64, 0u64);
         for at in (start..end).step_by(64) {
             // `flatten` writes up to 64 positions past the count.
-            if self.bounds.len() < bounds + 64 {
-                self.bounds.resize(2 * self.bounds.len() + 8192, 0);
+            if self.starts.len() < tokens + 64 {
+                let n = 2 * self.starts.len() + 4096;
+                let doc = &mut self.doc;
+                for v in [
+                    &mut self.starts,
+                    &mut self.ends,
+                    &mut self.ids,
+                    &mut doc.fresh,
+                ] {
+                    v.resize(n, 0);
+                }
             }
-            let (alnum, lf, tab) = classify(&buf[at..at + 64]);
+            let (alnum, lf, tab) = classify(&self.buf[at..at + 64]);
             let live = u64::MAX >> (64 - (end - at).min(64));
             let (lf, tab) = (lf & live, tab & live);
-            // Most blocks hold no LF or TAB, and stay all in or all out.
-            let id = if lf | tab == 0 {
-                in_id
-            } else {
-                prefix_xor(lf | tab) ^ in_id
-            };
+            let id = prefix_xor(lf | tab) ^ in_id;
             in_id = ((id as i64) >> 63) as u64;
             let token = alnum & live & !id;
             let before = token << 1 | carry;
             carry = token >> 63;
-            let starts = token & !before;
+            flatten(token & !before, at as u32, &mut self.starts, &mut tokens);
+            flatten(!token & before, at as u32, &mut self.ends, &mut token_ends);
             if lf != 0 {
                 if self.lfs.len() < lines + 64 {
                     self.lfs.resize(2 * self.lfs.len() + 256, 0);
                 }
-                // A line's tokens end where the next line's begin: count the
-                // tokens that start before each LF (a token still open at
-                // this block has its start in `bounds` and not its end).
-                let (tokens, mut bits) = (bounds.div_ceil(2), lf);
-                while bits != 0 {
-                    let below = bits.isolate_lowest_one() - 1;
-                    self.lfs[lines] = (tokens + (starts & below).count_ones() as usize) as u32;
-                    lines += 1;
-                    bits &= bits - 1;
-                }
+                flatten(lf, at as u32, &mut self.lfs, &mut lines);
             }
-            // Starts and ends alternate, so one list holds both.
-            flatten(
-                starts | (!token & before),
-                at as u32,
-                &mut self.bounds,
-                &mut bounds,
-            );
             tabs += tab.count_ones() as usize;
         }
         if tabs != lines {
@@ -235,149 +215,86 @@ impl<'a> Scanner<'a> {
                 "every line of docs.txt must hold exactly one TAB ({at})"
             ));
         }
-        // Every token ends inside the region, which ends with an LF.
-        (bounds / 2, lines)
+        (tokens, lines)
     }
 
     /// Tokenizes `buf[start..end]` (whole lines) and records each document.
-    ///
-    /// Tokens go in batches of `BATCH`: first every token's home bucket is
-    /// computed and prefetched, then the tokens are looked up and recorded in
-    /// runs that stop at the end of a batch or of a document.
-    fn region(&mut self, buf: &[u8], start: usize, end: usize, out: &mut ChunkOut) {
-        let (tokens, lines) = self.lex(buf, start, end, out.first + out.lines);
+    fn region(&mut self, start: usize, end: usize, out: &mut ChunkOut) {
+        let (tokens, lines) = self.lex(start, end, out.first + out.lines);
         let (table, queries, ranges) = (self.table, self.queries, self.parsed_ranges);
-        let (doc, line_ends) = (&mut self.doc, &self.lfs[..lines]);
-        let bounds = &self.bounds[..2 * tokens];
+        let (buf, doc, lfs) = (&self.buf[..], &mut self.doc, &self.lfs[..lines]);
+        let (starts, ends) = (&self.starts[..tokens], &self.ends[..tokens]);
+        let ids = &mut self.ids[..tokens];
         doc.first = 0; // token indexes restart with each region
-        let mut probes = [Probe::default(); BATCH];
+        let miss = table.miss();
+        let mut keys = [(Key { lo: 0, w2: 0 }, 0); BATCH];
         let mut line = 0;
-        let look = table.lookup();
-        assert!(end + SHORT <= buf.len()); // `scan` leaves `PAD` bytes after the data
-        for a in (0..tokens).step_by(BATCH) {
-            let z = (a + BATCH).min(tokens);
-            // Every token's probe (its key and home bucket), whose bucket
-            // starts loading now.
-            for (probe, &[s, e]) in probes
-                .iter_mut()
-                .zip(bounds[2 * a..2 * z].as_chunks::<2>().0)
-            {
-                let (s, e) = (s as usize, e as usize);
-                debug_assert!(s < end);
-                // SAFETY: a token starts before `end` (`lex` only finds tokens
-                // in `start..end`), and `buf` has 16 bytes after `end`
-                // (checked above).
-                *probe = unsafe { look.probe(buf.as_ptr().add(s), e - s) };
+        let mut next_lf = lfs.first().copied().unwrap_or(u32::MAX);
+        for (batch, (b_starts, b_ends)) in starts.chunks(BATCH).zip(ends.chunks(BATCH)).enumerate()
+        {
+            for ((key, &s), &e) in keys.iter_mut().zip(b_starts).zip(b_ends) {
+                let k = Key::new(buf, s as usize, (e - s) as usize);
+                let slot = table.slot(k);
+                table.prefetch(slot);
+                *key = (k, slot);
             }
-            let mut k = a;
-            loop {
-                while line < lines && line_ends[line] as usize == k {
-                    doc.finish(k, out, table, ranges);
+            for (j, ((&(key, slot), &s), &e)) in keys.iter().zip(b_starts).zip(b_ends).enumerate() {
+                let k = batch * BATCH + j;
+                while s > next_lf {
+                    doc.finish(&ids[..k], out, table, ranges);
                     line += 1;
+                    next_lf = lfs.get(line).copied().unwrap_or(u32::MAX);
                 }
-                if k == z {
-                    break;
-                }
-                // `line < lines`: the last line ends at `tokens`, after `k`.
-                let stop = z.min(line_ends[line] as usize);
-                let run = Run {
-                    probes: &probes[k - a..stop - a],
-                    bounds: &bounds[2 * k..2 * stop],
-                    first: k,
-                };
-                doc.record(run, look, buf, queries);
-                k = stop;
+                let token = &buf[s as usize..e as usize];
+                let w2 = table.find(key, slot, token, queries).unwrap_or(miss);
+                ids[k] = Table::id(w2);
+                doc.token(k, w2);
             }
         }
-        while line < lines {
-            doc.finish(tokens, out, table, ranges);
-            line += 1;
+        for _ in line..lines {
+            doc.finish(ids, out, table, ranges);
         }
     }
 }
 
 impl Doc {
-    /// Looks up the tokens of `run` (all in this document), writes their ids
-    /// to `ids` and records them. Branch-free apart from long tokens and
-    /// overflowed buckets: every id is written to `fresh`, and kept only if it
-    /// is a BOOL term not seen in this document; every token is written to
-    /// `hits`, and kept if it anchors a phrase. Bits set in `seen` for other
-    /// terms (and for id 0) are never cleared, which is harmless: they are
-    /// never BOOL terms.
-    #[inline(always)]
-    fn record(&mut self, run: Run, look: Lookup, buf: &[u8], text: &[u8]) {
-        let (mut n_fresh, mut n_hits) = (self.n_fresh, self.n_hits);
-        // The run's tokens are tokens `at..to` of the document; `n_fresh`
-        // and `n_hits` are at most `at`.
-        let (at, to) = (
-            run.first - self.first,
-            run.first - self.first + run.probes.len(),
-        );
-        if self.ids.len() < to {
-            let n = to.next_power_of_two().max(1024);
-            for v in [&mut self.ids, &mut self.fresh, &mut self.hits] {
-                v.resize(n, 0);
-            }
+    /// Records token `k` with slot word `w2`. Branch-free apart from anchors:
+    /// the id is always written to `fresh`, and kept only if it is a BOOL
+    /// term not seen in this document. Bits set for other terms (and for
+    /// `Table::miss`) are never cleared, which is harmless: they are never BOOL terms.
+    #[inline]
+    fn token(&mut self, k: usize, w2: u64) {
+        let id = Table::id(w2);
+        let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
+        let fresh = (self.seen[word] & bit == 0) & (w2 & BOOL_TERM != 0);
+        self.seen[word] |= bit;
+        self.fresh[self.n_fresh] = id;
+        self.n_fresh += usize::from(fresh);
+        if w2 & ANCHOR != 0 {
+            self.hits.push(k as u32);
         }
-        // Unchecked indexing below, because this runs for every token: `seen`
-        // has a bit for every id below `Table::ids` (see `Scanner::new`), and
-        // every value's id is below it; `fresh` and `hits` have room for the
-        // run (checked here).
-        assert!(n_fresh.max(n_hits) + run.probes.len() <= self.fresh.len().min(self.hits.len()));
-        let (seen, fresh, hits) = (
-            self.seen.as_mut_ptr(),
-            self.fresh.as_mut_ptr(),
-            self.hits.as_mut_ptr(),
-        );
-        let ids = &mut self.ids[at..to];
-        for (k, (&probe, id_out)) in (at..to).zip(run.probes.iter().zip(ids)) {
-            let v = if !probe.long() {
-                look.find_short(probe)
-            } else {
-                let i = 2 * (k - at);
-                let (s, e) = (run.bounds[i] as usize, run.bounds[i + 1] as usize);
-                look.find_long(&buf[s..e], text)
-            };
-            let id = v & ID_MASK;
-            *id_out = id;
-            let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
-            // SAFETY: see above.
-            unsafe {
-                let seen = seen.add(word);
-                let new = (*seen & bit == 0) & (v & BOOL_TERM != 0);
-                *seen |= bit;
-                *fresh.add(n_fresh) = id;
-                n_fresh += usize::from(new);
-                *hits.add(n_hits) = k as u32;
-                n_hits += (v >> 31) as usize;
-            }
-        }
-        (self.n_fresh, self.n_hits) = (n_fresh, n_hits);
     }
 
-    /// Ends the document before token `end` of the region: emits its BOOL
-    /// terms and checks the phrases anchored at its tokens against the
+    /// Ends the document, whose tokens end where `ids` ends: emits its
+    /// BOOL terms and checks the phrases anchored at its tokens against the
     /// token sequence.
-    fn finish(&mut self, end: usize, out: &mut ChunkOut, table: &Table, ranges: &[&Parsed]) {
+    fn finish(&mut self, ids: &[u32], out: &mut ChunkOut, table: &Table, ranges: &[&Parsed]) {
         if self.local >= MAX_SEGMENT_DOCS {
             let id = out.first + out.lines;
             fail(&format!(
                 "too many documents in one segment, at document id {id}"
             ));
         }
-        let streams = &mut out.streams[..PARTS];
-        assert!(self.n_fresh <= self.fresh.len());
         for &term in &self.fresh[..self.n_fresh] {
-            streams[term as usize % PARTS].push((self.local << 16) | (term / PARTS as u32));
-            // SAFETY: `seen` has a bit for every id (see `record`).
-            unsafe { *self.seen.get_unchecked_mut(term as usize / 64) &= !(1 << (term % 64)) };
+            out.streams[term as usize % PARTS].push((self.local << 16) | (term / PARTS as u32));
+            self.seen[term as usize / 64] &= !(1 << (term % 64));
         }
         self.n_fresh = 0;
-        let doc = &self.ids[..end - self.first];
+        let doc = &ids[self.first..];
         let id = out.first + out.lines;
         let found = out.matches.len();
-        for &at in &self.hits[..self.n_hits] {
-            let at = at as usize;
+        for &at in &self.hits {
+            let at = at as usize - self.first;
             let mut phrase = table.head(doc[at]);
             while phrase != NONE {
                 let p = ranges[(phrase >> RANGE_SHIFT) as usize];
@@ -392,8 +309,8 @@ impl Doc {
                 phrase = p.next[i];
             }
         }
-        self.n_hits = 0;
-        self.first = end;
+        self.hits.clear();
+        self.first = ids.len();
         self.local += 1;
         out.lines += 1;
     }
@@ -438,18 +355,18 @@ fn prefix_xor(mut x: u64) -> u64 {
     x
 }
 
-/// Appends `base + i` for every set bit i of `bits` at `out[*n..]`. 24
-/// positions are written unconditionally (64 bytes hold about nine tokens,
-/// so 18 bounds), so few blocks take the loop; `out` has room for 64 past `*n`.
+/// Appends `base + i` for every set bit i of `bits` at `out[*n..]`. Eight
+/// positions are written unconditionally (64 bytes hold about nine tokens),
+/// so only longer runs take a loop; `out` has room for 64 past `*n`.
 #[inline]
 fn flatten(mut bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
     let count = bits.count_ones() as usize;
     let out = &mut out[*n..*n + 64];
-    for slot in &mut out[..24] {
+    for slot in &mut out[..8] {
         *slot = base + bits.trailing_zeros();
         bits &= bits.wrapping_sub(1);
     }
-    let mut i = 24;
+    let mut i = 8;
     while bits != 0 {
         out[i] = base + bits.trailing_zeros();
         bits &= bits - 1;
