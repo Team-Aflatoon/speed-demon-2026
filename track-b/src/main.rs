@@ -466,7 +466,7 @@ fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
     let docs = check_ids(&sh.segments, s, &chunks);
     sh.docs[s].store(docs, Relaxed);
     if p < PARTS {
-        let streams: Vec<&[u32]> = chunks.iter().map(|c| &c.streams[p][..]).collect();
+        let streams: Vec<&[u32]> = chunks.iter().map(|c| c.stream(p)).collect();
         let mut part = sh.parts[p].write().unwrap();
         return part.build(&streams, terms, docs as usize, cursor);
     }
