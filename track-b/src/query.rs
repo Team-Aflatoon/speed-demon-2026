@@ -5,19 +5,19 @@
 use crate::fail;
 use std::arch::x86_64::*;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Barrier, OnceLock};
 
 pub const NONE: u32 = u32::MAX;
-/// The stamp of a term id the scan never records (see `Table::stamps`).
-pub const NEVER: u8 = u8::MAX;
 /// A term's value in the table:
 ///
 /// ```text
 ///   bits  0..22  term id (0 is never a term: the value of a token that is no query term)
 ///   bits 22..29  how many query words are the term, saturating at USES_CAP
+///   bit  30      BOOL_TERM: in a BOOL query (the scan records its documents)
 ///   bit  31      ANCHOR: anchors a phrase (the scan checks phrases there)
 /// ```
+pub const BOOL_TERM: u32 = 1 << 30;
 pub const ANCHOR: u32 = 1 << 31;
 pub const ID_MASK: u32 = (1 << 22) - 1;
 const USES_SHIFT: u32 = 22;
@@ -57,6 +57,21 @@ struct Key {
     hi: u64,
 }
 
+const LOWER: u64 = 0x2020_2020_2020_2020;
+/// `MASKS[n]`: n bytes of ones, then zeros.
+static MASKS: [[u8; 16]; SHORT + 1] = {
+    let mut m = [[0; 16]; SHORT + 1];
+    let mut n = 0;
+    while n <= SHORT {
+        let mut i = 0;
+        while i < n {
+            m[n][i] = 0xFF;
+            i += 1;
+        }
+        n += 1;
+    }
+    m
+};
 /// `SLOT[m]`: the slot whose key matches, from the bits `m` of matching key
 /// words (bits 2j and 2j + 1 for slot j), or 3 (the bucket's miss value).
 static SLOT: [u8; 64] = {
@@ -75,45 +90,31 @@ static SLOT: [u8; 64] = {
     }
     t
 };
-/// A token's key and home bucket, as `Lookup::probe` makes them. Only
-/// `probe` makes one, so `Lookup::find` can trust the bucket.
+/// A token's key and home bucket, as `Lookup::probe` makes them: the bucket
+/// is null for a long token. Only `probe` makes one, so `find_short` can
+/// trust the bucket.
 #[derive(Clone, Copy)]
 pub struct Probe {
     key: __m128i,
     home: *const Bucket,
 }
 
-/// The home of every long token: it matches no key, and every value sends
-/// `Lookup::find` to the slow path, which compares the token's bytes.
-static LONG: Bucket = Bucket {
-    keys: [const { AtomicU64::new(0) }; 6],
-    vals: [const { AtomicU32::new(OVERFLOW) }; 4],
-};
+impl Probe {
+    /// Whether the token is long (`Lookup::find_long` looks it up).
+    #[inline(always)]
+    pub fn long(self) -> bool {
+        self.home.is_null()
+    }
+}
 
 impl Default for Probe {
     fn default() -> Probe {
         // SAFETY: SSE2 is part of x86-64-v3, which the crate requires.
         let key = unsafe { _mm_setzero_si128() };
-        Probe { key, home: &LONG }
-    }
-}
-
-/// The 16 bytes at `p`, or-ed with 0x20 (which lowercases letters and keeps
-/// digits), and with every byte from `len` on zeroed (none for `len` from 16
-/// to 127).
-///
-/// SAFETY: 16 bytes from `p` must be readable.
-#[inline(always)]
-unsafe fn lowered(p: *const u8, len: usize) -> __m128i {
-    // SAFETY: the caller vouches for the 16 bytes; unaligned loads have no
-    // alignment rule; SSE2 is part of x86-64-v3, which the crate requires.
-    unsafe {
-        let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-        let mask = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), iota);
-        _mm_and_si128(
-            _mm_or_si128(_mm_loadu_si128(p.cast()), _mm_set1_epi8(0x20)),
-            mask,
-        )
+        Probe {
+            key,
+            home: std::ptr::null(),
+        }
     }
 }
 
@@ -122,15 +123,32 @@ impl Key {
     /// (anything after the token is masked off).
     #[inline]
     pub fn new(bytes: &[u8], at: usize, len: usize) -> Key {
-        // SAFETY: the 16 bytes are checked by the slice.
-        let key = Key::of(unsafe { lowered(bytes[at..at + 16].as_ptr(), len.min(SHORT)) });
-        let tag = (0x80 | len.min(127) as u64) << 56;
-        match len {
-            ..=SHORT => key,
-            _ => Key {
-                lo: key.lo,
-                hi: key.hi & (u64::MAX >> 8) | tag,
-            },
+        let w = &bytes[at..at + 16];
+        let lo = u64::from_le_bytes(w[..8].try_into().unwrap()) | LOWER;
+        let hi = u64::from_le_bytes(w[8..].try_into().unwrap()) | LOWER;
+        if len <= SHORT {
+            Key::short(lo, hi, len as u32)
+        } else {
+            let tag = (0x80 | len.min(127) as u64) << 56;
+            Key {
+                lo,
+                hi: hi & (u64::MAX >> 8) | tag,
+            }
+        }
+    }
+
+    /// The key of a token of `len <= SHORT` bytes whose first 16 bytes, or-ed
+    /// with `LOWER`, are `lo` and `hi`.
+    #[inline(always)]
+    pub fn short(lo: u64, hi: u64, len: u32) -> Key {
+        let bits = len * 8;
+        // SAFETY: BMI2 is part of x86-64-v3, which the crate requires. `bzhi`
+        // keeps the low `bits` bits, or all 64 for `bits >= 64`.
+        unsafe {
+            Key {
+                lo: _bzhi_u64(lo, bits),
+                hi: _bzhi_u64(hi, bits.saturating_sub(64)),
+            }
         }
     }
 
@@ -146,14 +164,12 @@ impl Key {
         }
     }
 
-    /// CRC-32C of the first 12 bytes of the key (the CRC of `lo` from the
-    /// low half of `hi`): one instruction, and every one of those bits
-    /// reaches the low bits that pick the bucket. Keys that differ only in
-    /// bytes 12 to 15 share a bucket, which is rare and only costs a probe.
+    /// CRC-32C of the key: two instructions, and every input bit reaches
+    /// the low bits that pick the bucket.
     #[inline(always)]
     pub fn hash(self) -> usize {
         // SAFETY: SSE4.2 is part of x86-64-v3, which the crate requires.
-        unsafe { _mm_crc32_u64(self.hi, self.lo) as usize }
+        unsafe { _mm_crc32_u64(_mm_crc32_u64(0, self.lo), self.hi) as usize }
     }
 }
 
@@ -183,32 +199,37 @@ impl Lookup<'_> {
     /// SAFETY: 16 bytes from `p` must be readable.
     #[inline(always)]
     pub unsafe fn probe(self, p: *const u8, len: usize) -> Probe {
-        // SAFETY: the caller vouches for the 16 bytes; a prefetch is only a
-        // hint and never faults. (A long token's key is not used.)
+        // SAFETY: the caller vouches for the 16 bytes; `MASKS` has 17 rows of
+        // 16 bytes; unaligned loads have no alignment rule; AVX2 is required
+        // by the crate; a prefetch is only a hint and never faults.
         unsafe {
-            let key = lowered(p, len);
+            let raw = _mm_loadu_si128(p.cast());
+            let mask = _mm_loadu_si128(MASKS[len.min(SHORT)].as_ptr().cast());
+            let key = _mm_and_si128(_mm_or_si128(raw, _mm_set1_epi8(0x20)), mask);
             // `& mask` makes this a bucket of the table (whose bucket count
             // is a power of two), which lives until the process exits.
             let home: *const Bucket = self.buckets.get_unchecked(Key::of(key).hash() & self.mask);
             crate::prefetch(home);
-            let home = if len <= SHORT { home } else { &LONG };
+            let home = if len <= SHORT { home } else { std::ptr::null() };
             Probe { key, home }
         }
     }
 
-    /// The value of the token `token()` of `probe`: branch-free, unless the
-    /// token is long or its bucket has overflowed and it is not in it.
+    /// The value of the short token of `probe`: branch-free, unless the
+    /// bucket has overflowed and the token is not in it.
     #[inline(always)]
-    pub fn find<'b>(self, probe: Probe, token: impl FnOnce() -> &'b [u8], text: &[u8]) -> u32 {
+    pub fn find_short(self, probe: Probe) -> u32 {
+        let key = probe.key;
+        debug_assert!(!probe.long());
         // SAFETY: `probe` made the home a bucket of the table, which lives until
-        // the process exits, or `LONG`. The parse is over (a barrier orders
-        // every insert before the scan), so the bucket is no longer written
-        // while it is read here; its 64 bytes are aligned and readable; AVX2
-        // is required by the crate.
+        // the process exits, and a short token's is not null. The parse is over
+        // (a barrier orders every insert before the scan), so the bucket is no
+        // longer written while it is read here; its 64 bytes are aligned and
+        // readable; AVX2 is required by the crate.
         let v = unsafe {
             let bucket = &*probe.home;
             let p: *const __m256i = bucket.keys.as_ptr().cast();
-            let q = _mm256_broadcastsi128_si256(probe.key);
+            let q = _mm256_broadcastsi128_si256(key);
             let eq = |v| _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, q))) as u32;
             // Bits 2j and 2j + 1: slot j's lo and hi match (the second load's
             // top half holds the values, masked off).
@@ -216,22 +237,17 @@ impl Lookup<'_> {
             *bucket.vals[usize::from(SLOT[m as usize])].as_ptr()
         };
         if v & OVERFLOW != 0 {
-            return self.find_slow(probe, token(), text);
+            // A short token needs no text to be compared.
+            return self.table.find_slow(Key::of(key), None);
         }
         v
     }
 
-    /// The value of a long token, or of one whose bucket has overflowed.
+    /// The value of a long token, by probing.
     #[cold]
-    #[inline(never)]
-    fn find_slow(self, probe: Probe, token: &[u8], text: &[u8]) -> u32 {
-        match token.len() {
-            // A short token needs no text to be compared.
-            ..=SHORT => self.table.find_slow(Key::of(probe.key), None),
-            len => self
-                .table
-                .find_slow(Key::new(token, 0, len), Some((token, text))),
-        }
+    pub fn find_long(self, token: &[u8], text: &[u8]) -> u32 {
+        self.table
+            .find_slow(Key::new(token, 0, token.len()), Some((token, text)))
     }
 }
 
@@ -251,8 +267,6 @@ pub struct Table {
     /// Per term id: the first phrase anchored at it plus 1 (0 for none, so
     /// the array starts zeroed), linked on through `Parsed::next`.
     heads: &'static [AtomicU32],
-    /// Per term id: 1 if the term is in a BOOL query.
-    bools: &'static [AtomicU8],
 }
 
 /// `n` zeroed values in fresh anonymous pages, never unmapped (the table
@@ -302,17 +316,14 @@ impl Table {
         // SAFETY: zero bytes are valid atomic integers, which is all a
         // `Bucket` holds; it needs 64-byte alignment, less than a page.
         // The buckets are touched all over; the per-id arrays only where ids are.
-        let (buckets, text_at, heads, bools) = unsafe {
-            let per_id = (zeroed(ids, false), zeroed(ids, false), zeroed(ids, false));
-            (zeroed(n, true), per_id.0, per_id.1, per_id.2)
-        };
+        let (buckets, text_at, heads) =
+            unsafe { (zeroed(n, true), zeroed(ids, false), zeroed(ids, false)) };
         Table {
             buckets,
             mask: n - 1,
             next_block: AtomicU32::new(1),
             text_at,
             heads,
-            bools,
         }
     }
 
@@ -325,17 +336,6 @@ impl Table {
     /// Starts loading the head of term `id`'s phrase list.
     pub fn prefetch_head(&self, id: u32) {
         crate::prefetch(self.heads.as_ptr().wrapping_add(id as usize));
-    }
-
-    /// A stamp per term id for the scan's `Doc::finish`: 0 for BOOL terms,
-    /// `NEVER` for every other id (0, phrase-only terms, unused ids).
-    pub fn stamps(&self) -> Vec<u8> {
-        let bools = &self.bools[..self.ids()];
-        // SAFETY: the parse is over (a barrier orders every insert before the
-        // scan), so no thread writes these bytes any more.
-        let bools: &[u8] =
-            unsafe { std::slice::from_raw_parts(bools.as_ptr().cast(), bools.len()) };
-        bools.iter().map(|&b| NEVER * (1 - b)).collect()
     }
 
     /// One past the last id of the last block taken: a bound on the term ids
@@ -509,19 +509,7 @@ impl Parsed {
     /// ids are filled in by `insert`. Every line must be a query (spec 2.3);
     /// only the empty piece after the final LF is not a line.
     pub fn parse(text: &[u8], from: usize, to: usize) -> Parsed {
-        // Room for the words and lines of a typical range (about 11 bytes a
-        // word and 35 a line), so the vectors seldom grow.
-        let (lines, words) = ((to - from) / 24, (to - from) / 8);
-        let mut p = Parsed {
-            order: Vec::with_capacity(lines),
-            ends: Vec::with_capacity(lines),
-            term_ends: Vec::with_capacity(lines),
-            steps: Vec::with_capacity(words),
-            bool_words: Vec::with_capacity(words),
-            terms: Vec::with_capacity(words),
-            phrase_words: Vec::with_capacity(words),
-            ..Parsed::default()
-        };
+        let mut p = Parsed::default();
         let lines = &text[from..to];
         let lines = lines.strip_suffix(b"\n").unwrap_or(lines);
         // An empty range has no lines (splitting it would give one empty one).
@@ -579,16 +567,14 @@ impl Parsed {
     }
 
     /// Puts every word into the table, turning steps and phrase terms into
-    /// term ids, counts how often each term occurs and marks BOOL terms.
+    /// term ids, counts how often each term occurs and flags BOOL terms.
     pub fn insert(&mut self, table: &Table, text: &[u8]) {
         let mut ids = 0..0;
         let mut insert =
             |(at, len): (u32, u8)| table.insert(text, at as usize, len as usize, &mut ids);
         for (step, &word) in self.steps.iter_mut().zip(&self.bool_words) {
-            let (id, _) = insert(word);
-            if table.bools[id as usize].load(Relaxed) == 0 {
-                table.bools[id as usize].store(1, Relaxed);
-            }
+            let (id, slot) = insert(word);
+            table.flag(slot, BOOL_TERM);
             *step |= id;
         }
         for (term, &word) in self.terms.iter_mut().zip(&self.phrase_words) {
@@ -658,14 +644,37 @@ impl<'a> Setup<'a> {
     }
 
     /// The words of `queries.txt`, counted to size the table before the
-    /// parse: in a line that parses, every term follows a space (a phrase's
-    /// first through its quote), and every other word after a space is an
-    /// uppercase operator. A line that does not parse ends the run before it
-    /// inserts anything.
+    /// parse: in a query
+    /// line that parses, there is one space before every word but the first,
+    /// and an operator is the one word after a space that starts with an
+    /// uppercase letter, so a line holds its spaces less its operators
+    /// (counting the `BOOL` or `PHRASE` word for the first, and for PHRASE
+    /// the space before the quote for its first term). A line that does not
+    /// parse ends the run before it inserts anything, and adds at least 0.
     pub fn count_words(&self) -> usize {
         let text = &self.text[..self.text.len() - QUERY_PAD];
-        let term = |(&a, &b): (&u8, &u8)| usize::from((a == b' ') & !b.is_ascii_uppercase());
-        text.iter().zip(&text[1..]).map(term).sum()
+        let (mut spaces, mut ops, mut after) = (0, 0, 0);
+        let (blocks, rest) = text.as_chunks::<32>();
+        for block in blocks {
+            // SAFETY: 32 readable bytes; AVX2 is required by the crate.
+            let (space, upper) = unsafe {
+                let v = _mm256_loadu_si256(block.as_ptr().cast());
+                let space = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b' ' as i8));
+                let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'A' as i8));
+                let upper = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(25)), d);
+                let mask = |m| _mm256_movemask_epi8(m) as u32;
+                (mask(space), mask(upper))
+            };
+            spaces += space.count_ones() as usize;
+            ops += (upper & (space << 1 | after)).count_ones() as usize;
+            after = space >> 31;
+        }
+        for &b in rest {
+            spaces += usize::from(b == b' ');
+            ops += usize::from(after == 1 && b.is_ascii_uppercase());
+            after = u32::from(b == b' ');
+        }
+        spaces - ops
     }
 
     /// Makes the table for `words` words (from `count_words`).
@@ -688,7 +697,9 @@ impl<'a> Setup<'a> {
 
 /// A query line for an error message: quoted, and cut to 80 bytes.
 fn shown(line: &[u8]) -> String {
-    format!("{:?}", String::from_utf8_lossy(&line[..line.len().min(80)]))
+    let cut = &line[..line.len().min(80)];
+    let more = if cut.len() < line.len() { " ..." } else { "" };
+    format!("{:?}{more}", String::from_utf8_lossy(cut))
 }
 
 /// The first line start of `text` at or after `at`.

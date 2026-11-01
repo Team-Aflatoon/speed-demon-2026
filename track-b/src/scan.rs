@@ -6,7 +6,9 @@
 
 use crate::fail;
 use crate::index::PARTS;
-use crate::query::{Parsed, Probe, Table, ID_MASK, NEVER, NONE, RANGE_SHIFT, SHORT};
+use crate::query::{
+    Lookup, Parsed, Probe, Table, ANCHOR, BOOL_TERM, ID_MASK, NONE, RANGE_SHIFT, SHORT,
+};
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -29,59 +31,15 @@ pub const MAX_SEGMENT_DOCS: u32 = 1 << 16;
 /// What the scan of one chunk leaves for the build.
 #[derive(Default)]
 pub struct ChunkOut {
-    /// `doc << 16 | id / PARTS` for every distinct BOOL term of every
-    /// document, grouped by partition `p = id % PARTS` and in document order
-    /// within one: partition `p` is `postings[starts[p]..starts[p + 1]]`.
+    /// `streams[p]`: `doc << 16 | id / PARTS` for every distinct BOOL term
+    /// with `id % PARTS == p` of every document, in document order, where
     /// `doc` is numbered within the segment.
-    postings: Vec<u32>,
-    starts: Vec<u32>,
+    pub streams: Vec<Vec<u32>>,
     /// `(phrase, document id)` of every phrase match, in document order.
     pub matches: Vec<(u32, u32)>,
     /// First document id of the chunk and its number of documents.
     pub first: u32,
     pub lines: u32,
-}
-
-impl ChunkOut {
-    /// The postings of partition `p`.
-    pub fn stream(&self, p: usize) -> &[u32] {
-        &self.postings[self.starts[p] as usize..self.starts[p + 1] as usize]
-    }
-
-    /// Groups the postings by partition. Document `i` of the chunk (numbered
-    /// `local + i` in the segment) has the distinct BOOL terms
-    /// `fresh[ends[i - 1]..ends[i]]`.
-    fn partition(&mut self, fresh: &[u32], ends: &[u32], local: u32) {
-        let mut cursor = [0u32; PARTS];
-        for &id in fresh {
-            cursor[id as usize % PARTS] += 1;
-        }
-        self.starts.clear();
-        self.starts.push(0);
-        let mut at = 0;
-        for c in &mut cursor {
-            (*c, at) = (at, at + *c);
-            self.starts.push(at);
-        }
-        self.postings.clear();
-        self.postings.reserve(fresh.len());
-        let out = self.postings.spare_capacity_mut().as_mut_ptr();
-        let mut begin = 0;
-        for (i, &end) in ends.iter().enumerate() {
-            let doc = (local + i as u32) << 16;
-            for &id in &fresh[begin..end as usize] {
-                let c = &mut cursor[id as usize % PARTS];
-                // SAFETY: the cursor of partition `p` runs from its start to
-                // the next one, so each of the `fresh.len()` slots is written
-                // exactly once.
-                unsafe { (*out.add(*c as usize)).write(doc | (id / PARTS as u32)) };
-                *c += 1;
-            }
-            begin = end as usize;
-        }
-        // SAFETY: every slot below `fresh.len()` was written above.
-        unsafe { self.postings.set_len(fresh.len()) };
-    }
 }
 
 /// Per-thread scratch, reused for every chunk.
@@ -95,25 +53,34 @@ pub struct Scanner<'a> {
     bounds: Vec<u32>,
     /// Per line of the region: one past its last token.
     lfs: Vec<u32>,
-    /// Per token of the region: its value in the term table (0 for no query
-    /// term).
-    vals: Vec<u32>,
     doc: Doc,
 }
 
-/// Per-chunk scratch: the number `local` of the next document in its
-/// segment, the distinct BOOL terms of the chunk's documents (`fresh`, the
-/// documents ending at `ends`), and the stamps that tell which terms a
-/// document has already shown.
+/// A run of tokens of one document: their probes, their
+/// bounds (start, end) in the buffer, and the region index of the first.
+struct Run<'r> {
+    probes: &'r [Probe],
+    bounds: &'r [u32],
+    first: usize,
+}
+
+/// The document being scanned: number `local` in its segment, whose first
+/// token is token `first` of the region. The arrays are indexed by token
+/// within the document and grow to its length (see `Doc::record`).
 #[derive(Default)]
 struct Doc {
     local: u32,
+    first: usize,
+    /// The term id of each token so far (0 for no query term), with
+    /// `ANCHOR` set if the term anchors a phrase.
+    ids: Vec<u32>,
+    /// The distinct BOOL terms so far: `fresh[..n_fresh]`.
     fresh: Vec<u32>,
-    ends: Vec<u32>,
+    /// Invariant: at most the document's token count, and 0 between documents.
+    n_fresh: usize,
     /// Per term id, the stamp of the last document it was seen in: a term
     /// was seen in this document if its stamp is `stamp`. Stamps run from 1
-    /// to `NEVER - 1`, and are cleared when they wrap. Ids that are no BOOL
-    /// term keep `NEVER`, so they never look new.
+    /// to 255, and the array is zeroed when they wrap.
     stamps: Vec<u8>,
     stamp: u8,
     /// The document's anchor tokens and their first phrase links.
@@ -127,11 +94,11 @@ impl<'a> Scanner<'a> {
         parsed_ranges: &'a [&'a Parsed],
     ) -> Scanner<'a> {
         let doc = Doc {
-            stamps: table.stamps(),
+            stamps: vec![0; table.ids()], // a stamp per id (see `Doc::record`)
             stamp: 1,
             ..Doc::default()
         };
-        let (buf, bounds, lfs, vals) = Default::default();
+        let (buf, bounds, lfs) = Default::default();
         Scanner {
             table,
             queries,
@@ -139,7 +106,6 @@ impl<'a> Scanner<'a> {
             buf,
             bounds,
             lfs,
-            vals,
             doc,
         }
     }
@@ -159,8 +125,8 @@ impl<'a> Scanner<'a> {
     /// partial last line to the front for the next read. It is `done` after
     /// the line holding byte `to - 1`, or at the end of the file.
     pub fn scan(&mut self, file: &File, (from, to): (u64, u64), first: u32, out: &mut ChunkOut) {
-        self.doc.fresh.clear();
-        self.doc.ends.clear();
+        out.streams.resize_with(PARTS, Vec::new);
+        out.streams.iter_mut().for_each(Vec::clear);
         out.matches.clear();
         out.lines = 0;
         // buf[..len] holds the file from `off`. A chunk that does not start the
@@ -221,38 +187,23 @@ impl<'a> Scanner<'a> {
             (off, len) = (off + end as u64, len - end);
         }
         self.buf = buf;
-        let doc = &self.doc;
-        out.partition(&doc.fresh, &doc.ends, doc.local - out.lines);
     }
 
     /// Finds the tokens and LFs of `buf[start..end]` (whole lines, the first
     /// of them document `first`); returns how many of each.
-    #[inline(never)]
     fn lex(&mut self, buf: &[u8], start: usize, end: usize, first: u32) -> (usize, usize) {
-        // A block adds at most 64 bounds and 64 line ends, and `flatten`
-        // writes up to 64 bounds past the count. The arrays are filled
-        // through pointers and their lengths set at the end, so their unused
-        // room is never touched.
-        let most = (end - start).div_ceil(64) * 64 + 64;
-        self.bounds.clear();
-        self.bounds.reserve(most);
-        self.lfs.clear();
-        self.lfs.reserve(most);
-        assert!(end + PAD <= buf.len()); // every block is readable
-        let (bounds, lfs) = (self.bounds.as_mut_ptr(), self.lfs.as_mut_ptr());
-        let (mut n, mut lines, mut tabs) = (0usize, 0, 0);
+        let (mut bounds, mut lines, mut tabs) = (0, 0, 0);
         // `in_id` is all ones while inside a line's "id TAB" prefix: every line
         // starts there, an LF enters it and the TAB leaves it, so a prefix XOR
         // of the LF and TAB bits marks it and the ids never become tokens.
         let (mut in_id, mut carry) = (!0u64, 0u64);
         for at in (start..end).step_by(64) {
-            // SAFETY: `at + 64 <= end + PAD` bytes are readable (checked above).
-            let (alnum, lf, tab) = unsafe { classify(buf.as_ptr().add(at)) };
-            let live = if end - at >= 64 {
-                !0
-            } else {
-                !(!0 << (end - at))
-            };
+            // `flatten` writes up to 64 positions past the count.
+            if self.bounds.len() < bounds + 64 {
+                self.bounds.resize(2 * self.bounds.len() + 8192, 0);
+            }
+            let (alnum, lf, tab) = classify(&buf[at..at + 64]);
+            let live = u64::MAX >> (64 - (end - at).min(64));
             let (lf, tab) = (lf & live, tab & live);
             // Most blocks hold no LF or TAB, and stay all in or all out.
             let id = if lf | tab == 0 {
@@ -265,116 +216,175 @@ impl<'a> Scanner<'a> {
             let before = token << 1 | carry;
             carry = token >> 63;
             let starts = token & !before;
-            // A line's tokens end where the next line's begin: count the
-            // tokens that start before each LF (a token still open at this
-            // block has its start in `bounds` and not its end).
-            let (tokens, mut bits) = (n.div_ceil(2), lf);
-            while bits != 0 {
-                let below = bits.isolate_lowest_one() - 1;
-                // SAFETY: at most 64 line ends per block (see `most`).
-                unsafe {
-                    *lfs.add(lines) = (tokens + (starts & below).count_ones() as usize) as u32
-                };
-                lines += 1;
-                bits &= bits - 1;
+            if lf != 0 {
+                if self.lfs.len() < lines + 64 {
+                    self.lfs.resize(2 * self.lfs.len() + 256, 0);
+                }
+                // A line's tokens end where the next line's begin: count the
+                // tokens that start before each LF (a token still open at
+                // this block has its start in `bounds` and not its end).
+                let (tokens, mut bits) = (bounds.div_ceil(2), lf);
+                while bits != 0 {
+                    let below = bits.isolate_lowest_one() - 1;
+                    self.lfs[lines] = (tokens + (starts & below).count_ones() as usize) as u32;
+                    lines += 1;
+                    bits &= bits - 1;
+                }
             }
             // Starts and ends alternate, so one list holds both.
-            // SAFETY: at most 64 bounds per block, and 64 more (see `most`).
-            n += unsafe { flatten(starts | (!token & before), at as u32, bounds.add(n)) };
+            flatten(
+                starts | (!token & before),
+                at as u32,
+                &mut self.bounds,
+                &mut bounds,
+            );
             tabs += tab.count_ones() as usize;
         }
         if tabs != lines {
+            let at = format!("the {lines} lines from document {first}");
             fail(&format!(
-                "a line from document {first} on has no TAB or two"
+                "every line of docs.txt must hold exactly one TAB ({at})"
             ));
         }
-        // SAFETY: the first `n` bounds and `lines` line ends were written above.
-        unsafe {
-            self.bounds.set_len(n);
-            self.lfs.set_len(lines);
-        }
         // Every token ends inside the region, which ends with an LF.
-        (n / 2, lines)
+        (bounds / 2, lines)
     }
 
-    /// Tokenizes `buf[start..end]` (whole lines), looks every token up and
-    /// records each document.
+    /// Tokenizes `buf[start..end]` (whole lines) and records each document.
     ///
-    /// Tokens are looked up `BATCH` at a time: first every token's home
-    /// bucket is computed and prefetched, then the tokens are looked up, so
-    /// that the cache misses of rare words overlap.
-    #[inline(never)]
+    /// Tokens go in batches of `BATCH`: first every token's home bucket is
+    /// computed and prefetched, then the tokens are looked up and recorded in
+    /// runs that stop at the end of a batch or of a document.
     fn region(&mut self, buf: &[u8], start: usize, end: usize, out: &mut ChunkOut) {
         let (tokens, lines) = self.lex(buf, start, end, out.first + out.lines);
-        let (look, text) = (self.table.lookup(), self.queries);
-        if self.vals.len() < tokens {
-            self.vals.resize(tokens.next_power_of_two(), 0);
-        }
-        let bounds = self.bounds[..2 * tokens].as_chunks::<2>().0;
-        assert!(end + SHORT <= buf.len()); // `scan` leaves `PAD` bytes after the data
+        let (table, queries, ranges) = (self.table, self.queries, self.parsed_ranges);
+        let (doc, line_ends) = (&mut self.doc, &self.lfs[..lines]);
+        let bounds = &self.bounds[..2 * tokens];
+        doc.first = 0; // token indexes restart with each region
         let mut probes = [Probe::default(); BATCH];
-        for (bounds, vals) in bounds.chunks(BATCH).zip(self.vals.chunks_mut(BATCH)) {
-            for (probe, &[s, e]) in probes.iter_mut().zip(bounds) {
+        let mut line = 0;
+        let look = table.lookup();
+        assert!(end + SHORT <= buf.len()); // `scan` leaves `PAD` bytes after the data
+        for a in (0..tokens).step_by(BATCH) {
+            let z = (a + BATCH).min(tokens);
+            // Every token's probe (its key and home bucket), whose bucket
+            // starts loading now.
+            for (probe, &[s, e]) in probes
+                .iter_mut()
+                .zip(bounds[2 * a..2 * z].as_chunks::<2>().0)
+            {
+                let (s, e) = (s as usize, e as usize);
+                debug_assert!(s < end);
                 // SAFETY: a token starts before `end` (`lex` only finds tokens
                 // in `start..end`), and `buf` has 16 bytes after `end`
                 // (checked above).
-                *probe = unsafe { look.probe(buf.as_ptr().add(s as usize), (e - s) as usize) };
+                *probe = unsafe { look.probe(buf.as_ptr().add(s), e - s) };
             }
-            for ((val, &probe), &[s, e]) in vals.iter_mut().zip(&probes).zip(bounds) {
-                *val = look.find(probe, || &buf[s as usize..e as usize], text);
+            let mut k = a;
+            loop {
+                while line < lines && line_ends[line] as usize == k {
+                    doc.finish(k, out, table, ranges);
+                    line += 1;
+                }
+                if k == z {
+                    break;
+                }
+                // `line < lines`: the last line ends at `tokens`, after `k`.
+                let stop = z.min(line_ends[line] as usize);
+                let run = Run {
+                    probes: &probes[k - a..stop - a],
+                    bounds: &bounds[2 * k..2 * stop],
+                    first: k,
+                };
+                doc.record(run, look, buf, queries);
+                k = stop;
             }
         }
-        let mut first = 0;
-        for &last in &self.lfs[..lines] {
-            let doc = &self.vals[first..last as usize];
-            self.doc.finish(doc, out, self.table, self.parsed_ranges);
-            first = last as usize;
+        while line < lines {
+            doc.finish(tokens, out, table, ranges);
+            line += 1;
         }
     }
 }
 
 impl Doc {
-    /// Records the document whose tokens have the table values `doc`: emits
-    /// its distinct BOOL terms and checks the phrases anchored at its tokens
-    /// against the token sequence.
-    #[inline(never)]
-    fn finish(&mut self, doc: &[u32], out: &mut ChunkOut, table: &Table, ranges: &[&Parsed]) {
-        if self.local >= MAX_SEGMENT_DOCS {
-            let id = out.first + out.lines;
-            fail(&format!("too many documents in a segment at id {id}"));
+    /// Looks up the tokens of `run` (all in this document), writes their ids
+    /// to `ids` and records them. Branch-free apart from long tokens and
+    /// overflowed buckets: every id is written to `fresh`, and kept only if it
+    /// is a BOOL term not seen in this document; every token stamps its id.
+    #[inline(always)]
+    fn record(&mut self, run: Run, look: Lookup, buf: &[u8], text: &[u8]) {
+        let mut n_fresh = self.n_fresh;
+        // The run's tokens are tokens `at..to` of the document; `n_fresh` is
+        // at most `at`.
+        let (at, to) = (
+            run.first - self.first,
+            run.first - self.first + run.probes.len(),
+        );
+        if self.ids.len() < to {
+            let n = to.next_power_of_two().max(1024);
+            self.ids.resize(n, 0);
+            self.fresh.resize(n, 0);
         }
-        // The distinct BOOL terms, appended to `fresh`. Branch-free: every
-        // id is written, and kept only if its stamp is older than this
-        // document's (a BOOL term not seen yet); every id's stamp is raised
-        // to this document's (`NEVER` stays).
-        self.fresh.reserve(doc.len());
-        let (stamps, stamp) = (self.stamps.as_mut_ptr(), self.stamp);
-        let (fresh, mut n) = (self.fresh.as_mut_ptr(), self.fresh.len());
-        for &v in doc {
+        // Unchecked indexing below, because this runs for every token: `stamps`
+        // has a slot for every id below `Table::ids` (see `Scanner::new`), and
+        // every value's id is below it; `fresh` has room for the run (checked
+        // here).
+        assert!(n_fresh + run.probes.len() <= self.fresh.len());
+        let (stamps, stamp, fresh) = (
+            self.stamps.as_mut_ptr(),
+            self.stamp,
+            self.fresh.as_mut_ptr(),
+        );
+        let ids = &mut self.ids[at..to];
+        for (k, (&probe, id_out)) in (at..to).zip(run.probes.iter().zip(ids)) {
+            let v = if !probe.long() {
+                look.find_short(probe)
+            } else {
+                let i = 2 * (k - at);
+                let (s, e) = (run.bounds[i] as usize, run.bounds[i + 1] as usize);
+                look.find_long(&buf[s..e], text)
+            };
             let id = v & ID_MASK;
-            // SAFETY: `stamps` has a slot for every id below `Table::ids` (see
-            // `Scanner::new`), and every value's id is below it; `fresh` has
-            // room for every token (reserved above).
+            *id_out = v & (ID_MASK | ANCHOR);
+            // SAFETY: see above.
             unsafe {
                 let seen = stamps.add(id as usize);
-                let old = *seen;
-                *seen = old.max(stamp);
-                *fresh.add(n) = id;
-                n += usize::from(old < stamp);
+                let new = (*seen != stamp) & (v & BOOL_TERM != 0);
+                *seen = stamp;
+                *fresh.add(n_fresh) = id;
+                n_fresh += usize::from(new);
             }
         }
-        // SAFETY: the ids up to `n` were written above.
-        unsafe { self.fresh.set_len(n) };
-        self.ends.push(n as u32);
-        // A new stamp for the next document; when they run out, the stamps of
-        // BOOL terms are cleared, so no old stamp can match one reused.
-        self.stamp += 1;
-        if self.stamp == NEVER {
-            self.stamps
-                .iter_mut()
-                .for_each(|s| *s &= NEVER * u8::from(*s == NEVER));
-            self.stamp = 1;
+        self.n_fresh = n_fresh;
+    }
+
+    /// Ends the document before token `end` of the region: emits its BOOL
+    /// terms and checks the phrases anchored at its tokens against the
+    /// token sequence.
+    fn finish(&mut self, end: usize, out: &mut ChunkOut, table: &Table, ranges: &[&Parsed]) {
+        if self.local >= MAX_SEGMENT_DOCS {
+            let id = out.first + out.lines;
+            fail(&format!(
+                "too many documents in one segment, at document id {id}"
+            ));
         }
+        let streams = &mut out.streams[..PARTS];
+        assert!(self.n_fresh <= self.fresh.len());
+        for &term in &self.fresh[..self.n_fresh] {
+            streams[term as usize % PARTS].push((self.local << 16) | (term / PARTS as u32));
+        }
+        self.n_fresh = 0;
+        // A new stamp for the next document; when they run out, every slot
+        // is cleared, so no old stamp can match one reused.
+        self.stamp = match self.stamp {
+            u8::MAX => {
+                self.stamps.fill(0);
+                1
+            }
+            s => s + 1,
+        };
+        let doc = &self.ids[..end - self.first];
         let id = out.first + out.lines;
         let found = out.matches.len();
         // The phrase lists of the anchors are cold: the heads of all of them
@@ -419,6 +429,7 @@ impl Doc {
                 link = record[0];
             }
         }
+        self.first = end;
         self.local += 1;
         out.lines += 1;
     }
@@ -441,37 +452,34 @@ fn anchors(doc: &[u32], at: usize) -> u64 {
     mask
 }
 
-/// For the 64 bytes at `p`, the masks of token bytes (ASCII letters and
-/// digits), LFs and TABs. A byte is a letter or digit if the classes of its
-/// high and low nibble share a bit (`HIGH` and `LOW`): bit 0 for digits,
-/// bit 1 for `A`-`O` and `a`-`o`, bit 2 for `P`-`Z` and `p`-`z`.
-///
-/// SAFETY: 64 bytes from `p` must be readable.
-#[inline(always)]
-unsafe fn classify(p: *const u8) -> (u64, u64, u64) {
-    const HIGH: [u8; 16] = [0, 0, 0, 1, 2, 4, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0];
-    const LOW: [u8; 16] = [5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 2, 2, 2, 2, 2];
+/// For 64 bytes, the masks of token bytes (ASCII letters and digits), LFs and TABs.
+#[inline]
+fn classify(bytes: &[u8]) -> (u64, u64, u64) {
+    let bytes: &[u8; 64] = bytes[..64].try_into().unwrap();
+    // SAFETY: AVX2 is enabled for the whole crate (see the compile_error above).
+    let ((a0, l0, t0), (a1, l1, t1)) =
+        unsafe { (classify32(&bytes[..32]), classify32(&bytes[32..])) };
+    (a0 | a1 << 32, l0 | l1 << 32, t0 | t1 << 32)
+}
+
+#[target_feature(enable = "avx2")]
+fn classify32(bytes: &[u8]) -> (u64, u64, u64) {
+    assert!(bytes.len() >= 32);
+    // SAFETY: the 32 bytes are readable (checked above); loadu has no alignment rule.
+    let v = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) };
+    let letter = in_range(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), b'a', 25);
+    let alnum = _mm256_or_si256(letter, in_range(v, b'0', 9));
+    let lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
+    let tab = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\t' as i8));
     let mask = |m| _mm256_movemask_epi8(m) as u32 as u64;
-    let half = |v: __m256i| {
-        let table = |t: [u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
-        let nibbles = _mm256_set1_epi8(0x0F);
-        let high = _mm256_shuffle_epi8(
-            table(HIGH),
-            _mm256_and_si256(_mm256_srli_epi16(v, 4), nibbles),
-        );
-        let low = _mm256_shuffle_epi8(table(LOW), _mm256_and_si256(v, nibbles));
-        let other = _mm256_cmpeq_epi8(_mm256_and_si256(high, low), _mm256_setzero_si256());
-        let lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
-        let tab = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\t' as i8));
-        (!mask(other) & 0xFFFF_FFFF, mask(lf), mask(tab))
-    };
-    // SAFETY: the caller vouches for 64 bytes; loadu has no alignment rule;
-    // AVX2 is required by the crate.
-    unsafe {
-        let (a0, l0, t0) = half(_mm256_loadu_si256(p.cast()));
-        let (a1, l1, t1) = half(_mm256_loadu_si256(p.add(32).cast()));
-        (a0 | a1 << 32, l0 | l1 << 32, t0 | t1 << 32)
-    }
+    (mask(alnum), mask(lf), mask(tab))
+}
+
+/// Bytes in `lo..=lo + n`: subtract `lo`, then an unsigned `<= n` done with `min`.
+#[target_feature(enable = "avx2")]
+fn in_range(v: __m256i, lo: u8, n: u8) -> __m256i {
+    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(lo as i8));
+    _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(n as i8)), d)
 }
 
 /// Bit i of the result is the XOR of bits 0..=i of `x`.
@@ -501,29 +509,30 @@ static POSITIONS: [[u8; 8]; 256] = {
     t
 };
 
-/// Writes `base + i` for every set bit i of `bits` to `out`, and returns
-/// how many: a byte of `bits` at a time, its bit positions come from
-/// `POSITIONS`, widened to eight u32s and stored whole. No branches.
-///
-/// SAFETY: 64 u32s from `out` must be writable.
-#[inline(always)]
-unsafe fn flatten(bits: u64, base: u32, out: *mut u32) -> usize {
-    // SAFETY: AVX2 is required by the crate; each row of `POSITIONS` is 8
-    // readable bytes; the bytes before byte i had at most 8i bits, so the
-    // store for byte i ends within 8i + 8 <= 64 u32s.
-    unsafe {
-        let (mut at, eight) = (_mm256_set1_epi32(base as i32), _mm256_set1_epi32(8));
-        let mut k = 0;
-        for i in 0..8 {
-            let byte = (bits >> (8 * i)) as u8;
-            let row = POSITIONS[usize::from(byte)].as_ptr();
-            let pos = _mm256_cvtepu8_epi32(_mm_loadl_epi64(row.cast()));
-            _mm256_storeu_si256(out.add(k).cast(), _mm256_add_epi32(pos, at));
-            at = _mm256_add_epi32(at, eight);
-            k += byte.count_ones() as usize;
+/// Appends `base + i` for every set bit i of `bits` at `out[*n..]`, a byte of
+/// `bits` at a time: its bit positions come from `POSITIONS`, widened to eight
+/// u32s and stored whole, and the count advances by the byte's bits. No
+/// branches; `out` has room for 64 past `*n`.
+#[inline]
+fn flatten(bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
+    let out = &mut out[*n..*n + 64];
+    let mut k = 0;
+    for i in 0..8 {
+        let byte = (bits >> (8 * i)) as u8;
+        let row = &POSITIONS[usize::from(byte)];
+        // k + 8 <= 64: the bytes before this one had at most 56 bits.
+        let dst = &mut out[k..k + 8];
+        // SAFETY: `row` is 8 readable bytes and `dst` 8 writable u32s;
+        // unaligned loads and stores have no alignment rule; AVX2 is
+        // required by the crate.
+        unsafe {
+            let pos = _mm256_cvtepu8_epi32(_mm_loadl_epi64(row.as_ptr().cast()));
+            let at = _mm256_add_epi32(pos, _mm256_set1_epi32((base + 8 * i) as i32));
+            _mm256_storeu_si256(dst.as_mut_ptr().cast(), at);
         }
-        k
+        k += byte.count_ones() as usize;
     }
+    *n += k;
 }
 
 /// The decimal id at the start of a line, up to its TAB.
@@ -533,7 +542,9 @@ pub fn parse_id(line: &[u8], at: u64) -> u32 {
     let id = std::str::from_utf8(&line[..digits]).map(str::parse);
     match id {
         Ok(Ok(id)) => id,
-        _ => fail(&format!("no document id at byte {at} of docs.txt")),
+        _ => fail(&format!(
+            "the line at byte {at} of docs.txt does not start with a document id"
+        )),
     }
 }
 
