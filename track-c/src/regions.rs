@@ -28,17 +28,17 @@ impl Regions {
     /// largest because spec 2.3 lists the ids unique and in ascending order.
     /// `parse` rejects any id above it, so a file breaking that order can
     /// never index outside the map.
-    pub fn new(f: Mapped) -> Result<Self, &'static str> {
+    pub fn new(f: Mapped) -> Result<Self, String> {
         let (b, len) = (f.b, f.len);
         if !b.starts_with(HEADER) || b[len - 1] != b'\n' {
-            return Err("regions.csv: bad header, or no LF at the end");
+            return Err("regions.csv: bad header, or no LF at the end".into());
         }
         let last = b[..len - 1].iter().rposition(|&c| c == b'\n');
         let max = uint(b, last.map_or(0, |i| i + 1)).map_or(0, |(id, _)| id as usize);
         if max > MAX_ID {
-            return Err("regions.csv: ids over 100,000,000 (the spec's are below 1,000,000)");
+            return Err(format!("regions.csv: last id {max} is over {MAX_ID}"));
         }
-        let ids = crate::map::zeroed(max / 8 + 1).map_err(|_| "out of memory")?;
+        let ids = crate::map::zeroed(max / 8 + 1).map_err(|e| format!("memory: {e}"))?;
         let (codes, groups) = (
             (0..CODES).map(|_| AtomicU8::new(0)).collect(),
             Mutex::new(0),
@@ -60,8 +60,10 @@ impl Regions {
 
     /// Adds share `t` of `n` of the lines `id,CCC\n`. A share runs from the
     /// first line start at or after its nominal start to the next share's.
-    pub fn parse(&self, f: Mapped, t: usize, n: usize) -> Result<(), &'static str> {
+    /// An error names the byte offset of the line it is about.
+    pub fn parse(&self, f: Mapped, t: usize, n: usize) -> Result<(), String> {
         let b = f.b;
+        let bad = |p: usize, what: &str| format!("regions.csv, line at byte {p}: {what}");
         let start = |k: usize| match k * f.len / n {
             0 => HEADER.len(),
             // The file ends in an LF (checked in `new`), so one is found.
@@ -69,33 +71,36 @@ impl Regions {
         };
         let (mut p, end) = (start(t), start(t + 1));
         while p < end {
-            let (id, q) = uint(b, p).ok_or("regions.csv: bad region id")?;
+            let (id, q) = uint(b, p).ok_or_else(|| bad(p, "bad region id"))?;
             let code = &b[q + 1..q + 4];
             if b[q] != b',' || b[q + 4] != b'\n' || !code.iter().all(u8::is_ascii_uppercase) {
-                return Err("regions.csv: bad line");
+                return Err(bad(p, &format!("id {id}: not `id,CCC` and an LF")));
             }
             let code = code.iter().fold(0, |c, &l| c * 26 + usize::from(l - b'A'));
             let word = self.ids.get(id as usize / 8);
-            let word = word.ok_or("regions.csv: ids are not ascending")?;
-            word.fetch_or(u64::from(self.group_of(code)?) << (id % 8 * 8), Relaxed);
+            let word = word.ok_or_else(|| bad(p, &format!("id {id} is above the last line's")))?;
+            let group = self
+                .group_of(code)
+                .ok_or_else(|| bad(p, "more than 255 countries"))?;
+            word.fetch_or(u64::from(group) << (id % 8 * 8), Relaxed);
             p = q + 5;
         }
         Ok(())
     }
 
-    fn group_of(&self, code: usize) -> Result<u8, &'static str> {
+    fn group_of(&self, code: usize) -> Option<u8> {
         let g = self.codes[code].load(Relaxed);
         if g != 0 {
-            return Ok(g);
+            return Some(g);
         }
         let mut groups = self.groups.lock().unwrap();
         // Another worker may have handed this code a group meanwhile.
         if self.codes[code].load(Relaxed) == 0 {
             let next = groups.checked_add(1);
-            *groups = next.ok_or("regions.csv: more than 255 countries")?;
+            *groups = next?;
             self.codes[code].store(*groups, Relaxed);
         }
-        Ok(self.codes[code].load(Relaxed))
+        Some(self.codes[code].load(Relaxed))
     }
 
     /// `(code, group)` for every country seen, in code order.

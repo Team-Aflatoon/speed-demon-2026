@@ -35,7 +35,10 @@ pub const PAD: usize = 128;
 /// and counted into, and the chunks. Chunk c covers nominally the `piece`
 /// bytes from `c * piece` (see `read`); `next` is the next one to claim, and
 /// `quotes[c]` the quote bytes found in chunk c. `fail` is the worst `Fail`
-/// of any chunk, 0 for none.
+/// of any chunk, `NO_FAIL` for none, and `bad_at` the lowest buffer offset
+/// of a grammar error (a file offset when the file is one chunk).
+///
+/// The parser itself is `impl Shared` in records.rs, starting at `chunk`.
 pub struct Shared<'a> {
     file: &'a File,
     len: usize,
@@ -45,7 +48,11 @@ pub struct Shared<'a> {
     next: AtomicUsize,
     quotes: Vec<AtomicU64>,
     fail: AtomicU8,
+    bad_at: AtomicUsize,
 }
+
+/// `Shared::fail` before any chunk has failed; `Fail`s count up from 1.
+const NO_FAIL: u8 = 0;
 
 /// Parses everything with `threads` workers, in chunks of nominally `piece`
 /// bytes, with a name table of `slots` slots, and returns the aggregates by
@@ -60,18 +67,19 @@ pub struct Shared<'a> {
 /// it, each one did start outside quotes, right after a terminator, and was
 /// parsed exactly as one sequential pass would have parsed it. If not, this
 /// returns `Fail::Malformed`, and the caller retries with a single chunk.
+/// With the failure comes the offset of the first grammar error, if any.
 pub fn run(
     threads: usize,
     piece: usize,
     slots: usize,
     records: (&File, usize),
     regions: (&Regions, Mapped),
-) -> Result<Vec<Agg>, Fail> {
+) -> Result<Vec<Agg>, (Fail, usize)> {
     let ((file, len), piece) = (records, piece.max(1));
     let names = Names::new(slots, len).unwrap_or_else(|e| die(&format!("memory: {e}")));
     let chunks = len.div_ceil(piece).max(1);
     let quotes = (0..chunks).map(|_| AtomicU64::new(0)).collect();
-    let (next, fail) = (AtomicUsize::new(0), AtomicU8::new(0));
+    let (next, fail) = (AtomicUsize::new(0), AtomicU8::new(NO_FAIL));
     let shared = Shared {
         file,
         len,
@@ -81,6 +89,7 @@ pub fn run(
         next,
         quotes,
         fail,
+        bad_at: AtomicUsize::new(usize::MAX),
     };
     // Before records start, the first workers fault in the name tables (see
     // `Names::touch`) while the others split regions.csv; one worker alone
@@ -96,7 +105,7 @@ pub fn run(
         }
         if let Some(part) = t.checked_sub(touchers).or((threads == 1).then_some(0)) {
             if let Err(e) = regions.0.parse(regions.1, part, parsers) {
-                die(e);
+                die(&e);
             }
             waiting.fetch_sub(1, Release);
         }
@@ -119,10 +128,11 @@ pub fn run(
         }
         before += q.load(Relaxed);
     }
+    let bad_at = shared.bad_at.into_inner();
     match shared.fail.into_inner() {
-        0 => Ok(total.into_inner().unwrap()),
-        1 => Err(Fail::Full),
-        _ => Err(Fail::Malformed),
+        NO_FAIL => Ok(total.into_inner().unwrap()),
+        f if f == Fail::Full as u8 => Err((Fail::Full, bad_at)),
+        _ => Err((Fail::Malformed, bad_at)),
     }
 }
 
@@ -151,11 +161,20 @@ impl Shared<'_> {
             }
             let (start, end) = self.read(c, &mut buffer);
             let eof = c * self.piece + end == self.len;
+            // The parser: records.rs, `Shared::chunk`.
             match self.chunk(&buffer[start..], end - start, c == 0, eof, aggs) {
                 Ok(quotes) => self.quotes[c].store(quotes, Relaxed),
                 Err(f) => _ = self.fail.fetch_max(f as u8, Relaxed),
             }
         }
+    }
+
+    /// Notes a grammar error at offset `at` of the chunk's buffer; returns
+    /// the `Fail` to report. Off the hot path.
+    #[cold]
+    pub fn malformed(&self, at: usize) -> Fail {
+        self.bad_at.fetch_min(at, Relaxed);
+        Fail::Malformed
     }
 
     /// Reads chunk c into `buffer` with pread, rather than mapping the file:

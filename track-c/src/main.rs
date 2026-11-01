@@ -1,6 +1,10 @@
 //! Speed Demon 2026, Track C (Join): parses the hostile /data/records.csv,
 //! joins it to /data/regions.csv and writes /out/aggregates.txt.
 //! README.md explains the design; the spec is specs/c-join.md.
+//!
+//! Usage: `track-c [DATA_DIR [OUT_DIR]]`, by default `/data` and `/out`.
+//! Errors go to stderr, with exit status 1. So do notes on the two
+//! fallbacks (a bigger name table, one chunk), which still exit 0.
 
 // The parser's SIMD needs AVX2, which .cargo/config.toml turns on for the
 // whole crate (target-cpu=x86-64-v3); refuse any other build.
@@ -15,11 +19,14 @@ mod regions;
 
 use records::Fail;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering::AcqRel};
 use std::{env, fs, fs::File, process, thread};
 
 /// Name-table slots for the first attempt: room for 114,688 distinct names
-/// (the spec's name pool has 100,000). A larger input retries with more.
+/// (the spec's name pool has 100,000). A larger input retries with 8 times
+/// more, up to `MAX_SLOTS` (58.7 million names; 2 GiB of table).
 const SLOTS: usize = 1 << 17;
+const MAX_SLOTS: usize = 1 << 26;
 /// Bytes per chunk of records.csv, read into a worker's buffer and parsed
 /// while it is still in that core's L2 cache.
 const PIECE: usize = 64 << 10;
@@ -31,7 +38,8 @@ pub const GROUPS: usize = 256;
 /// Running aggregates for one group, which is one output line. `sums` holds,
 /// in this order: count, id sum, amount sum (cents), distinct names, name
 /// bytes and note bytes. The parser adds whole records to it at once, and the
-/// name counter adds to the distinct names alone, at index `DISTINCT`.
+/// name counter adds to the distinct names alone, at index `DISTINCT`. Keep
+/// the order in step with `Shared::records` and the output line in `main`.
 #[derive(Clone, Copy)]
 pub struct Agg {
     pub sums: [i64; 6],
@@ -88,7 +96,7 @@ fn main() {
         die("records.csv is over 4 GiB; chunk offsets are 32-bit"); // spec: 202 MB
     }
     let region_file = map_or_die(&format!("{data}/regions.csv"));
-    let regions = regions::Regions::new(region_file).unwrap_or_else(|e| die(e));
+    let regions = regions::Regions::new(region_file).unwrap_or_else(|e| die(&e));
     let threads = thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_THREADS);
@@ -96,10 +104,19 @@ fn main() {
     let aggs = loop {
         match pipeline::run(threads, piece, slots, (&file, len), (&regions, region_file)) {
             Ok(aggs) => break aggs,
-            Err(Fail::Full) => slots *= 8,
+            Err((Fail::Full, _)) if slots < MAX_SLOTS => {
+                slots *= 8;
+                eprintln!("track-c: note: name table full; retrying with {slots} slots");
+            }
+            Err((Fail::Full, _)) => die(&format!("more than {} distinct names", MAX_SLOTS / 8 * 7)),
             // A single chunk starts at the start of the file: always right.
-            Err(Fail::Malformed) if piece < len => piece = len,
-            Err(Fail::Malformed) => die("records.csv does not follow spec section 2.1"),
+            Err((Fail::Malformed, _)) if piece < len => {
+                piece = len;
+                eprintln!("track-c: note: chunk cuts unproven; reparsing as one chunk");
+            }
+            Err((Fail::Malformed, at)) => die(&format!(
+                "records.csv does not follow spec section 2.1 (first error at byte {at})"
+            )),
         }
     };
     let mut text = String::new();
@@ -133,8 +150,16 @@ fn map_or_die(path: &str) -> map::Mapped {
 /// sets `panic = "abort"`, so the few `unwrap`s left (on locks, which abort
 /// instead of being poisoned, on writes to a `String`, and on lengths just
 /// checked) cannot fire on any input; if one ever did, the process would
-/// still stop with a message and a non-zero status.
+/// still stop with a message and a non-zero status. Workers may fail at the
+/// same time; the first caller reports and exits, and any other one waits
+/// for that exit, so stderr gets one message.
 pub fn die(msg: &str) -> ! {
+    static DYING: AtomicBool = AtomicBool::new(false);
+    if DYING.swap(true, AcqRel) {
+        loop {
+            thread::park();
+        }
+    }
     eprintln!("track-c: {msg}");
     process::exit(1)
 }

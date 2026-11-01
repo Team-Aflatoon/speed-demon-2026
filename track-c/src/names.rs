@@ -17,9 +17,13 @@ const SLOT: usize = 4;
 /// The longest name kept in its slot; longer ones live in the arena.
 const INLINE: usize = 8 * (SLOT - 1);
 /// `meta` of a slot whose claimer is still filling it in. Otherwise `meta`
-/// is 0 for an empty slot, or `(id + 1) << 32 | length`, where a length of
-/// `LONG` or more is `LONG` and the slot's first word holds the real one.
+/// is 0 for an empty slot, or `(id + 1) << 32 | length`. A name longer than
+/// `INLINE` keeps its length and arena offset in the slot's first two words.
 const FILLING: u64 = u64::MAX;
+/// A length no name has: main refuses a records.csv of 4 GiB or more, so
+/// the `min(LONG)` below never changes a length (it only bounds the field),
+/// and a slot published with length `LONG` matches no lookup, which is how
+/// `fill` retires a slot it has no id for.
 const LONG: usize = u32::MAX as usize;
 
 pub struct Names {
@@ -124,10 +128,14 @@ impl Names {
             return Err(Fail::Full);
         }
         if n.len <= INLINE {
-            // Only the name words: slot[SLOT - 1] is `meta`, which must change only through the
-            // Release store below; writing the key's hash word there first let a concurrent
-            // lookup see a transient `meta` and insert the same name twice.
-            key[..SLOT - 1].iter().zip(slot).for_each(|(&w, s)| s.store(w, Relaxed));
+            // The name words only. `meta` (slot[SLOT - 1]) changes only through
+            // the claiming CAS in `id` and the Release store below, and the
+            // name words are written before that store, so a lookup that sees
+            // a published `meta` also sees the whole name.
+            key[..SLOT - 1]
+                .iter()
+                .zip(slot)
+                .for_each(|(&w, s)| s.store(w, Relaxed));
         } else {
             let at = self.next_word.0.fetch_add(n.len.div_ceil(8), Relaxed);
             words(b, n)

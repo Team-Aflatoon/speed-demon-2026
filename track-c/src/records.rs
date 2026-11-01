@@ -54,9 +54,10 @@ pub struct Record {
     note_len: i64,
 }
 
-/// A chunk's separators not yet consumed: offsets from `base`, the quote
-/// bytes before each, how many there are, and where their record starts;
-/// and the batch the records they complete are parsed into.
+/// The parser's state within one chunk. First the separators found but not
+/// yet consumed: their offsets from `base`, the quote bytes before each, how
+/// many there are, and where their first record starts. Then `batch`, the
+/// records that those separators complete, parsed in place.
 struct Separators {
     at: [u32; ROOM],
     quotes: [u32; ROOM],
@@ -72,7 +73,9 @@ impl Shared<'_> {
     /// Parses the records in `b[..end]` into `aggs`: one chunk of the file,
     /// read into a buffer and followed there by `pipeline::PAD` zero bytes. It
     /// must start at a record start, or with the header if `header`; `eof`
-    /// says whether it ends the file. Returns the number of quote bytes in it.
+    /// says whether it ends the file. Returns the number of quote bytes in it,
+    /// which `pipeline::run` uses to check the chunk cuts. Every error notes
+    /// its offset in `b` (see `Shared::malformed`).
     pub fn chunk(
         &self,
         b: &[u8],
@@ -110,8 +113,9 @@ impl Shared<'_> {
             let lf_after = lf >> 1 | u64::from(next == b'\n') << 63;
             let opens = quote & ins & !(sep << 1 | sep_before);
             let closes = quote & !ins & !sep_after;
-            if opens | closes | cr & !ins & !lf_after != 0 {
-                return Err(Fail::Malformed);
+            let bad = opens | closes | cr & !ins & !lf_after;
+            if bad != 0 {
+                return Err(self.malformed(o + bad.trailing_zeros() as usize));
             }
             s.push((comma | lf) & !ins, (o - base) as u32, quote, quotes);
             quotes += quote.count_ones();
@@ -124,12 +128,14 @@ impl Shared<'_> {
         self.records(b, &mut s, aggs)?;
         // The final record may end at end of file without a terminator.
         if s.n == 4 && eof && inside == 0 {
-            self.parse(b, &mut s, 0, end, 0).ok_or(Fail::Malformed)?;
+            let parsed = self.parse(b, &mut s, 0, end, 0);
+            parsed.ok_or_else(|| self.malformed(s.record))?;
             self.join(b, &mut s.batch[..1], aggs)?;
             (s.n, s.record) = (0, end);
         }
         let whole = s.n == 0 && s.record == end;
-        whole.then_some(u64::from(quotes)).ok_or(Fail::Malformed)
+        let quotes = whole.then_some(u64::from(quotes));
+        quotes.ok_or_else(|| self.malformed(s.record))
     }
 
     /// The header line; returns where the first record starts.
@@ -138,7 +144,7 @@ impl Shared<'_> {
         let q = p + HEADER.len();
         let crlf = usize::from(b[q] == b'\r');
         let ok = b[p..q] == *HEADER && b[q + crlf] == b'\n';
-        ok.then_some(q + crlf + 1).ok_or(Fail::Malformed)
+        ok.then_some(q + crlf + 1).ok_or_else(|| self.malformed(0))
     }
 
     /// Parses and joins the records whose five separators (four commas,
@@ -151,7 +157,7 @@ impl Shared<'_> {
             let lf = s.base + s.at[5 * r + 4] as usize;
             let parsed = b[lf] == b'\n' && self.parse(b, s, 5 * r, lf, r).is_some();
             if !parsed {
-                return Err(Fail::Malformed);
+                return Err(self.malformed(s.record));
             }
             self.regions.prefetch(s.batch[r].region);
             s.record = lf + 1;
@@ -187,6 +193,7 @@ impl Shared<'_> {
     fn join(&self, b: &[u8], batch: &mut [Record], aggs: &mut [Agg]) -> Result<(), Fail> {
         for r in batch.iter_mut() {
             r.group = self.regions.group(r.region);
+            // In `Agg::sums` order; distinct names (0 here) come from `count`.
             let sums = [1, r.id, r.cents, 0, r.name_len, r.note_len];
             aggs[usize::from(r.group)].add(sums, r.cents, r.cents);
         }
