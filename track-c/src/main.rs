@@ -39,15 +39,14 @@ pub const GROUPS: usize = 256;
 #[repr(align(128))]
 pub struct Padded<T>(pub T);
 
-/// Asks the CPU to start loading the cache line of element `i` of `s`, so
-/// that a later read finds it there. Used to overlap the cache misses of a
-/// window's records. An `i` past the end is harmless, so it is not checked.
+/// Asks the CPU to start loading `value`'s cache line, so that a later read
+/// finds it there. Used to overlap the cache misses of a window's records.
 #[inline(always)]
-pub fn prefetch<T>(s: &[T], i: usize) {
+pub fn prefetch<T>(value: &T) {
     use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-    // SAFETY: a prefetch is only a hint: it never faults, whatever the
-    // address, and has no effect on memory.
-    unsafe { _mm_prefetch::<_MM_HINT_T0>(s.as_ptr().wrapping_add(i).cast()) }
+    // SAFETY: a prefetch is only a hint. It never faults and has no effect
+    // on memory, and the pointer comes from a live reference anyway.
+    unsafe { _mm_prefetch::<_MM_HINT_T0>((value as *const T).cast()) }
 }
 
 fn main() {

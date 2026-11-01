@@ -164,8 +164,8 @@ impl Table {
     /// Starts loading the cache line a lookup of `k` reads first.
     pub fn prefetch(&self, k: &Key) {
         match k.tag as usize - 1 <= SHORT {
-            true => crate::prefetch(self.short, 2 * k.home as usize),
-            false => crate::prefetch(self.long, 4 * k.home as usize),
+            true => crate::prefetch(&self.short[2 * k.home as usize]),
+            false => crate::prefetch(&self.long[4 * k.home as usize]),
         }
     }
 
@@ -174,22 +174,17 @@ impl Table {
     #[inline(always)]
     pub fn find(&self, k: &Key, b: &[u8], budget: &mut Budget) -> Res<usize> {
         if k.tag as usize - 1 > SHORT {
-            return Ok(self.short.len() / 2 + self.probe::<4>(k, b, budget, false)?);
+            return Ok(self.short.len() / 2 + self.probe::<4>(k, b, budget)?);
         }
         // The four slots of the home line at once. A slot only matches once
         // published, and the Acquire load of its `meta` makes the word
         // written before it (in `fill`) visible.
         let ([w, meta], first) = (want::<2>(k), k.home as usize);
-        // SAFETY: `key` masks `home` to a line start within the short slots.
-        let l = unsafe { self.short.get_unchecked(2 * first..2 * first + 8) };
-        let metas = [0, 1, 2, 3].map(|j| l[2 * j + 1].load(Acquire));
-        let same = |j: usize| (metas[j] == meta) & (l[2 * j].load(Relaxed) == w);
+        let l = &self.short[2 * first..2 * first + 8];
+        let same = |j: usize| (l[2 * j + 1].load(Acquire) == meta) & (l[2 * j].load(Relaxed) == w);
         let hit = (0..4).rev().fold(4, |hit, j| if same(j) { j } else { hit });
-        // A line of four published names, none of them this one, is full for
-        // good: the probe can start at the next line.
-        let full = metas.iter().all(|&m| m.wrapping_add(1) > 1);
         match hit {
-            4 => self.probe::<2>(k, b, budget, full),
+            4 => self.probe::<2>(k, b, budget),
             _ => Ok(first + hit),
         }
     }
@@ -201,11 +196,10 @@ impl Table {
     /// in turn) apart, not the next one: linear probing by lines would pile
     /// names up in runs of full lines. A long slot's `meta` is compared in its
     /// low 32 bits, the tag.
-    fn probe<const W: usize>(&self, k: &Key, b: &[u8], budget: &mut Budget, skip: bool) -> Res<usize> {
+    fn probe<const W: usize>(&self, k: &Key, b: &[u8], budget: &mut Budget) -> Res<usize> {
         let (words, want, len) = (self.slots::<W>(), want::<W>(k), k.tag as usize - 1);
         let mix = (k.w[0] ^ k.w[1] ^ k.w[2]).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let (mask, step) = (words.len() / W - 1, (mix >> 40 | 1) as usize);
-        let mut i = (k.home as usize + if skip { 4 * step } else { 0 }) & mask;
+        let (mask, step, mut i) = (words.len() / W - 1, (mix >> 40 | 1) as usize, k.home as usize);
         loop {
             let slot = &words[W * i..W * i + W];
             let mut meta = slot[W - 1].load(Acquire);
@@ -293,7 +287,7 @@ impl Table {
 
     /// Phase 2 for one bucket: counts its pairs from every worker into `out`.
     /// `bits` must be all zero, and is left so.
-    pub fn count(&self, all: &[&Pairs], bucket: usize, bits: &mut [u64; 1024], out: &mut [Counts; 256]) {
+    pub fn count(&self, all: &[&Pairs], bucket: usize, bits: &mut [u64; 1024], out: &mut [Counts]) {
         let lens: [u64; BUCKET] = std::array::from_fn(|j| self.unescaped(bucket * BUCKET + j));
         for pairs in all {
             pairs.each(bucket, |e| {
@@ -349,8 +343,7 @@ impl Pairs {
 
     #[inline(always)]
     pub fn push(&mut self, id: usize, group: u8) {
-        // SAFETY: ids are slot indices, and `cur` has a bucket per 256 slots.
-        let bucket = unsafe { self.cur.get_unchecked_mut(id / BUCKET) };
+        let bucket = &mut self.cur[id / BUCKET];
         let mut p = *bucket as usize;
         if p % BLOCK == 0 {
             // A new block for a bucket whose cursor is 0 or the end of its
