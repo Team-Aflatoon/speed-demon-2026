@@ -2,7 +2,9 @@
 
 ## Summary
 
-**Final: v5 (step 16, commit f3edcde).** Board run run-407d7d7d6411: 125.9 ms, 36.1 MB, K 30.21,
+**Final: v5.1 (step 17, commit 1f63325).** Board run run-438bfabbceeb: 113.6 ms, 36.3 MB, K 31.43, 74.87 points; S 1,689. It is v5 with 12 MB segments and 64 KB reads (21 segments instead of 31, and each BOOL query pays a fixed cost per segment), a shorter serial setup (queries.txt mapped, the term table sized from a word count and built before the threads start), the anchor flag carried in the stored term id, contiguous phrase records with prefetched anchor heads, evaluation that skips query-segment pairs that provably match nothing, and pwrite output per format task; instructions -10.7% locally.
+
+**Before it, v5 (step 16, commit f3edcde).** Board run run-407d7d7d6411: 125.9 ms, 36.1 MB, K 30.21,
 74.01 points (50 log10 K); the reference takes 56.35 s and 2,200 MB. It won because the v4.2
 scan spent about 120-190 instructions on every token; a branch-free term table (three keys in a
 cache line) and a leaner token loop cut the instructions by 35% and the mispredicts by 53% (see
@@ -64,6 +66,7 @@ points are 50 log10 of its K of 30.21.
 | 14 | v4.2 before the error-path round: static linking (`+crt-static`), revised comments, and a simplification pass (S 1,316 → 1,269, the insert prefetch removed); output byte-identical on seeds 1, 7, 101 and 202. Three board runs (0.1887, 0.1876, 0.1886 s; median shown). | run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5 | 0.1886 | 36.2 | 70.29 |
 | 15 | Errors for unseen input: every input error names its byte offset, document id or line span; query lines in messages are quoted and cut to 80 bytes; a failed write removes the partial results.txt; optional `[data] [out]` arguments; `--locked`. S rose from 1,269 to 1,299 only for this, so that a holdout the program cannot handle fails loudly and says where; output is unchanged. Two board runs (0.1860, 0.1923 s; median shown). **This is v4.2 as submitted (701dd4f).** | run-3ae92ad95108, run-f30168793c18 | 0.1892 | 36.1 | 70.18 |
 | 16 | v5 (see "v5: a cheaper per-token scan" below): term table of three-key buckets probed branch-free; per-token loop in two passes (key and prefetch, then look up and record); document ends found by token index in the lexer; document-local scratch; galloping union and prefetched term entries in eval; cheaper setup. Local: instructions 9,554 M to 6,172 M (-35%), mispredicts -53%, CPU -34%. S 1,299 to 1,562. **This is v5 (f3edcde).** | run-407d7d7d6411 | 0.1259 | 36.1 | 74.01 |
+| 17 | **v5.1 (final).** Round 2 on v5: 12 MB segments and 64 KB reads; queries.txt mapped and the term table sized from a word count before the threads start; anchor flag in the stored term id; a per-document stamp instead of the seen bitset; one contiguous record per phrase with anchor heads prefetched; evaluation skips query-segment pairs that provably match nothing; pwrite output per format task. Instructions 6,186M -> 5,525M (-10.7%); S 1,562 -> 1,689. Dropped: a three-stage pipeline (+2.5 MiB, same wall), a token pre-filter (79% of tokens are query terms). | run-438bfabbceeb | 0.1136 | 36.3 | 74.87 |
 
 **What the board says.** Board T stayed at 302-316 ms from v1 to v3: the local gains of
 steps 5-10 (a few percent each in A/B) are within the board's run-to-run spread. The board win

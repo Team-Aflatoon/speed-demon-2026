@@ -6,8 +6,10 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-Board, v5 (commit f3edcde, PERF.md step 16): **125.9 ms, 36.1 MB, K 30.21, 74.01 points**
-(run-407d7d7d6411). That is about 448 times faster than the reference (56.35 s) in about a
+Board, v5.1 (commit 1f63325, PERF.md step 17): **113.6 ms, 36.3 MB, K 31.43, 74.87 points**
+(run-438bfabbceeb), S 1,689. v5.1 is v5 (125.9 ms, K 30.21, run-407d7d7d6411) with 12 MB segments,
+a shorter setup and leaner token and phrase paths; see PERF.md step 17. The figures below that
+refer to v5 are kept as measured. That is about 448 times faster than the reference (56.35 s) in about a
 sixtieth of its memory (2,200 MB). The previous build, v4.2, took 186.0-192.3 ms at 36.1-36.6 MB
 (K 25.1-25.5); v5 has the same design with a much cheaper per-token scan and writes
 byte-identical output. The steps that got here are in [PERF.md](PERF.md).
