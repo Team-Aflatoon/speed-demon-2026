@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::mpsc::{self, TryRecvError::Empty};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::{cell::UnsafeCell, fmt::Display, fs::File, os::unix::fs::FileExt, ptr, slice, thread};
+use std::os::fd::AsRawFd;
 
 /// Hours in the log: the spec fixes the span at 2026-10-30T18:00Z to 2026-11-02T18:00Z.
 /// The span's start is also written into `hour_row` and `stamp`: change all three together.
@@ -42,7 +43,7 @@ const BLOCK: usize = 1024;
 const CROWDED: usize = 1 << 17;
 /// Bytes of input a worker claims and reads at a time: a buffer that, with its
 /// hyperthread sibling's, stays in a P-core's 1.25 MB L2.
-const PIECE: usize = 64 << 10;
+const PIECE: usize = 1 << 20;
 /// The longest line the grammar allows: timestamp, 7-byte method, 125-byte endpoint,
 /// status and 10-digit latency, with their separators and the newline.
 const MAX_LINE: usize = 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1;
@@ -289,6 +290,29 @@ impl<'a> Job<'a> {
 
     /// Reads and parses piece `i`; the hours below `closed` are closed.
     fn piece(&self, i: usize, closed: usize, open: &mut Open, buf: &mut Vec<u8>) {
+        // Map the piece from the page before it to past its last line and SLACK, unless
+        // that runs past the file's last page.
+        let at = (i * PIECE).saturating_sub(4096);
+        let stop = ((i + 1) * PIECE + MAX_LINE + SLACK).next_multiple_of(4096);
+        if stop <= self.len.next_multiple_of(4096) {
+            let fd = self.input.as_raw_fd();
+            let len = stop - at;
+            let p = unsafe { mmap(ptr::null_mut(), len, 1, 0x02, fd, at as i64) };
+            if p as isize == -1 {
+                die(std::io::Error::last_os_error());
+            }
+            let b = unsafe { slice::from_raw_parts(p as *const u8, len) };
+            let after_newline = |from: usize| b[from..].iter().position(|&c| c == b'\n').map_or(len, |q| from + q + 1);
+            let from = if i == 0 { 0 } else { after_newline(i * PIECE - 1 - at) };
+            let to = after_newline((i + 1) * PIECE - 1 - at);
+            let row = hour_row(&b[from..from + 13]).map_or(0, |row| row + 1);
+            self.rows[i].store(row, Relaxed);
+            if !unsafe { self.parse(open, closed, (p, from, to)) } {
+                lock(&self.plan).late = true;
+            }
+
+            return;
+        }
         // SAFETY: `read` leaves SLACK zero bytes after the piece's lines.
         if !unsafe { self.parse(open, closed, self.read(i, buf)) } {
             lock(&self.plan).late = true;
