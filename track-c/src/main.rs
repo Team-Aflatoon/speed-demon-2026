@@ -132,6 +132,7 @@ fn main() {
     }
     let path = format!("{out}/aggregates.txt");
     if let Err(e) = fs::write(&path, text) {
+        let _ = fs::remove_file(&path); // no partial output
         die(&format!("{path}: {e}"));
     }
 }

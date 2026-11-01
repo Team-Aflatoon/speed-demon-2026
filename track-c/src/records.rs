@@ -76,6 +76,12 @@ impl Shared<'_> {
     /// says whether it ends the file. Returns the number of quote bytes in it,
     /// which `pipeline::run` uses to check the chunk cuts. Every error notes
     /// its offset in `b` (see `Shared::malformed`).
+    ///
+    /// Per 64-byte block at offset `o` of `b`: the byte masks, the grammar
+    /// check, then the block's separators pushed into `s`, with the records
+    /// they complete parsed every `FLUSH` separators; after the last block,
+    /// the final record if it has no terminator. `s` is the chunk's parser
+    /// state (`Separators`).
     pub fn chunk(
         &self,
         b: &[u8],

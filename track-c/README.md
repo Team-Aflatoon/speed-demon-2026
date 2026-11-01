@@ -6,9 +6,9 @@ Team Aflatoon: Dhruv Sharma (@spiritsfuse), Anushika Chauhan (@Anushika06), Prat
 
 ## Result
 
-The final version, v4.1, measured on the board as run-0fc0507654be: T 49.1 ms, M 12.1 MB, S 734, D 1 (no crates), K 25.47 (70.30 points); the same code also ran 49.4 ms (run-0f99c23b4b3e). The reference is 14.44 s and 367 MB. About 5 MB of M is the container runtime's own baseline, charged before `main` runs. PERF.md has every step with its board run. Since v4.1 this folder only adds error-path changes (better messages, notes on the fallbacks; PERF.md row 36), which bring S to 767.
+The submitted version, v4.2 (commit 5f8b6df), measured on the board as run-31b13fc9019b: T 48.9 ms, M 12.6 MB, K 25.15 (70.03 points), and run-8721232bf1f2: 50.5 ms, 12.3 MB, K 24.85 (69.77 points); median 49.7 ms. S 767, D 1 (no crates); this folder adds one line since (a failed write removes the partial output; S 768). The reference is 14.44 s and 367 MB. Before its error paths were added (v4.1, run-0fc0507654be) the same hot code ran 49.1 ms at S 734; the 33 extra lines make input the generator never writes fail loudly, with a byte offset, and the fallbacks say so on stderr. PERF.md has every step with its board run. M (bytes / 10^6) is about 9.7 MB of tables and buffers; the rest is code, stacks and the container runtime's processes, charged before `main` runs.
 
-v4 as first submitted (run-1e5d2353fd9f) had a race that gave a wrong output in about 1 run of 100; a 300-run stress test found it and v4.1 fixes it in one line (see **Distinct names**, and PERF.md's summary).
+v4 as first submitted (run-1e5d2353fd9f) had a race that gave a wrong output in about 1 run of 100; a 300-run stress test found it, and v4.1 fixed it in one line (see **Distinct names**, and PERF.md's summary).
 
 | File | What it does |
 |---|---|
@@ -45,9 +45,9 @@ A Rust binary with no crates, built as a static executable for x86-64-v3 (AVX2);
 
 **Aggregates.** Each worker keeps its own count, id sum, amount sum, min, max and byte counts per group; they are summed at the end, sorted by country code (index order already is code order), and printed with integer cents formatting. `_UNMATCHED` comes last.
 
-**Limits, all far above the spec.** The name table starts with room for 114,688 names (the spec's pool has 100,000) and is rebuilt 8 times larger if a file has more, up to 58.7 million names. Up to 255 countries, region ids up to 100,000,000 and files up to 4 GiB; beyond those the program says so on stderr and exits non-zero.
+**Limits, all far above the spec.** The name table starts with room for 114,688 names (the spec's pool has 100,000) and is rebuilt 8 times larger if a file has more, up to 58.7 million names. Each attempt faults its tables in up front and none is unmapped, so reaching that last size (a 2 GiB name table and a 1.9 GB pair bitset) peaks at about 4.6 GB, within the harness's 8 GB; the step before it, 7.3 million names, needs about 0.6 GB in all. Up to 255 countries, region ids up to 100,000,000 and files up to 4 GiB; beyond those the program says so on stderr and exits non-zero.
 
-**Testing.** The official tests live in the organisers' repository (`tests/test_c_join.py` there, not in this one). Every check below compares the output byte for byte with the reference, unless it says otherwise.
+**Testing.** The official tests live in the organisers' repository (`tests/test_c_join.py` there, not in this one). Every check below compares the output byte for byte with the reference, unless it says otherwise. The synthetic inputs were written by small Python scripts that build records.csv and regions.csv from the spec's grammar (quoting, escapes, CR, BOMs and record lengths chosen per case); the scripts and files are not kept in this repository.
 
 | Case class | Inputs | Path exercised |
 |---|---|---|
@@ -55,7 +55,7 @@ A Rust binary with no crates, built as a static executable for x86-64-v3 (AVX2);
 | The official hand-written cases | the worked example and the four 2.1-only variants: no BOM, U+FEFF inside quotes, no final terminator, final LF or CRLF | normal path, EOF handling, BOM skipping |
 | Small and sample data | tiny data for seeds 2 to 6, sample data for seeds 2 to 9 | files of one chunk or a few |
 | 2.1 features the generator never writes | unquoted non-empty text, CR, LF, digits and BOMs inside quotes, long names | the chunk check fails, so the one-chunk reparse |
-| More than 114,688 distinct names | a synthetic file | the name table's retry with 8 times the slots |
+| More than 114,688 distinct names | a synthetic file of unique names | the name table's retry with 8 times the slots |
 | Records longer than the read slack and than a whole 64 KiB piece | four files | the read that doubles, empty chunks; where Python's csv module refuses a field over 128 KiB, compared with the earlier memory-mapped build |
 | Malformed records | a field missing or extra, an LF in place of a comma, a short or quoted amount | rejected with an error and the byte offset, as the reference rejects them |
 | Races | seed 1 run 100 to 300 times in a row in one container, by a stress script kept outside this folder | thread interleavings; found v4's race (PERF.md) |
@@ -68,5 +68,5 @@ None. The two libc functions used, `mmap` and `madvise`, are declared by hand wi
 
 - The atomic OR on the shared pair bitset costs about 7% of CPU at 12 threads compared with a plain store (measured by swapping in a racy one). Routing each pair to a worker that owns its name could recover part of that, but needs a queue that never blocks: an earlier ring-based version let one descheduled worker stall the others.
 - Make the per-record path leaner. After the names (21 ms of the box's time), field parsing and aggregates cost 12.3 ms there and separator flattening 5.2 ms (locally 15 of 180 ms of single-thread CPU, 8%; PERF.md, probe table). Counting quotes per text field instead of at every separator was tried and was 7% slower; any next attempt has to be measured on the box, where per-record work costs 2 to 3 times more than on a laptop.
-- Shrink memory: a rank bitmap instead of the 1 MB region map, and 24-byte table slots. The 3.7 MB pair bitset is close to the floor for exact counting, and about 5 MB of the measured peak is the container runtime's, charged before `main` runs.
+- Shrink memory: a rank bitmap instead of the 1 MB region map, and 24-byte table slots. The 3.7 MB pair bitset is close to the floor for exact counting, and the part of M that is not the program's own (2 to 3 MB on the board) is out of its reach.
 - Keep measuring on the scoring box: its probes (PERF.md) showed that local timings, taken on a faster laptop that was shared with other jobs, mispredicted which changes would help, in both directions.
