@@ -24,9 +24,17 @@ pub const PHRASE: u32 = 1 << 31;
 /// A slot holds the first 12 bytes of its term inline; longer terms are
 /// confirmed against their text in `queries.txt`.
 const INLINE: usize = 12;
-/// `w2` bits 0..38 are the key (12 bytes inline + 6-bit length), 38..62 the
-/// term id, 62 and 63 the flags.
+/// A slot is `[lo, w2]`: `lo` holds term bytes 0..8, and `w2`
+///
+/// ```text
+///   bits  0..32  term bytes 8..12   } the key, with `lo`
+///   bits 32..38  term length        }
+///   bits 38..62  term id
+///   bit  62      BOOL_TERM
+///   bit  63      ANCHOR
+/// ```
 const KEY_BITS: u64 = (1 << 38) - 1;
+const LEN_SHIFT: u32 = 32;
 const ID_SHIFT: u32 = 38;
 const ID_MASK: u32 = (1 << 24) - 1;
 /// Term offsets in `queries.txt` are kept as u32.
@@ -58,7 +66,7 @@ impl Key {
         Key {
             lo: lo & (u64::MAX >> (64 - 8 * len.min(8))),
             // 63 is longer than any term, so a longer token never matches.
-            w2: (u64::from(hi) & hi_mask) | (len.min(63) as u64) << 32,
+            w2: (u64::from(hi) & hi_mask) | (len.min(63) as u64) << LEN_SHIFT,
         }
     }
 
@@ -92,6 +100,7 @@ pub struct Table {
 }
 
 const ID_BLOCK: u32 = 1024;
+const MAX_IDS: usize = 1 << 22;
 
 impl Table {
     /// Room for the terms of `words` query words, and ids for all of them from
@@ -99,9 +108,13 @@ impl Table {
     pub fn new(words: usize, threads: usize) -> Table {
         let n = (words * 4 / 3).next_power_of_two().max(1 << 10);
         let ids = words + threads * ID_BLOCK as usize;
-        // A partition-local term number (id / 64) must fit in 16 bits.
-        if ids > 1 << 22 {
-            fail("too many query words");
+        // The binding limit on ids: a posting holds the partition-local term
+        // number (id / 64) in 16 bits, so ids stay under 2^22. The id field of
+        // a slot (24 bits) and of a BOOL step (30 bits) are looser. 50,000
+        // queries hold at most 400,000 words.
+        if ids > MAX_IDS {
+            let most = MAX_IDS - threads * ID_BLOCK as usize;
+            fail(&format!("too many query words: {words}, at most {most}"));
         }
         Table {
             slots: (0..n).map(|_| Default::default()).collect(),
@@ -226,7 +239,7 @@ impl Table {
     }
 
     fn term_len(&self, i: usize) -> usize {
-        (self.slots[i][1].load(Relaxed) >> 32 & 63) as usize
+        (self.slots[i][1].load(Relaxed) >> LEN_SHIFT & 63) as usize
     }
 
     /// Whether the token's bytes after the inline 12 match term `id`.
@@ -292,8 +305,7 @@ impl Parsed {
         // An empty range has no lines (splitting it would give one empty one).
         for line in lines.split(|&b| b == b'\n').take_while(|_| from < to) {
             if p.line(line, text).is_none() {
-                let line = String::from_utf8_lossy(line);
-                fail(&format!("malformed query: {line:?}"));
+                fail(&format!("malformed query: {}", shown(line)));
             }
         }
         p
@@ -332,7 +344,8 @@ impl Parsed {
             }
             let start = self.term_ends.last().map_or(0, |&e| e as usize);
             if self.terms.len() - start > usize::from(u8::MAX) {
-                return None; // anchor positions are bytes
+                // Anchor positions are bytes (the spec allows 8 terms).
+                fail(&format!("phrase with more than 255 terms: {}", shown(line)));
             }
             self.term_ends.push(self.terms.len() as u32);
         }
@@ -434,6 +447,13 @@ impl<'a> Setup<'a> {
         mine.choose_anchors(table, i);
         (mine, table)
     }
+}
+
+/// A query line for an error message: quoted, and cut to 80 bytes.
+fn shown(line: &[u8]) -> String {
+    let cut = &line[..line.len().min(80)];
+    let more = if cut.len() < line.len() { " ..." } else { "" };
+    format!("{:?}{more}", String::from_utf8_lossy(cut))
 }
 
 /// The first line start of `text` at or after `at`.

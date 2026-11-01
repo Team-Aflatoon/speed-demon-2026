@@ -37,9 +37,15 @@ const MAX_THREADS: usize = 12;
 const SEGMENT_BYTES: u64 = 8 << 20;
 const CHUNK_BYTES: u64 = 512 << 10;
 
+/// Ranges are named by `range << RANGE_SHIFT` in a u32 (see `query.rs`).
+const _: () = assert!(MAX_THREADS <= 1 << (32 - RANGE_SHIFT));
+
+/// `track-b [data dir] [out dir]`, by default `/data` and `/out`.
 fn main() {
     disable_huge_pages();
-    run("/data", "/out");
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |i: usize, default: &'static str| args.get(i).map_or(default, String::as_str);
+    run(arg(1, "/data"), arg(2, "/out"));
 }
 
 /// Prints `msg` and exits with status 1. Every input and I/O error ends here.
@@ -160,8 +166,10 @@ fn run(data: &str, out_dir: &str) {
     let out = format!("{out_dir}/results.txt");
     let mut file = File::create(&out).unwrap_or_else(|e| fail(&format!("{out}: {e}")));
     for lines in &shared.lines {
-        file.write_all(&lines.lock().unwrap())
-            .unwrap_or_else(|e| fail(&format!("{out}: {e}")));
+        if let Err(e) = file.write_all(&lines.lock().unwrap()) {
+            let _ = std::fs::remove_file(&out); // no partial results.txt
+            fail(&format!("{out}: {e}"));
+        }
     }
 }
 
@@ -223,7 +231,7 @@ fn plan(file: &File) -> Vec<Segment> {
 fn id_at(file: &File, at: u64) -> u32 {
     let mut id = [0u8; 16];
     let n = read_full(file, &mut id, at);
-    parse_id(&id[..n])
+    parse_id(&id[..n], at)
 }
 
 /// The id of the last line of the file (`len` bytes, ending with an LF).
@@ -285,6 +293,15 @@ fn wait(count: &AtomicU32, n: usize) {
 
 /// One worker: takes tasks from the queue in order until it is empty. Each
 /// task's locks are released before it counts itself done.
+///
+/// What each task waits for (`s` a segment):
+///
+/// | task     | waits until                   | because it                          |
+/// |----------|-------------------------------|-------------------------------------|
+/// | scan s   | build s - 2 is done           | reuses the chunk buffers of s - 2   |
+/// | build s  | scan s and eval s - 1 are done | reads s's chunks, rewrites `parts`  |
+/// | eval s   | build s is done               | reads `parts`                       |
+/// | format   | the last eval is done         | reads the finished answers          |
 ///
 /// It cannot deadlock: tasks are claimed in queue order and a task waits only
 /// on tasks earlier in the queue, so the oldest unfinished task waits on
@@ -377,6 +394,9 @@ fn check_ids(segments: &[Segment], s: usize, chunks: &[RwLockReadGuard<ChunkOut>
         {
             end - first
         }
-        _ => fail("document ids must be 0, 1, 2, ... in order"),
+        _ => fail(&format!(
+            "document ids must be 0, 1, 2, ... in order (in docs.txt bytes {}..{})",
+            segments[s].start, segments[s].end
+        )),
     }
 }

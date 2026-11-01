@@ -44,7 +44,7 @@ pub struct ChunkOut {
 pub struct Scanner<'a> {
     table: &'a Table,
     queries: &'a [u8],
-    phrases: &'a [&'a Parsed],
+    parsed_ranges: &'a [&'a Parsed],
     buf: Vec<u8>,
     /// Per token of the region being scanned: start, end (one past) and term id.
     starts: Vec<u32>,
@@ -71,7 +71,11 @@ struct Doc {
 }
 
 impl<'a> Scanner<'a> {
-    pub fn new(table: &'a Table, queries: &'a [u8], phrases: &'a [&'a Parsed]) -> Scanner<'a> {
+    pub fn new(
+        table: &'a Table,
+        queries: &'a [u8],
+        parsed_ranges: &'a [&'a Parsed],
+    ) -> Scanner<'a> {
         let seen = vec![0; table.ids() / 64 + 1]; // one more id: `Table::miss`
         let doc = Doc {
             seen,
@@ -81,7 +85,7 @@ impl<'a> Scanner<'a> {
         Scanner {
             table,
             queries,
-            phrases,
+            parsed_ranges,
             buf,
             starts,
             ends,
@@ -93,6 +97,12 @@ impl<'a> Scanner<'a> {
 
     /// Scans the lines that start in `docs.txt[from..to]`, numbering
     /// documents from `first` (the id of the segment's first line).
+    ///
+    /// Each turn reads up to `PIECE` more bytes behind the carried ones, then:
+    /// while `skip`, drops bytes up to the first LF (the end of the previous
+    /// chunk's last line); tokenizes the whole lines it has; and carries the
+    /// partial last line to the front for the next read. It is `done` after
+    /// the line holding byte `to - 1`, or at the end of the file.
     pub fn scan(&mut self, file: &File, (from, to): (u64, u64), first: u32, out: &mut ChunkOut) {
         out.streams.resize_with(PARTS, Vec::new);
         out.streams.iter_mut().for_each(Vec::clear);
@@ -137,10 +147,13 @@ impl<'a> Scanner<'a> {
             };
             if end > start {
                 if !known {
-                    out.first = parse_id(&self.buf[start..end]);
+                    let at = off + start as u64;
+                    out.first = parse_id(&self.buf[start..end], at);
                     let local = out.first.checked_sub(first);
-                    self.doc.local =
-                        local.unwrap_or_else(|| fail("document ids are not ascending"));
+                    let id = out.first;
+                    let ascending =
+                        || fail(&format!("document id {id} at byte {at} is out of order"));
+                    self.doc.local = local.unwrap_or_else(ascending);
                     known = true;
                 }
                 self.region(start, end, out);
@@ -153,9 +166,9 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Finds the tokens and LFs of `buf[start..end]` (whole lines); returns
-    /// how many of each.
-    fn lex(&mut self, start: usize, end: usize) -> (usize, usize) {
+    /// Finds the tokens and LFs of `buf[start..end]` (whole lines, the first
+    /// of them document `first`); returns how many of each.
+    fn lex(&mut self, start: usize, end: usize, first: u32) -> (usize, usize) {
         let (mut tokens, mut token_ends, mut lines, mut tabs) = (0, 0, 0, 0);
         // `in_id` is all ones while inside a line's "id TAB" prefix: every line
         // starts there, an LF enters it and the TAB leaves it, so a prefix XOR
@@ -194,15 +207,18 @@ impl<'a> Scanner<'a> {
             tabs += tab.count_ones() as usize;
         }
         if tabs != lines {
-            fail("every line of docs.txt must hold exactly one TAB");
+            let at = format!("the {lines} lines from document {first}");
+            fail(&format!(
+                "every line of docs.txt must hold exactly one TAB ({at})"
+            ));
         }
         (tokens, lines)
     }
 
     /// Tokenizes `buf[start..end]` (whole lines) and records each document.
     fn region(&mut self, start: usize, end: usize, out: &mut ChunkOut) {
-        let (tokens, lines) = self.lex(start, end);
-        let (table, queries, phrases) = (self.table, self.queries, self.phrases);
+        let (tokens, lines) = self.lex(start, end, out.first + out.lines);
+        let (table, queries, ranges) = (self.table, self.queries, self.parsed_ranges);
         let (buf, doc, lfs) = (&self.buf[..], &mut self.doc, &self.lfs[..lines]);
         let (starts, ends) = (&self.starts[..tokens], &self.ends[..tokens]);
         let ids = &mut self.ids[..tokens];
@@ -222,7 +238,7 @@ impl<'a> Scanner<'a> {
             for (j, ((&(key, slot), &s), &e)) in keys.iter().zip(b_starts).zip(b_ends).enumerate() {
                 let k = batch * BATCH + j;
                 while s > next_lf {
-                    doc.finish(&ids[..k], out, table, phrases);
+                    doc.finish(&ids[..k], out, table, ranges);
                     line += 1;
                     next_lf = lfs.get(line).copied().unwrap_or(u32::MAX);
                 }
@@ -233,7 +249,7 @@ impl<'a> Scanner<'a> {
             }
         }
         for _ in line..lines {
-            doc.finish(ids, out, table, phrases);
+            doc.finish(ids, out, table, ranges);
         }
     }
 }
@@ -259,9 +275,12 @@ impl Doc {
     /// Ends the document, whose tokens end where `ids` ends: emits its
     /// BOOL terms and checks the phrases anchored at its tokens against the
     /// token sequence.
-    fn finish(&mut self, ids: &[u32], out: &mut ChunkOut, table: &Table, phrases: &[&Parsed]) {
+    fn finish(&mut self, ids: &[u32], out: &mut ChunkOut, table: &Table, ranges: &[&Parsed]) {
         if self.local >= MAX_SEGMENT_DOCS {
-            fail("a segment of docs.txt holds more than 65,536 documents");
+            let id = out.first + out.lines;
+            fail(&format!(
+                "too many documents in one segment, at document id {id}"
+            ));
         }
         for &term in &self.fresh[..self.n_fresh] {
             out.streams[term as usize % PARTS].push((self.local << 16) | (term / PARTS as u32));
@@ -275,7 +294,7 @@ impl Doc {
             let at = at as usize - self.first;
             let mut phrase = table.head(doc[at]);
             while phrase != NONE {
-                let p = phrases[(phrase >> RANGE_SHIFT) as usize];
+                let p = ranges[(phrase >> RANGE_SHIFT) as usize];
                 let i = (phrase & ((1 << RANGE_SHIFT) - 1)) as usize;
                 let (terms, anchor) = (p.phrase(i), usize::from(p.anchor[i]));
                 let here = at >= anchor
@@ -354,12 +373,15 @@ fn flatten(mut bits: u64, base: u32, out: &mut [u32], n: &mut usize) {
 }
 
 /// The decimal id at the start of a line, up to its TAB.
-pub fn parse_id(line: &[u8]) -> u32 {
+/// `at` is the line's offset in docs.txt, for the error message.
+pub fn parse_id(line: &[u8], at: u64) -> u32 {
     let digits = line.iter().position(|&b| b == b'\t').unwrap_or(0);
     let id = std::str::from_utf8(&line[..digits]).map(str::parse);
     match id {
         Ok(Ok(id)) => id,
-        _ => fail("a line of docs.txt does not start with a document id"),
+        _ => fail(&format!(
+            "the line at byte {at} of docs.txt does not start with a document id"
+        )),
     }
 }
 

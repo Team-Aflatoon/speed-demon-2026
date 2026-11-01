@@ -4,26 +4,49 @@ Team Aflatoon: Dhruv Sharma (@Spiritsfuse), Anushika Chauhan (@Anushika06), Prat
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 
+## Result
+
+Board, median of three runs of the submitted build: **188.6 ms, 36.2 MB, K 25.46**
+(run-6a7f77612f9d, run-51caec2f4dcc, run-e44ae1bf8ad5), against the reference's 56.35 s and
+2.2 GB. The steps that got here are in [PERF.md](PERF.md).
+
+| File | What it holds |
+|---|---|
+| `src/main.rs` | Segment planning, the task queue and the worker loop, output |
+| `src/query.rs` | Query parsing, the lock-free term table, phrase anchors |
+| `src/scan.rs` | Reading and tokenizing `docs.txt`, postings streams, phrase checks |
+| `src/index.rs` | Postings per segment, BOOL evaluation, answers |
+
+`track-b [data dir] [out dir]` reads `queries.txt` and `docs.txt` from the data directory
+(default `/data`) and writes `results.txt` to the output directory (default `/out`).
+
 ## Approach
 
 The queries are part of the input, so the program reads `queries.txt` first and indexes
-only its terms. Twelve threads parse line-aligned ranges of the file and insert every word
+only its terms. Twelve threads parse line-aligned ranges of `queries.txt` and insert every word
 into one open-addressing hash table at the same time: a thread claims an empty slot with a
 compare-and-swap on its first word, so no locks are needed. A slot is 16 bytes: the first
 12 bytes of the term inline, its length, a term id and two flags (the term appears in a BOOL
 query; the term anchors a phrase). Ids are block-dense: each thread takes 1,024 at a time from
 a shared counter and hands them out in order, so an id costs no shared counter per term and
-each thread leaves at most one block partly unused. The table has room for every query word to be a
-distinct term at a load of at most 3/4, so it can never fill up, whatever the input.
+each thread leaves at most one block partly unused. The table has room for every query word to
+be a distinct term at a load of at most 3/4, so it can never fill up, whatever the input.
 
 **Phrases need no index.** Every phrase gets one anchor term: the one that occurs least often
 in `queries.txt`, the longest on a tie. Common words appear in many queries and rare words in
-one or two, so this picks rare corpus words without reading the corpus: on seed 1 the chosen
-anchors occur 1.26 million times in `docs.txt`, against 0.92 million for the truly rarest
-terms and 52 million for "the longest term". While scanning a document the program keeps
-the term id of every token (a dummy id for tokens that are no query term). When the document
-ends, each phrase anchored at one of its tokens is compared with the ids around that token.
-Positions are never stored and no document is read twice.
+one or two, so this picks rare corpus words without reading the corpus. What the scan pays is
+the number of times the anchors occur in `docs.txt` (seed 1):
+
+| Anchor | Occurrences in `docs.txt` |
+|---|---|
+| The truly rarest term (needs a pass over the corpus) | 0.92 million |
+| Fewest occurrences in `queries.txt` (used) | 1.26 million |
+| The longest term | 52 million |
+
+So the anchors are within 1.4x of the best possible without reading the corpus. While scanning
+a document the program keeps the term id of every token (a dummy id for tokens that are no
+query term). When the document ends, each phrase anchored at one of its tokens is compared
+with the ids around that token. Positions are never stored and no document is read twice.
 
 **Reading and tokenizing.** `docs.txt` is read with `pread` into a 128 KB buffer per
 thread, cut at the last line end, with the partial line carried to the next read. Each
@@ -56,9 +79,28 @@ tasks whose output it reads. The streams are double buffered by segment parity, 
 on scanning the next segment while the last one is built and answered, and no thread idles at
 a phase boundary.
 
-All I/O errors and malformed input end the program with a message on stderr and exit code 1.
-`unsafe` appears only in the hand-declared `prctl`, the prefetch hint and the AVX2 loads, each
-with a `SAFETY` note.
+All I/O errors and malformed input end the program with a message on stderr (with the byte
+offset, document id or query line where it can tell) and exit code 1, and leave no partial
+`results.txt`. `unsafe` appears only in the hand-declared `prctl`, the prefetch hint and the
+AVX2 loads, each with a `SAFETY` note.
+
+## Limits
+
+- At most 2^22 query words less 1,024 per thread (50,000 queries hold at most 400,000).
+- Phrases of at most 255 terms (the spec allows 8); query terms of 1 to 32 bytes.
+- `queries.txt` under 1 GB; document ids `0, 1, 2, ...` in order, each line with one TAB.
+- At most 16 threads (12 are used).
+- Segments are cut to hold at most 65,536 documents, so any number of documents is fine.
+
+## Testing
+
+Every build was checked against the reference's output on seeds 1 and 7 and the audit seeds 101
+and 202, and on 23 small cases: the spec's worked example, every hand-written case of
+`tests/test_b_index.py`, generated tiny and sample seeds, and random cases with long tokens,
+terms sharing their first 12 bytes, a line longer than a read buffer, op words as terms and NOT
+emptying a set. The 23 also run in three stress builds with tiny read buffers, chunks and
+segments (and one with at most 100 documents per segment), which exercise every boundary path,
+and seed 1 was repeated 100 times in one container with no differing output.
 
 ## Dependencies
 
@@ -76,6 +118,7 @@ and links the binary statically so that a run never pays for the dynamic loader.
   nothing on the board, so the lookup's own work (hashing, compares, branches) is what to cut.
   Next would be a direct table for the one- and two-byte tokens (1,332 entries), which are among
   the most frequent and would then need no hash, measured on the box.
-- Writing the BOOL postings costs about 4 ns per (term, document) pair. The commonest terms make
-  up about a third of the pairs and end up as bitmaps anyway, so the scan could set their bits
-  directly and skip their postings and their counting sort.
+- Writing postings costs about 4 ns per (term, document) pair. Setting the commonest terms'
+  bits directly in the scan lost on the board (197 ms, run-ff23bf5cc8f4: two more writes per
+  token cost what the skipped postings saved), so the next attempt would make the per-pair
+  write itself cheaper: one bulk copy per document into each stream instead of a push per pair.
