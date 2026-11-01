@@ -18,7 +18,6 @@ use std::{cell::UnsafeCell, fs::File, ops::Range, os::unix::fs::FileExt, ptr, sl
 
 /// Hours in the log: the spec fixes the span at 2026-10-30T18:00Z to 2026-11-02T18:00Z.
 const HOURS: usize = 72;
-const SPAN_START: i64 = days_from_civil(2026, 10, 30) * 24 + 18;
 /// A record has 11 bits for the endpoint id. Ids start at 1: a zero record is a slot
 /// that was reserved but not (or not yet) written. The spec promises 1,842 endpoints.
 const IDS: usize = 1 << 11;
@@ -106,18 +105,6 @@ fn reserve<T>(len: usize) -> io::Result<&'static [T]> {
     Ok(unsafe { slice::from_raw_parts(p.cast(), len) })
 }
 
-/// A log record as (endpoint id and 5xx bits, latency).
-fn record(r: &AtomicU32) -> (u32, u32) {
-    let r = r.load(Relaxed);
-    (r, r % MARK)
-}
-
-/// A side entry as (endpoint id and 5xx bits, latency).
-fn side_entry(e: &AtomicU64) -> (u32, u32) {
-    let e = e.load(Relaxed);
-    ((e >> 32) as u32, e as u32)
-}
-
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A lock is poisoned only by a thread that panics while holding it, and with
     // panic = "abort" a panic ends the process first: this `expect` cannot fire.
@@ -133,10 +120,6 @@ struct Hour {
     /// side entries taken.
     used: AtomicUsize,
     big: AtomicUsize,
-    /// The hour as two words of input text, `YYYY-MM-D` and `-MM-DDTHH`.
-    stamp: [AtomicU64; 2],
-    /// Lines its report counted.
-    reported: AtomicUsize,
 }
 
 /// Who does what next, under one lock.
@@ -168,7 +151,6 @@ struct Job<'a> {
     /// The log and its length (an `Option` only so that `Job` can derive `Default`).
     input: Option<&'a File>,
     len: usize,
-    pieces: usize,
     /// Per piece, the hour row of its first line plus one, once a worker has read it.
     rows: Vec<AtomicUsize>,
     speculate: bool,
@@ -181,8 +163,10 @@ struct Job<'a> {
     logs: &'a [AtomicU32],
     sides: &'a [AtomicU64],
     hours: Vec<Hour>,
-    /// Lines parsed, summed over the workers once they are done, and workers done.
+    /// Lines parsed, summed over the workers once they are done; lines the reports
+    /// counted; and workers done.
     lines: AtomicUsize,
+    reported: AtomicUsize,
     stopped: AtomicUsize,
     plan: Mutex<Plan>,
     changed: Condvar,
@@ -197,6 +181,7 @@ struct Job<'a> {
 impl<'a> Job<'a> {
     fn new(input: &'a File, speculate: bool) -> io::Result<Job<'a>> {
         let (len, input) = (input.metadata()?.len() as usize, Some(input));
+        let pieces = len.div_ceil(PIECE);
         // Room for every line of the file in any one hour (a line has at least 40
         // bytes), plus each worker's last, partly used block. A whole number of blocks
         // keeps every hour's log (and side list) page-aligned, as madvise(DONTNEED) in
@@ -205,10 +190,7 @@ impl<'a> Job<'a> {
         Ok(Job {
             input,
             len,
-            pieces: len.div_ceil(PIECE),
-            rows: (0..len.div_ceil(PIECE))
-                .map(|_| AtomicUsize::new(0))
-                .collect(),
+            rows: (0..pieces).map(|_| AtomicUsize::new(0)).collect(),
             speculate,
             room,
             logs: reserve(HOURS * room)?,
@@ -249,8 +231,7 @@ impl<'a> Job<'a> {
         lock(&self.plan).failure.take().map_or(Ok(()), Err)?;
         // Each line is one record in its hour, so the reports saw every line exactly when
         // they saw as many as were parsed.
-        let reported: usize = self.hours.iter().map(|h| h.reported.load(Relaxed)).sum();
-        Ok(reported == self.lines.load(Relaxed))
+        Ok(self.reported.load(Relaxed) == self.lines.load(Relaxed))
     }
 
     /// One worker: parses pieces and reports hours, whichever is due, until all is done.
@@ -268,7 +249,7 @@ impl<'a> Job<'a> {
                     parsed = Some(i);
                     // Among the last pieces, this was most likely this worker's last one:
                     // free its buffer now, not at the memory peak at the end.
-                    if i + WORKERS >= self.pieces {
+                    if i + WORKERS >= self.rows.len() {
                         buf = Vec::new();
                     }
                 }
@@ -314,19 +295,17 @@ impl<'a> Job<'a> {
             // (shard 0 uploads each hour 5 to 10 minutes after it ends), though nothing
             // promises it.
             let frontier = plan.parsing.iter().fold(plan.next_piece, |a, &i| a.min(i));
-            let due = if frontier == self.pieces {
-                HOURS
-            } else if self.speculate {
-                self.rows[frontier].load(Relaxed).saturating_sub(2)
-            } else {
-                0
+            let due = match self.rows.get(frontier) {
+                None => HOURS,
+                Some(row) if self.speculate => row.load(Relaxed).saturating_sub(2),
+                Some(_) => 0,
             };
             if plan.failure.is_some() || plan.next_hour == HOURS {
                 return Task::Stop;
             } else if plan.next_hour < due {
                 plan.next_hour += 1;
                 return Task::Hour(plan.next_hour - 1);
-            } else if plan.next_piece < self.pieces {
+            } else if plan.next_piece < self.rows.len() {
                 let i = plan.next_piece;
                 plan.parsing.push(i);
                 plan.next_piece += 1;
@@ -342,14 +321,11 @@ impl<'a> Job<'a> {
     /// from the byte before it to the end of its last line, then SLACK zero bytes. Also
     /// notes the hour of its first line for the plan (one outside the span stays unknown).
     fn read(&self, i: usize, buf: &mut Vec<u8>) -> io::Result<Piece> {
-        let (at, end) = (
-            (i * PIECE).saturating_sub(1),
-            self.len.min((i + 1) * PIECE + MAX_LINE),
-        );
+        let at = (i * PIECE).saturating_sub(1);
+        let end = self.len.min((i + 1) * PIECE + MAX_LINE);
+        let input = self.input.expect("set by `new`");
         buf.resize(end - at + SLACK, 0);
-        self.input
-            .expect("set by `new`")
-            .read_exact_at(&mut buf[..end - at], at as u64)?;
+        input.read_exact_at(&mut buf[..end - at], at as u64)?;
         buf[end - at..].fill(0);
         // A line starts after a newline, so the byte before the piece decides where its
         // first line starts, and the first newline from its last byte on where it stops.
@@ -375,8 +351,16 @@ impl<'a> Job<'a> {
         let side = &self.sides[at..at + h.big.load(Relaxed)];
         // Count pass, by endpoint id and 5xx flag together (the record's top 12 bits); then
         // per endpoint, requests in the low half and 5xx responses in the high half. A slot
-        // not written (yet) counts as id 0, which is never printed.
-        let records = || log.iter().map(record).chain(side.iter().map(side_entry));
+        // not written (yet) counts as id 0, which is never printed. Both kinds are read as
+        // (endpoint id and 5xx bits, latency).
+        let records = || {
+            let small = log.iter().map(|r| r.load(Relaxed)).map(|r| (r, r % MARK));
+            small.chain(
+                side.iter()
+                    .map(|e| e.load(Relaxed))
+                    .map(|e| ((e >> 32) as u32, e as u32)),
+            )
+        };
         let mut tally = [0u32; 2 * IDS];
         records().for_each(|(r, _)| tally[(r >> 20) as usize] += 1);
         let counts: [u64; IDS] = std::array::from_fn(|id| {
@@ -384,7 +368,7 @@ impl<'a> Job<'a> {
             (ok + errors) | (errors << 32)
         });
         let seen = counts[1..].iter().map(|&c| c as u32 as usize).sum();
-        h.reported.store(seen, Relaxed);
+        self.reported.fetch_add(seen, Relaxed);
         // Each endpoint gets a slice of `sorted`, in output order, and id 0 the last one.
         let order = self.order(counts.iter().rposition(|&c| c > 0).unwrap_or(0));
         let (mut next, mut total) = ([0u32; IDS], 0);
@@ -406,10 +390,7 @@ impl<'a> Job<'a> {
         // SAFETY: madvise(DONTNEED) on our own mapping; if it is refused, pages stay.
         unsafe { madvise(log.as_ptr() as _, size_of_val(log), MADV_DONTNEED) };
         unsafe { madvise(side.as_ptr() as _, size_of_val(side), MADV_DONTNEED) };
-        let mut stamp = [0; 32];
-        stamp[..8].copy_from_slice(&h.stamp[0].load(Relaxed).to_le_bytes());
-        stamp[5..13].copy_from_slice(&h.stamp[1].load(Relaxed).to_le_bytes());
-        stamp[13..21].copy_from_slice(b":00:00Z ");
+        let stamp = stamp(hour);
         // Room for every line at once (untouched pages cost nothing), so the text never
         // grows by copying.
         text.reserve(256 * order.len());
@@ -429,10 +410,10 @@ impl<'a> Job<'a> {
         if order.len() < max_id {
             // The id was published before its record was written, but maybe not yet seen
             // here (the record was read Relaxed); Acquire on the count makes the name so.
-            while ENDPOINTS.len() < max_id {
+            while ENDPOINTS.published.load(Acquire) < max_id {
                 std::hint::spin_loop();
             }
-            let mut ids: Vec<u16> = (1..=ENDPOINTS.len() as u16).collect();
+            let mut ids: Vec<u16> = (1..=ENDPOINTS.published.load(Acquire) as u16).collect();
             ids.sort_unstable_by_key(|&id| ENDPOINTS.get(id).bytes());
             *order = Arc::new(ids);
         }
@@ -446,7 +427,6 @@ impl<'a> Job<'a> {
     /// `from` must start a line, `to` must end one, and the SLACK bytes after every line
     /// start in between must be readable.
     unsafe fn parse(&self, open: &mut Open, (p, from, to): Piece) -> io::Result<usize> {
-        let word = |at: usize| p.add(at).cast::<u64>().read_unaligned();
         // The current hour, as a cache: shards write in time order, so it rarely changes.
         // `key` holds its `YYYY-MM-DDTHH`, compared as the first 13 of 16 loaded bytes.
         let (mut key, mut row, (mut n, mut end), mut lines) = (_mm_setzero_si128(), 0, open[0], 0);
@@ -480,11 +460,6 @@ impl<'a> Job<'a> {
                     row = hour_row(slice::from_raw_parts(p.add(start), 13))?;
                     (hour, (n, end)) = (&self.hours[row], open[row]);
                     log = self.logs[row * self.room..].as_ptr();
-                    // Stored once, so the shared line is not rewritten at every hour change.
-                    if hour.stamp[1].load(Relaxed) == 0 {
-                        hour.stamp[0].store(word(start), Relaxed);
-                        hour.stamp[1].store(word(start + 5), Relaxed);
-                    }
                 }
                 let (latency, space) = parse_latency(p.add(e - 16));
                 let status = e - 16 + space - 3;
@@ -635,22 +610,25 @@ unsafe fn parse_latency(p: *const u8) -> (u32, usize) {
     (latency, space as usize)
 }
 
-/// The row (0 to 71) of a `YYYY-MM-DDTHH` hour, or an error outside the spec's span.
+/// The row (0 to 71) of a `YYYY-MM-DDTHH` hour, or an error outside the spec's span. The
+/// span runs from 2026-10-30T18 over the end of October (31 days) into November.
 fn hour_row(t: &[u8]) -> io::Result<usize> {
     let num = |r: Range<usize>| t[r].iter().fold(0, |a, &d| a * 10 + d as i64 - 48);
-    let hours = days_from_civil(num(0..4), num(5..7), num(8..10)) * 24 + num(11..13);
-    match usize::try_from(hours - SPAN_START) {
-        Ok(row) if row < HOURS => Ok(row),
+    let day = num(8..10) + if num(5..7) == 11 { 31 } else { 0 };
+    let row = usize::try_from((day - 30) * 24 + num(11..13) - 18);
+    match (num(0..4), num(5..7), row) {
+        (2026, 10 | 11, Ok(row)) if row < HOURS => Ok(row),
         _ => Err(io::Error::other("a timestamp outside the 72-hour span")),
     }
 }
 
-/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
-const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let (era, doy) = (y.div_euclid(400), (153 * ((m + 9) % 12) + 2) / 5 + d - 1);
-    let yoe = y - era * 400;
-    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+/// The output's `YYYY-MM-DDTHH:00:00Z ` for hour row `row`, padded to 32 bytes.
+fn stamp(row: usize) -> [u8; 32] {
+    let (day, hour) = (30 + (row + 18) / 24, (row + 18) % 24);
+    let (month, day) = if day > 31 { (11, day - 31) } else { (10, day) };
+    let mut stamp = [0; 32];
+    stamp[..21].copy_from_slice(format!("2026-{month:02}-{day:02}T{hour:02}:00:00Z ").as_bytes());
+    stamp
 }
 
 /// One endpoint name and the space after it, zero-padded so it can be compared and
@@ -678,11 +656,9 @@ impl Name {
     unsafe fn is(&self, p: *const u8, len: usize) -> bool {
         // `b` is taken from the whole struct: the last block also covers `len`, masked off.
         let eq = |at: usize| {
-            let (a, b) = (
-                p.add(at).cast(),
-                (self as *const Name).cast::<u8>().add(at).cast(),
-            );
-            let eq = _mm256_cmpeq_epi8(_mm256_loadu_si256(a), _mm256_loadu_si256(b));
+            let a = _mm256_loadu_si256(p.add(at).cast());
+            let b = _mm256_loadu_si256((self as *const Name).cast::<u8>().add(at).cast());
+            let eq = _mm256_cmpeq_epi8(a, b);
             _mm256_movemask_epi8(eq) as u32 as u64
         };
         let all = |at| (eq(at) | eq(at + 32) << 32) | !_bzhi_u64(!0, (len + 1 - at) as u32) == !0;
@@ -716,10 +692,6 @@ static ENDPOINTS: Endpoints = Endpoints {
 };
 
 impl Endpoints {
-    fn len(&self) -> usize {
-        self.published.load(Acquire)
-    }
-
     fn get(&self, id: u16) -> &Name {
         // SAFETY: only published ids are passed in (see the Sync note).
         unsafe { &*self.names[id as usize % IDS].get() }

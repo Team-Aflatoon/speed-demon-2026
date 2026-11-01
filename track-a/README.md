@@ -60,8 +60,9 @@ on the value.
 compares and `movemask`) holds at most two line ends, so both candidates (the lowest set
 bit, and the lowest once that is cleared) are stored and the count advances by the
 popcount, with no branch per block. The hour is cached as the first 13 bytes of the
-timestamp and checked with one 16-byte compare; it is recomputed (days from the civil date)
-only when it changes. The latency is parsed right to left from the newline with no loop:
+timestamp and checked with one 16-byte compare; its row is worked out from the date only
+when it changes (the span crosses one month end, October's 31st, so no calendar is
+needed), and the output's hour stamp is made from the row. The latency is parsed right to left from the newline with no loop:
 one SSE compare finds the space before it, its digits are masked in and summed by three
 multiply-add steps, and the status digit before that space gives the 5xx flag. One more
 16-byte compare finds the space after the method, where the endpoint starts.
