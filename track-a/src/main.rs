@@ -372,33 +372,27 @@ impl<'a> Job<'a> {
         // `key` holds its `YYYY-MM-DDTHH`, compared as the first 13 of 16 loaded bytes.
         let (mut key, mut row, (mut n, mut end)) = (_mm_setzero_si128(), 0, open[0]);
         let (mut used, mut log) = (&self.used[0].0, self.logs.as_ptr());
-        // The first 13 bytes of a stamp, `YYYY-MM-DDTHH`, as a mask.
-        let hour_bytes =
-            _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0);
-        let mut ends = [0usize; SCAN / 32 + 2];
+        let mut ends = [0usize; SCAN / 32];
         let (mut line, mut block) = (from, from);
         while line < to {
             // Index the line ends of the next SCAN bytes. A 64-byte block holds at most two
             // (a line has at least 40 bytes), so both candidates (the lowest set bit, and
             // the lowest once that is cleared) are stored and the count advances by the
             // popcount, without a branch per block. SCAN bytes hold at most 103 lines, so
-            // the wrap never happens; it only lets the compiler drop the bounds checks (k + 1
-            // is at most SCAN / 32, within the array's two spare slots).
+            // the cap never bites; it only lets the compiler drop the bounds checks.
             let (stop, mut k) = ((block + SCAN).min(to), 0);
             while block < stop {
                 let bits = newlines(p.add(block));
                 ends[k] = block + bits.trailing_zeros() as usize;
                 ends[k + 1] = block + (bits & bits.wrapping_sub(1)).trailing_zeros() as usize;
-                k = (k + bits.count_ones() as usize) % (SCAN / 32);
+                k = (k + bits.count_ones() as usize).min(SCAN / 32 - 2);
                 block += 64;
             }
             // The last block may run past `to`, into the next piece.
             for &e in &ends[..ends[..k].partition_point(|&e| e < to)] {
                 let start = std::mem::replace(&mut line, e + 1);
                 let stamp = _mm_loadu_si128(p.add(start).cast());
-                if _mm_testz_si128(_mm_xor_si128(stamp, key), hour_bytes) == 0 {
-                    // A new run of lines of one hour (the hour is a cache).
-                    std::hint::cold_path();
+                if _mm_movemask_epi8(_mm_cmpeq_epi8(stamp, key)) & 0x1FFF != 0x1FFF {
                     open[row] = (n, end);
                     let t = slice::from_raw_parts(p.add(start), 13);
                     let what = || format!("{}: hour outside the span", t.escape_ascii());
@@ -660,31 +654,24 @@ unsafe fn spaces(p: *const u8) -> u32 {
     _mm_movemask_epi8(eq) as u32
 }
 
-/// The low nibble of every digit, for the bytes after a space: 16 bytes of this table from
-/// index `n` (0 to 16) keep the nibbles of the bytes from `n` on and zero the first `n`.
-static DIGIT_MASK: [u128; 2] = [0, u128::MAX / 17]; // 17 = 0x11; x86 is little-endian
-
 /// The latency that ends the 16 bytes at `p` (the bytes before a newline), and the index
 /// of the space in front of it. With no loop: the latency's at most 10 digits are masked
-/// in (an ASCII digit's low nibble is its value) and summed as a 16-digit number by three
-/// multiply-add steps.
+/// in and summed as a 16-digit number by three multiply-add steps.
 ///
 /// # Safety
 /// The 16 bytes must be readable. SSE4.1 is enabled crate-wide (target-cpu=x86-64-v3).
 unsafe fn parse_latency(p: *const u8) -> (u32, usize) {
-    // The space mask has 16 bits, so it has 16 to 31 leading zeros, or 32 when empty (never,
-    // in the spec's lines: a latency has at most 10 digits, so the space is among the 16
-    // bytes). `skip` = 15 - the space's index (0 to 15, or 16 when empty) is then the offset
-    // into the table of a window that zeroes the bytes up to the space; 16 + 16 fit.
-    let skip = spaces(p).leading_zeros() as usize - 16;
-    let keep = _mm_loadu_si128(DIGIT_MASK.as_ptr().cast::<u8>().add(skip).cast());
-    let digits = _mm_and_si128(_mm_loadu_si128(p.cast()), keep);
+    let space = 31 - spaces(p).leading_zeros();
+    let index = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let after = _mm_cmpgt_epi8(index, _mm_set1_epi8(space as i8));
+    let digits = _mm_sub_epi8(_mm_loadu_si128(p.cast()), _mm_set1_epi8(b'0' as i8));
+    let digits = _mm_and_si128(digits, after);
     let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010A)); // 10a + b
     let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064)); // 100ab + cd
     let eights = _mm_madd_epi16(_mm_packus_epi32(quads, quads), _mm_set1_epi32(0x0001_2710));
     let high = (_mm_cvtsi128_si32(eights) as u32).wrapping_mul(100_000_000);
     let latency = high.wrapping_add(_mm_extract_epi32::<1>(eights) as u32);
-    (latency, 15 - skip)
+    (latency, space as usize)
 }
 
 /// The row (0 to 71) of a `YYYY-MM-DDTHH` hour, if in the spec's span. The span runs from
@@ -708,27 +695,22 @@ struct Name {
 }
 
 impl Name {
-    /// Whether the `len` bytes at `p` are this name. Compares 64 bytes at a time; the
-    /// bytes agree up to the first difference, so the name matches when the compare mask
-    /// starts with more than `len` ones. Only names of 64 bytes and more need a second
-    /// step. Byte `len` settles the length too: a stored name is followed by a space,
-    /// like the name in a line (before the status), and names contain no spaces.
+    /// Whether the `len` bytes at `p` are this name. Compares 64 bytes at a time with the
+    /// bits past `len + 1` masked off; only names of 64 bytes and more need a second step.
+    /// Byte `len` settles the length too: a stored name is followed by a space, like the
+    /// name in a line (before the status), and names contain no spaces.
     ///
     /// # Safety
-    /// 128 bytes at `p` must be readable. AVX2 is enabled crate-wide.
+    /// 128 bytes at `p` must be readable. AVX2 and BMI2 are enabled crate-wide.
     unsafe fn is(&self, p: *const u8, len: usize) -> bool {
-        // `b` is taken from the whole struct: the last block also covers `len`.
+        // `b` is taken from the whole struct: the last block also covers `len`, masked off.
         let eq = |at: usize| {
             let a = _mm256_loadu_si256(p.add(at).cast());
             let b = _mm256_loadu_si256((self as *const Name).cast::<u8>().add(at).cast());
             _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32 as u64
         };
-        let ones = |at| (eq(at) | eq(at + 32) << 32).trailing_ones() as usize;
-        if len < 64 {
-            ones(0) > len
-        } else {
-            ones(0) == 64 && ones(64) > len - 64
-        }
+        let all = |at| (eq(at) | eq(at + 32) << 32) | !_bzhi_u64(!0, (len + 1 - at) as u32) == !0;
+        all(0) && (len < 64 || all(64))
     }
 }
 
@@ -779,21 +761,17 @@ impl Endpoints {
     unsafe fn id(&self, p: *const u8, len: usize) -> u32 {
         // Hash the first and last 8 bytes and the length. For a name under 8 bytes both
         // words are cut to the name, as their other bytes belong to the line around it.
-        // Two CRC32C steps (SSE4.2, part of x86-64-v3) mix them, starting from the length.
         let cut = 64 - 8 * len.min(8) as u32;
         let head = p.cast::<u64>().read_unaligned() << cut;
         let tail = p.add(len).sub(8).cast::<u64>().read_unaligned() >> cut;
-        let hash = _mm_crc32_u64(_mm_crc32_u64(len as u64, head), tail) as u32;
-        // The top bits of the 32-bit CRC index the slots.
-        let mut i = (hash >> (32 - SLOTS.trailing_zeros())) as usize;
+        let hash = (head ^ tail.rotate_left(31) ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // The top bits of the product index the slots.
+        let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
             match self.slots[i % SLOTS].load(Acquire) {
                 0 => return self.insert(p, len, i),
                 id if self.get(id).is(p, len) => return id as u32,
-                _ => {
-                    std::hint::cold_path();
-                    i += 1;
-                }
+                _ => i += 1,
             }
         }
     }
