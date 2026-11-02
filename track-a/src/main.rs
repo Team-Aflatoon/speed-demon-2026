@@ -53,13 +53,6 @@ const SLACK: usize = 256;
 /// Parsing and reporting threads; the main thread writes, and parses in between. The box
 /// has 12 CPUs.
 const WORKERS: usize = 11;
-/// A piece is handed out only if it is fewer than LEAD pieces past the oldest piece still being
-/// parsed. If the thread holding that piece is descheduled, the others would otherwise race
-/// ahead and pile up logs and texts for hours that cannot be reported yet; the final score
-/// takes the maximum memory over 5 runs, so one such spike costs the whole result. It never
-/// binds in a normal run (about 12 pieces are in flight) and cannot deadlock: when it binds,
-/// the frontier piece is being parsed by a running thread, whose `parsed()` wakes the waiters.
-const LEAD: usize = 64;
 
 // From <sys/mman.h>, <sys/prctl.h> and <malloc.h>.
 const READ_WRITE: i32 = 1 | 2;
@@ -344,7 +337,7 @@ impl<'a> Job<'a> {
             } else if !writer && plan.closed.get(h).is_some_and(|&pieces| frontier >= pieces) {
                 plan.next_hour += 1;
                 return Task::Hour(h);
-            } else if plan.next_piece < self.rows.len().min(frontier + LEAD) {
+            } else if plan.next_piece < self.rows.len() {
                 let i = plan.next_piece;
                 plan.parsing.push(i);
                 plan.next_piece += 1;
