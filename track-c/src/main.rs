@@ -33,8 +33,11 @@ use std::{env, fs, process, sync::Mutex};
 /// Bytes per chunk of records.csv, read into a worker's buffer and parsed
 /// while it is still in that core's L2 cache.
 const PIECE: usize = 64 << 10;
-/// Groups: `_UNMATCHED` (0) and up to 255 countries.
+/// Group numbers the aggregates have room for: any `u8`.
 pub const GROUPS: usize = 256;
+/// Rows of the name matrix: `_UNMATCHED` and the 240 countries of spec 2.3.
+/// A group number from `regions.csv` is below this, or `Regions` stops.
+pub const MATRIX_ROWS: usize = 241;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -167,22 +170,26 @@ pub unsafe fn mapped<T>(n: usize, fd: i32) -> &'static mut [T] {
 /// `n` zeroed values of `T` in a new private mapping that starts on a 2 MiB
 /// boundary, for which the kernel is asked to use huge pages (MADV_HUGEPAGE),
 /// whatever its default: the name table and matrix, which are read and
-/// written at random all over. The mapping has up to 2 MiB more address space
-/// than that, which stays untouched.
+/// written at random all over. The huge-page range is `n` values rounded up to
+/// whole pages; the mapping has up to 2 MiB more address space than that,
+/// which stays untouched.
 ///
 /// # Safety
 /// Zero bytes must make a valid `T`, as for `mapped`.
 pub unsafe fn mapped_huge<T>(n: usize) -> &'static mut [T] {
     const HUGE: usize = 2 << 20;
     let bytes = n * size_of::<T>();
+    // Whole huge pages: advice on a range ending inside one would leave that
+    // page to 4 KiB pages.
+    let pages = bytes.next_multiple_of(HUGE);
     // SAFETY: any bytes are valid `u8`s; the caller's promise covers the `T`s.
-    let all: &'static mut [u8] = unsafe { mapped(bytes + HUGE, -1) };
+    let all: &'static mut [u8] = unsafe { mapped(pages + HUGE, -1) };
     let skip = all.as_ptr().align_offset(HUGE);
-    // SAFETY: `skip` is below `HUGE`, so `bytes` more are within the mapping.
+    // SAFETY: `skip` is below `HUGE`, so `pages` more are within the mapping.
     let base = unsafe { all.as_mut_ptr().add(skip) };
     // SAFETY: that range of our new mapping; the advice changes no bytes. 14
     // is MADV_HUGEPAGE.
-    unsafe { madvise(base, bytes, 14) };
+    unsafe { madvise(base, pages, 14) };
     // SAFETY: bytes for `n` values, aligned (a multiple of `HUGE` from the
     // page-aligned start), never unmapped or aliased.
     unsafe { std::slice::from_raw_parts_mut(base.cast(), n) }
