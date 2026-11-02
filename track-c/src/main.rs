@@ -28,11 +28,6 @@ fn main() {
     if !std::arch::is_x86_feature_detected!("pclmulqdq") {
         die("this CPU lacks PCLMULQDQ, which the parser uses (see parse::prefix_xor)");
     }
-    // No transparent huge pages: a huge-page fault can stall while the
-    // kernel compacts memory, and would charge 2 MiB for a barely used table.
-    // SAFETY: a plain prctl (PR_SET_THP_DISABLE) with integer arguments; if
-    // the kernel refuses, we just keep its default.
-    unsafe { prctl(41, 1, 0, 0, 0) };
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
@@ -52,9 +47,9 @@ fn main() {
     let mut text = String::new();
     // `_` sorts after every capital letter, so _UNMATCHED comes last.
     for (key, group) in regions.countries().chain([("_UNMATCHED".into(), 0)]) {
-        let ([ids, cents, txt, min, max], [distinct, both]) = totals[usize::from(group)];
-        let (records, names) = (both >> 32, both & 0xFFFF_FFFF);
-        let (sum, min, max, notes) = (money(cents), money(min), money(max), txt - names as i64);
+        let [ids, cents, txt, min, max, names, recdist] = totals[usize::from(group)];
+        let (records, distinct) = (recdist >> 32, recdist & 0xFFFF_FFFF);
+        let (sum, min, max, notes) = (money(cents), money(min), money(max), txt - names);
         let line = format!("{key} {records} {ids} {sum} {min} {max} {distinct} {names}");
         if records > 0 {
             _ = writeln!(text, "{line} {notes}");
@@ -103,19 +98,33 @@ pub fn prefetch<T>(s: &[T], i: usize) {
     unsafe { _mm_prefetch::<_MM_HINT_T0>(s.as_ptr().wrapping_add(i).cast()) }
 }
 
+/// Asks the CPU to start loading the cache line of element `i` of `s` for
+/// writing (PREFETCHW), so that a later atomic OR there finds the line in
+/// this core's cache, already owned. The `_MM_HINT_ET0` intrinsic compiles
+/// to a plain read prefetch under our flags, so this is the instruction
+/// itself. Harmless like `prefetch`.
+#[inline(always)]
+pub fn prefetch_write<T>(s: &[T], i: usize) {
+    let p = s.as_ptr().wrapping_add(i);
+    // SAFETY: a prefetch never faults and changes no memory.
+    unsafe { std::arch::asm!("prefetchw [{0}]", in(reg) p, options(nostack, preserves_flags, readonly)) }
+}
+
 // The few kernel calls the standard library does not offer, declared by
 // hand (no crates). Nothing mapped here is ever unmapped; it all lives until
 // the process exits.
 extern "C" {
     fn mmap(at: *mut u8, n: usize, prot: i32, how: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(at: *const u8, n: usize, advice: i32) -> i32;
-    fn prctl(option: i32, ...) -> i32;
 }
 
 /// `n` values of `T` in a new private mapping, page-aligned and never
 /// unmapped: the first bytes of the file `fd`, read-only (its pages are
 /// already in the page cache, so this costs page-table entries, not copies),
-/// or with `fd` -1 zeroed pages that are only backed by memory once touched.
+/// or with `fd` -1 zeroed pages that are only backed by memory once touched
+/// and never made huge pages (MADV_NOHUGEPAGE): where the kernel gives huge
+/// pages to every mapping that can hold one, a sparse map would be charged
+/// 2 MiB for each of them. Only `mapped_huge` asks for them.
 ///
 /// # Safety
 /// The bytes must make valid `T`s: zero bytes for a fresh mapping (true for
@@ -132,8 +141,35 @@ pub unsafe fn mapped<T>(n: usize, fd: i32) -> &'static mut [T] {
     if base as isize == -1 {
         die(&format!("mmap: {}", std::io::Error::last_os_error()));
     }
+    if fd < 0 {
+        // SAFETY: our new mapping; the advice changes no bytes.
+        unsafe { madvise(base, bytes, 15) };
+    }
     // SAFETY: bytes for `n` values, never unmapped or aliased, valid as `T`s
     // (the caller's promise).
+    unsafe { std::slice::from_raw_parts_mut(base.cast(), n) }
+}
+
+/// `n` zeroed values of `T` in a new private mapping that starts on a 2 MiB
+/// boundary, for which the kernel is asked to use huge pages (MADV_HUGEPAGE),
+/// whatever its default: the name table and matrix, which are read and
+/// written at random all over. The mapping has up to 2 MiB more address space
+/// than that, which stays untouched.
+///
+/// # Safety
+/// Zero bytes must make a valid `T`, as for `mapped`.
+pub unsafe fn mapped_huge<T>(n: usize) -> &'static mut [T] {
+    const HUGE: usize = 2 << 20;
+    let bytes = n * size_of::<T>();
+    // SAFETY: any bytes are valid `u8`s; the caller's promise covers the `T`s.
+    let all: &'static mut [u8] = unsafe { mapped(bytes + HUGE, -1) };
+    let skip = all.as_ptr().align_offset(HUGE);
+    // SAFETY: `skip` is below `HUGE`, so `bytes` more are within the mapping.
+    let base = unsafe { all.as_mut_ptr().add(skip) };
+    // SAFETY: that range of our new mapping; the advice changes no bytes.
+    unsafe { madvise(base, bytes, 14) };
+    // SAFETY: bytes for `n` values, aligned (a multiple of `HUGE` from the
+    // page-aligned start), never unmapped or aliased.
     unsafe { std::slice::from_raw_parts_mut(base.cast(), n) }
 }
 
