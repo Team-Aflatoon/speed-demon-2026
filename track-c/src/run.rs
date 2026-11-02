@@ -6,7 +6,7 @@
 
 use crate::names::{Table, PAGES};
 use crate::parse::{merge, Agg, Local, Parser, Res, Span, EMPTY, PAD};
-use crate::{die, or_die, GROUPS, MATRIX_ROWS};
+use crate::{die, or_die, GROUPS};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::{fs::File, os::unix::fs::FileExt, sync::Mutex, thread};
 
@@ -103,11 +103,10 @@ fn grow<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, t: usize, n: usiz
 }
 
 /// Reads the chunk of nominally `piece` bytes at `from` of records.csv, of
-/// which `rest` bytes are left from there, into `buffer` with pread, rather
-/// than mapping the file: on the scoring box the page faults, page-table
-/// set-up and tear-down of a 200 MB mapping cost more than copying the
-/// bytes. Returns where in `buffer` the chunk starts and ends, with `PAD`
-/// zero bytes after it.
+/// which `rest` bytes are left from there, into `buffer` with pread, rather than mapping the file: on the scoring
+/// box the page faults, page-table set-up and tear-down of a 200 MB mapping
+/// cost more than copying the bytes. Returns where in `buffer` the chunk
+/// starts and ends, with `PAD` zero bytes after it.
 ///
 /// The chunk runs from the first record boundary at or after `from` to the
 /// first at or after `from + piece` (the first chunk from the end of the
@@ -158,7 +157,7 @@ fn cut(b: &[u8], from: usize) -> Option<usize> {
 
 /// regions.csv: a direct-indexed map from region id to group, filled by the
 /// workers in parallel at start-up. Group 0 is `_UNMATCHED`; countries get
-/// 1..=240 in order of first sight, and are listed in code order at the end.
+/// 1..=255 in order of first sight, and are listed in code order at the end.
 /// Any line that is not `id,CCC` stops the program with its byte offset.
 pub struct Regions {
     /// The lines after the header line.
@@ -184,9 +183,7 @@ impl Regions {
         if lines.last() != Some(&b'\n') {
             die(&format!("{path}: bad header, or no LF at its end"));
         }
-        // Cannot fail: `lines` ends in an LF (checked above), so splitting it
-        // at LFs gives an empty piece first, then the last line.
-        let last = lines.rsplit(|&c| c == b'\n').nth(1).unwrap();
+        let last = lines.rsplit(|&c| c == b'\n').nth(1).unwrap(); // the last line
         let max = last.iter().take_while(|c| c.is_ascii_digit());
         let max = max.fold(0, |n, &c| (n * 10 + usize::from(c - b'0')).min(1 << 27));
         // SAFETY: zero is a valid AtomicU8.
@@ -196,15 +193,13 @@ impl Regions {
         Regions { lines, map, codes }
     }
 
-    /// Adds share `t` of `PARTS` of the lines `id,CCC\n`. A share runs from
-    /// the first line start at or after its nominal start to the next share's.
+    /// Adds share `t` of `PARTS` of the lines `id,CCC\n`. A share runs from the first line start at or after its nominal
+    /// start to the next share's.
     fn parse(&self, t: usize) {
         let b = self.lines;
         let start = |k: usize| match k * b.len() / PARTS {
             0 => 0,
-            // Cannot fail: `p - 1` is inside `b`, whose last byte is an LF
-            // (checked in `open`), so there is an LF at or after it.
-            p => p + b[p - 1..].iter().position(|&c| c == b'\n').unwrap(),
+            p => p + b[p - 1..].iter().position(|&c| c == b'\n').unwrap(), // the last byte is an LF
         };
         let (mut p, end) = (start(t), start(t + 1));
         while p < end {
@@ -231,11 +226,8 @@ impl Regions {
             let mut groups = groups.lock().unwrap();
             // Another worker may have handed this code a group meanwhile.
             if codes[code].load(Relaxed) == 0 {
-                // Group 0 is `_UNMATCHED`, so the countries take 1 to 240.
-                if usize::from(*groups) + 1 >= MATRIX_ROWS {
-                    die("regions.csv: more than 240 countries");
-                }
-                *groups += 1;
+                let next = groups.checked_add(1);
+                *groups = next.unwrap_or_else(|| die("regions.csv: over 255 countries"));
                 codes[code].store(*groups, Relaxed);
             }
         }
@@ -257,7 +249,6 @@ impl Regions {
 /// once. Anything else is left to the caller's loop, one byte at a time.
 fn id_of(b: &[u8]) -> Option<(usize, usize)> {
     const ONES: u64 = 0x0101_0101_0101_0101;
-    // (`get(..8)` is exactly 8 bytes, so the conversion to `[u8; 8]` cannot fail.)
     let w = u64::from_le_bytes(b.get(..8)?.try_into().unwrap());
     let commas = w ^ 0x2C * ONES;
     let n = ((commas.wrapping_sub(ONES) & !commas & 0x80 * ONES).trailing_zeros() / 8) as usize;

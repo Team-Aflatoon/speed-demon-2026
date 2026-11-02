@@ -246,12 +246,11 @@ impl<'a> Job<'a> {
                     // freed smaller copies would stay in this thread's malloc arena. The
                     // scatter needs one entry per slot of the hour's log, which `room` slots
                     // already cover (a failed reservation makes the run late before the hour
-                    // could be reported). The rest is `percentiles`' scratch, a table and
-                    // four copies of the biggest group at most: only what it uses is ever
-                    // touched, and untouched pages cost nothing.
+                    // could be reported), so the `2 *` is spare, not required: untouched
+                    // pages cost nothing.
                     let text = self.texts.lock().unwrap().pop().unwrap_or_default();
                     let sorted = self.scratch.lock().unwrap().pop();
-                    let mut sorted = sorted.unwrap_or_else(|| vec![0; 5 * self.room + BINS]);
+                    let mut sorted = sorted.unwrap_or_else(|| vec![0; 2 * self.room]);
                     _ = sender.send((h, self.report(h, &mut sorted, text)));
                     // As for texts: a few are kept, more would only add to the peak.
                     let mut scratch = self.scratch.lock().unwrap();
@@ -452,8 +451,7 @@ impl<'a> Job<'a> {
     /// 2. a slice of `sorted` per endpoint, in output order (a prefix sum);
     /// 3. scatter pass: every latency into its endpoint's slice;
     /// 4. the hour's log pages given back;
-    /// 5. per endpoint, the three percentiles (rank counting, or a radix select) and its
-    ///    output line.
+    /// 5. per endpoint, three selections for the percentiles and its output line.
     fn report(&self, hour: usize, sorted: &mut Vec<u32>, mut text: Vec<u8>) -> Vec<u8> {
         let log = &self.logs[hour * self.room..][..self.used[hour].0.load(Relaxed)];
         let slots = || log.iter().map(|r| r.load(Relaxed));
@@ -491,13 +489,12 @@ impl<'a> Job<'a> {
         text.reserve(256 * order.len());
         // Each group's output line is `stamp`, the endpoint's name, and the numbers from its
         // latencies `v` and its 5xx count; nothing for an empty group.
-        let (data, spare) = sorted.split_at_mut(self.room);
         let mut at = 0;
         for &id in order.iter().filter(|&&id| count(id) > 0) {
             let (n, name, errors) = (count(id), ENDPOINTS.get(id), tally[2 * id as usize + 1]);
-            let v = &mut data[at..at + n as usize];
+            let v = &mut sorted[at..at + n as usize];
             at += n as usize;
-            let [p50, p95, p99] = percentiles(v, spare);
+            let [p50, p95, p99] = percentiles(v);
             let ppm = (errors as u64 * 1_000_000 / n as u64) as u32;
             text.reserve(256);
             // SAFETY: `reserve` gave 256 writable bytes past the end; the line uses at most
@@ -521,13 +518,8 @@ impl<'a> Job<'a> {
     }
 }
 
-/// Entries of the radix tables: 32 exponents times 2^5 mantissa steps, the finest of
-/// `percentiles`' keys.
-const BINS: usize = 32 << 5;
-
-/// Nearest-rank p50, p95 and p99 of a non-empty group, which it may reorder. A group of
-/// more than 64 needs `spare`: `BINS` zero entries (left zero), then four times its length.
-fn percentiles(v: &mut [u32], spare: &mut [u32]) -> [u32; 3] {
+/// Nearest-rank p50, p95 and p99 of a non-empty group, which it may reorder.
+fn percentiles(v: &mut [u32]) -> [u32; 3] {
     // Nearest rank: the 1-indexed rank ceil(p * n / 100), the spec's (p * n + 99) div 100.
     let ranks = [50, 95, 99].map(|p| (p * v.len()).div_ceil(100) - 1);
     if v.len() <= 64 {
@@ -541,58 +533,12 @@ fn percentiles(v: &mut [u32], spare: &mut [u32]) -> [u32; 3] {
         }
         return p;
     }
-    // Radix select: five cheap passes over the group, about 10 instructions a value in all,
-    // where three quickselects took about 25.
-    // Each value gets a key that rises with it: the exponent and top `mant` mantissa bits
-    // of its float (of x / 2, which converts as a signed int), so a bin spans about
-    // 2^-mant of its values whatever their scale; the latencies are spread over decades,
-    // which a linear bin would crowd into one. Values below 4 share key 0. Bigger groups
-    // get finer keys, so their bins stay small and the scan over bins short. The table
-    // `hist` is zero on entry and on exit, so a group costs only the bins it touches.
-    let mant = (v.len().ilog2() / 2).min(5);
-    let (hist, spare) = spare.split_first_chunk_mut::<BINS>().unwrap();
-    let (keys, bufs) = spare.split_at_mut(v.len());
-    let (mut lo, mut hi) = (BINS as u32, 0);
-    for (k, &x) in keys.iter_mut().zip(v.iter()) {
-        let key =
-            (((x >> 1) as i32 as f32).to_bits() >> (23 - mant)).max(127 << mant) - (127 << mant);
-        (*k, lo, hi) = (key, lo.min(key), hi.max(key));
-    }
-    keys.iter().for_each(|&k| hist[k as usize % BINS] += 1);
-    // The bin of each rank and the rank within it: one scan, as the ranks rise.
-    let (mut bin, mut below) = (lo as usize, 0);
-    let at = ranks.map(|rank| {
-        while below + hist[bin % BINS] as usize <= rank {
-            (below, bin) = (below + hist[bin % BINS] as usize, bin + 1);
-        }
-        (bin as u32, rank - below)
-    });
-    // Copy the values of those bins into `bufs`, a copy for each rank (ranks may share a
-    // bin). Eight keys at a time are compared with the bins, and only the few matching
-    // values are looked at.
-    let mut start = [0; 3];
-    (1..3).for_each(|j| start[j] = start[j - 1] + hist[at[j - 1].0 as usize % BINS] as usize);
-    let mut pos = start;
-    let mut copy = |x: u32, k: u32| {
-        (0..3)
-            .filter(|&j| k == at[j].0)
-            .for_each(|j| (bufs[pos[j]], pos[j]) = (x, pos[j] + 1))
-    };
-    let ((keys, key_tail), (vals, val_tail)) = (keys.as_chunks::<8>(), v.as_chunks::<8>());
-    for (k8, x8) in keys.iter().zip(vals) {
-        let mut hits = (0..8).fold(0, |m, i| m | (at.iter().any(|a| a.0 == k8[i]) as u32) << i);
-        while hits != 0 {
-            let i = hits.trailing_zeros() as usize;
-            (copy(x8[i], k8[i]), hits &= hits - 1);
-        }
-    }
-    for (&k, &x) in key_tail.iter().zip(val_tail) {
-        copy(x, k);
-    }
-    // Select inside each copy.
-    let p = std::array::from_fn(|j| *bufs[start[j]..pos[j]].select_nth_unstable(at[j].1).1);
-    hist[lo as usize..=hi as usize].fill(0);
-    p
+    // Low to high, each selection searching only above the previous one: about 1.55n
+    // steps. Beyond 64 values the three ranks are distinct.
+    let (_, &mut p50, above) = v.select_nth_unstable(ranks[0]);
+    let (_, &mut p95, above) = above.select_nth_unstable(ranks[1] - ranks[0] - 1);
+    let (_, &mut p99, _) = above.select_nth_unstable(ranks[2] - ranks[1] - 1);
+    [p50, p95, p99]
 }
 
 /// Writes `v` in decimal at `p` and returns the end, with no loop: the digits are made
