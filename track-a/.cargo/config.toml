@@ -1,4 +1,4 @@
 # AVX2/BMI2 code for the scoring box (a Raptor Lake i5-13500) and a static binary, so the
 # run never pays for the dynamic loader.
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
