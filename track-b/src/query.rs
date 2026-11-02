@@ -28,13 +28,14 @@ pub const USES_CAP: u32 = 63;
 /// In a bucket's fourth value only: a term whose search passed this bucket
 /// lives in a later one.
 const OVERFLOW: u32 = 1 << 29;
-/// Query operators, in the first half of a BOOL step.
+/// Query operators, kept in the top two bits of a BOOL step.
 pub const AND: u32 = 0;
 pub const OR: u32 = 1;
 pub const NOT: u32 = 2;
 const OPS: [&[u8]; 3] = [b"AND", b"OR", b"NOT"]; // in the order of their values
-/// A BOOL step: an operator and a term id.
-pub type Step = (u32, u32);
+/// A BOOL step is `op << TERM_BITS | term`: the term id in bits 0..30, the
+/// operator in bits 30 and 31.
+pub const TERM_BITS: u32 = 30;
 /// `order` entries with this bit are phrases.
 pub const PHRASE: u32 = 1 << 31;
 /// Tokens of up to this many bytes are their own key (see `Key`).
@@ -266,7 +267,7 @@ impl Table {
     /// Room for the terms of `words` query words, and ids for all of them from
     /// `threads` threads.
     pub fn new(words: usize, threads: usize) -> Table {
-        let n = 2 * words.div_ceil(3).next_power_of_two().max(1 << 10);
+        let n = words.div_ceil(3).next_power_of_two().max(1 << 10);
         // Id 0 is the no-term value, so blocks start at 1.
         let ids = 1 + words + threads * ID_BLOCK as usize;
         // The binding limit on ids: a posting holds the partition-local term
@@ -431,9 +432,9 @@ impl Table {
 pub struct Parsed {
     /// Per line: the index of its BOOL query, or `PHRASE |` its phrase index.
     pub order: Vec<u32>,
-    /// BOOL query `i` is `span(steps, ends, i)`, each step `(op, term)`;
+    /// BOOL query `i` is `span(steps, ends, i)`, each step `op << TERM_BITS | term`;
     /// the first step is `OR t1` applied to an empty set.
-    pub steps: Vec<Step>,
+    pub steps: Vec<u32>,
     pub ends: Vec<u32>,
     /// Phrase `i` is the terms `span(terms, term_ends, i)`.
     pub terms: Vec<u32>,
@@ -444,9 +445,10 @@ pub struct Parsed {
     /// terms), then the terms. A link is `range << RANGE_SHIFT | offset`.
     pub records: Vec<u32>,
     /// `(offset in queries.txt, length)` of each step's and each phrase
-    /// term's word, until `insert` turns them into term ids; a phrase term's
-    /// offset is then replaced by its table slot, until anchors are chosen.
+    /// term's word, until `insert` turns them into term ids.
     words: [Vec<(u32, u8)>; 2],
+    /// Table slots of the phrase terms, until anchors are chosen.
+    slots: Vec<u32>,
 }
 
 /// A phrase is named across ranges by `range << 28 | index`, and its record
@@ -456,13 +458,13 @@ pub struct Parsed {
 pub const RANGE_SHIFT: u32 = 28;
 
 /// Record `i` of a list of variable-length records that end at `ends`.
-fn span<'a, T>(items: &'a [T], ends: &[u32], i: usize) -> &'a [T] {
+fn span<'a>(items: &'a [u32], ends: &[u32], i: usize) -> &'a [u32] {
     let start = if i == 0 { 0 } else { ends[i - 1] as usize };
     &items[start..ends[i] as usize]
 }
 
 impl Parsed {
-    pub fn bool_steps(&self, i: usize) -> &[Step] {
+    pub fn bool_steps(&self, i: usize) -> &[u32] {
         span(&self.steps, &self.ends, i)
     }
 
@@ -501,7 +503,7 @@ impl Parsed {
             let (mut words, mut op) = (rest.split(|&b| b == b' '), OR);
             loop {
                 word(words.next()?, 0)?;
-                self.steps.push((op, 0));
+                self.steps.push(op << TERM_BITS);
                 match words.next() {
                     None => break,
                     Some(o) => op = OPS.iter().position(|&k| k == o)? as u32,
@@ -531,15 +533,15 @@ impl Parsed {
             |&(at, len): &(u32, u8)| table.insert(text, at as usize, len as usize, &mut ids);
         for (step, word) in self.steps.iter_mut().zip(&self.words[0]) {
             let id = insert(word).0;
-            step.1 = id;
+            *step |= id;
             if table.bools[id as usize].load(Relaxed) == 0 {
                 table.bools[id as usize].store(1, Relaxed);
             }
         }
-        for (term, word) in self.terms.iter_mut().zip(&mut self.words[1]) {
+        for (term, word) in self.terms.iter_mut().zip(&self.words[1]) {
             let slot;
             (*term, slot) = insert(word);
-            word.0 = slot as u32;
+            self.slots.push(slot as u32);
         }
     }
 
@@ -551,10 +553,11 @@ impl Parsed {
     pub fn choose_anchors(&mut self, table: &Table, range: usize) {
         for i in 0..self.term_ends.len() {
             let terms = span(&self.terms, &self.term_ends, i);
-            let words = span(&self.words[1], &self.term_ends, i);
-            let rank = |j: usize| (table.uses(words[j].0 as usize), u8::MAX - words[j].1);
+            let slots = span(&self.slots, &self.term_ends, i);
+            let words = &self.words[1][self.term_ends[i] as usize - terms.len()..];
+            let rank = |j: usize| (table.uses(slots[j] as usize), u8::MAX - words[j].1);
             let a = (0..terms.len()).min_by_key(|&j| rank(j)).unwrap();
-            let (term, slot) = (terms[a], words[a].0);
+            let (term, slot) = (terms[a], slots[a]);
             table.flag(slot as usize, ANCHOR);
             let link = (range as u32) << RANGE_SHIFT | self.records.len() as u32;
             let previous = table.heads[term as usize].swap(link + 1, AcqRel);
@@ -563,7 +566,7 @@ impl Parsed {
             self.records.extend_from_slice(&[previous, i as u32, meta]);
             self.records.extend_from_slice(terms);
         }
-        self.words = Default::default();
+        (self.slots, self.words) = Default::default();
     }
 }
 

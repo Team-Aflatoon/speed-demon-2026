@@ -43,11 +43,15 @@ const SCAN: usize = 4096;
 /// has 12 CPUs.
 const WORKERS: usize = 11;
 /// A piece is handed out only if it is fewer than LEAD pieces past the oldest piece still being
-/// parsed. If the thread holding that piece is descheduled, the others would otherwise race
-/// ahead and pile up logs and texts for hours that cannot be reported yet; the final score
-/// takes the maximum memory over 5 runs, so one such spike costs the whole result. It never
-/// binds in a normal run (about 12 pieces are in flight) and cannot deadlock: when it binds,
-/// the frontier piece is being parsed by a running thread, whose `parsed()` wakes the waiters.
+/// parsed (the frontier). If the thread holding that piece is descheduled, the others would
+/// otherwise race ahead and pile up logs and texts for hours that cannot be reported yet; the
+/// final score takes the maximum memory over 5 runs, so one such spike costs the whole result.
+/// It never binds in a normal run (about 12 pieces are in flight) and cannot deadlock: when it
+/// binds, the frontier piece is being parsed by a running thread, whose `parsed()` wakes the
+/// waiters. When no piece is being parsed, the frontier is `next_piece`, which is below the cap
+/// as long as a piece is left (and when none is, every hour is due), so no one waits.
+/// If the run turns out `late`, the rerun starts with this run's pages still resident (the logs
+/// are only unmapped by a run that was not late): the memory peak on that rare path.
 const LEAD: usize = 64;
 
 // From <sys/mman.h>, <sys/prctl.h> and <malloc.h>; their constants are spelled out
@@ -109,8 +113,10 @@ struct Plan {
 }
 
 enum Task {
-    /// Parse a piece; the hours below the second field are closed.
+    /// `Piece(index, closed)`: read and parse piece `index`. The hours below `closed` are
+    /// closed: a line for one of them makes the run late.
     Piece(usize, usize),
+    /// Report hour `h`, which is closed and has every piece that could write it parsed.
     Hour(usize),
 }
 
@@ -122,9 +128,10 @@ type Open = [(usize, usize); HOURS];
 /// line's first byte, and the offset just past the last line's newline.
 type Lines = (*const u8, usize, usize);
 
+// A lock is poisoned only by a thread that panics while holding it, and with
+// panic = "abort" a panic ends the process first: the `unwrap`s on locks cannot fire.
+
 /// Everything the workers share.
-/// A lock is poisoned only by a thread that panics while holding it, and with
-/// panic = "abort" a panic ends the process first: the `unwrap`s on locks cannot fire.
 struct Job<'a> {
     input: &'a File,
     len: usize,
@@ -236,7 +243,11 @@ impl<'a> Job<'a> {
                 }
                 Task::Hour(h) => {
                     // Scratch has room for any hour from the start: grown step by step, its
-                    // freed smaller copies would stay in this thread's malloc arena.
+                    // freed smaller copies would stay in this thread's malloc arena. The
+                    // scatter needs one entry per slot of the hour's log, which `room` slots
+                    // already cover (a failed reservation makes the run late before the hour
+                    // could be reported), so the `2 *` is spare, not required: untouched
+                    // pages cost nothing.
                     let text = self.texts.lock().unwrap().pop().unwrap_or_default();
                     let sorted = self.scratch.lock().unwrap().pop();
                     let mut sorted = sorted.unwrap_or_else(|| vec![0; 2 * self.room]);
@@ -262,13 +273,13 @@ impl<'a> Job<'a> {
 
     /// Reads and parses piece `i`; the hours below `closed` are closed. It reads the lines
     /// that start in [i * PIECE, (i + 1) * PIECE) into `buf`: from the byte before the
-    /// piece to the end of its last line, then SLACK zero bytes. Also notes the hour of
-    /// its first line for the plan.
+    /// piece to the end of its last line, then 256 bytes of slack, all zero. Also notes the
+    /// hour of its first line for the plan.
     fn piece(&self, i: usize, closed: usize, open: &mut Open, buf: &mut Vec<u8>) {
         let at = (i * PIECE).saturating_sub(1);
         // The longest line the grammar allows has 177 bytes: timestamp, 7-byte method,
         // 125-byte endpoint, status and 10-digit latency, with their separators and the
-        // newline. SLACK is the 256 readable bytes the parser may touch past a line's start.
+        // newline. The 256 bytes of slack are what the parser may touch past a line's start.
         let end = self.len.min((i + 1) * PIECE + 177) - at;
         buf.resize(end + 256, 0);
         let read = self.input.read_exact_at(&mut buf[..end], at as u64);
@@ -285,7 +296,9 @@ impl<'a> Job<'a> {
         // An unknown hour (0; a piece may hold no line start) only delays the reports.
         let row = hour_row(&buf[from..from + 13]).map_or(0, |row| row + 1);
         self.rows[i].store(row, Relaxed);
-        // SAFETY: SLACK zero bytes follow the piece's lines.
+        // SAFETY: `from` follows a newline (or is 0), and `to` follows one (or is the buffer
+        // end `end`), both by `after_newline`. Every line start in between is below `end`,
+        // and 256 zero bytes follow `end`, so the 256 bytes of slack after it are readable.
         if !unsafe { self.parse(open, closed, (buf.as_ptr(), from, to)) } {
             self.plan.lock().unwrap().late = true;
         }
@@ -318,6 +331,12 @@ impl<'a> Job<'a> {
             // later: lines arrive at most minutes late (shard 0 uploads each hour 5 to 10
             // minutes after it ends), though nothing promises it. Every hour closes once
             // every piece is parsed.
+            // `rows[frontier]` is the hour row of the frontier piece's first line plus one (0
+            // while unread, so nothing closes). Example: the first line is at 20:30 UTC, row 2
+            // (18:00 is row 0), so `rows` holds 3 and `close` is 3 - 2 = 1: hour 0 (18:00) is
+            // closed, hour 1 (19:00) is not. Past the last piece `close` is HOURS. `closed`
+            // never shrinks, and an hour closed now records `i`, the pieces handed out so far:
+            // only those may still write it.
             let frontier = plan.parsing.iter().fold(plan.next_piece, |a, &i| a.min(i));
             let close = self.rows.get(frontier);
             let close = close.map_or(HOURS, |r| r.load(Relaxed).saturating_sub(self.lag));
@@ -345,8 +364,8 @@ impl<'a> Job<'a> {
     /// room for.
     ///
     /// # Safety
-    /// `from` must start a line, `to` must end one, and the SLACK bytes after every line
-    /// start in between must be readable.
+    /// `from` must start a line, `to` must end one, and the 256 bytes of slack after every
+    /// line start in between must be readable.
     unsafe fn parse(&self, open: &mut Open, closed: usize, (p, from, to): Lines) -> bool {
         // The current hour, as a cache: shards write in time order, so it rarely changes.
         // `key` holds its `YYYY-MM-DDTHH`, compared as the first 13 of 16 loaded bytes.
@@ -383,11 +402,18 @@ impl<'a> Job<'a> {
                     (key, used, (n, end)) = (stamp, &self.used[row].0, open[row]);
                     log = self.logs[row * self.room..].as_ptr();
                 }
+                // SAFETY: a line has at least 40 bytes, so e - 16 >= start + 23: the 16 bytes
+                // at e - 16 lie within this line, and its latency's space is among them.
                 let (latency, space) = parse_latency(p.add(e - 16));
                 let status = e - 16 + space - 3;
                 // The endpoint starts after the space that ends the method (which follows
                 // the 27-byte timestamp and its space), and ends before the status.
                 let name = start + 29 + spaces(p.add(start + 28)).trailing_zeros() as usize;
+                // SAFETY: the method has at least 3 bytes, so name >= start + 32 and the 8
+                // bytes before name + len are inside the line. The line goes on past `name`
+                // by a name byte, space, status, space and a digit, then the newline, so
+                // e >= name + 7 and name + 128 <= e + 121 < end + 256: the 128 bytes are
+                // within the buffer and its slack.
                 let id = ENDPOINTS.id(p.add(name), status - 1 - name);
                 // The status's first digit tells a 5xx.
                 let record = id << ID_SHIFT | ((*p.add(status) == b'5') as u32) << ERROR_SHIFT;
@@ -403,7 +429,10 @@ impl<'a> Job<'a> {
                     }
                 }
                 // SAFETY (both stores): `used` never passes the hour's room (the check
-                // above stops first), and hands each block to one worker.
+                // above stops first), and hands each block to one worker. Relaxed is enough:
+                // a reader runs only after `next_task`, under the plan mutex, has seen the
+                // `parsed()` of every piece that could write the hour, each called after the
+                // piece's last store, and the mutex orders those stores before its loads.
                 if wide {
                     (*log.add(n)).store(latency / LOW, Relaxed);
                     n += 1;
