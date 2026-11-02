@@ -6,7 +6,16 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-Final code: **v14** (commit c104d78, **S 484**: Rust 478 + Dockerfile 6, D 1, no crates). It is v13 (commit dae0fd7,
+Final code: **v15** (**S 492**: Rust 486 + Dockerfile 6, D 1, no crates). It is v14 with eight cuts in the per-line parse
+and the endpoint lookup and the same output (PERF.md, step 79): instructions 668.6 M to 599.6 M (-10.3%, cachegrind, one
+thread, seed 1, local), mispredicts level. Three of the ideas, the probe by the compare mask's trailing ones, a CRC32C
+endpoint hash and cold paths, come from the public Cause Of Death entry's log (github.com/keirsalterego/danse-macabre);
+the code is ours. Box, each candidate run followed by v14 production: run-2c416ca182d5 19.4 ms, 17.9 MB, K 48.83 against
+run-55af1f1d25b6 19.1 ms, K 49.64; run-50369d6030bc 18.8 ms, 17.2 MB, K 49.98 against run-2106b793a242 20.5 ms, K 48.16.
+Means 19.1 against 19.8 ms (-3.5%) and K 49.41 against 48.90, one pair each way: adopted on the instruction count and the
+means, like v14. Only part of the instruction cut shows in T: A on the box is not bound by instructions alone.
+
+Before it, **v14** (commit c104d78, **S 484**: Rust 478 + Dockerfile 6, D 1, no crates). It is v13 (commit dae0fd7,
 S 447) with one change: percentiles for groups of more than 64 values come from a histogram radix select instead of three
 chained `select_nth_unstable` calls (PERF.md, step 78). v13 is v12 (commit 7d7779d, S 466) after a behaviour-preserving
 size cut. The output is byte-identical to the reference's (seeds 1, 7, 101 and 202 and the local case set; PERF.md step
