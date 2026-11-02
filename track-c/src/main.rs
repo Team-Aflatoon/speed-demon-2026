@@ -6,16 +6,19 @@
 //! Errors go to stderr, with exit status 1. So does a note on the fallback
 //! to one chunk, which still exits 0.
 
-// The parser's SIMD needs AVX2, which .cargo/config.toml turns on for the
-// whole crate (target-cpu=x86-64-v3); refuse any other build.
+// The SIMD needs AVX2, and the parser and name hash PCLMULQDQ and AES-NI;
+// .cargo/config.toml turns them on for the whole crate (x86-64-v3 and the other
+// two, all of them on every CPU since Haswell); refuse any other build.
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("track-c needs AVX2: build with -C target-cpu=x86-64-v3 (see .cargo/config.toml)");
+#[cfg(not(all(target_feature = "aes", target_feature = "pclmulqdq")))]
+compile_error!("track-c needs AES and PCLMULQDQ: see .cargo/config.toml");
 
 mod names;
 mod parse;
 mod run;
 
-use std::fmt::Write as _;
+use std::arch::{asm, x86_64::*};
 use std::{env, fs, process, sync::Mutex};
 
 /// Bytes per chunk of records.csv, read into a worker's buffer and parsed
@@ -25,9 +28,6 @@ const PIECE: usize = 64 << 10;
 pub const GROUPS: usize = 256;
 
 fn main() {
-    if !std::arch::is_x86_feature_detected!("pclmulqdq") {
-        die("this CPU lacks PCLMULQDQ, which the parser uses (see parse::prefix_xor)");
-    }
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
@@ -50,9 +50,9 @@ fn main() {
         let [ids, cents, txt, min, max, names, recdist] = totals[usize::from(group)];
         let (records, distinct) = (recdist >> 32, recdist & 0xFFFF_FFFF);
         let (sum, min, max, notes) = (money(cents), money(min), money(max), txt - names);
-        let line = format!("{key} {records} {ids} {sum} {min} {max} {distinct} {names}");
+        let line = format!("{key} {records} {ids} {sum} {min} {max} {distinct} {names} {notes}\n");
         if records > 0 {
-            _ = writeln!(text, "{line} {notes}");
+            text += &line;
         }
     }
     let path = format!("{out}/aggregates.txt");
@@ -90,9 +90,7 @@ pub fn die(msg: &str) -> ! {
 /// Asks the CPU to start loading the cache line of element `i` of `s`, so
 /// that a later read finds it there. Used to overlap the cache misses of a
 /// window's records. An `i` past the end is harmless, so it is not checked.
-#[inline(always)]
 pub fn prefetch<T>(s: &[T], i: usize) {
-    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
     // SAFETY: a prefetch is only a hint: it never faults, whatever the
     // address, and has no effect on memory.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(s.as_ptr().wrapping_add(i).cast()) }
@@ -103,11 +101,10 @@ pub fn prefetch<T>(s: &[T], i: usize) {
 /// this core's cache, already owned. The `_MM_HINT_ET0` intrinsic compiles
 /// to a plain read prefetch under our flags, so this is the instruction
 /// itself. Harmless like `prefetch`.
-#[inline(always)]
 pub fn prefetch_write<T>(s: &[T], i: usize) {
     let p = s.as_ptr().wrapping_add(i);
     // SAFETY: a prefetch never faults and changes no memory.
-    unsafe { std::arch::asm!("prefetchw [{0}]", in(reg) p, options(nostack, preserves_flags, readonly)) }
+    unsafe { asm!("prefetchw [{0}]", in(reg) p, options(nostack, preserves_flags, readonly)) }
 }
 
 // The few kernel calls the standard library does not offer, declared by
@@ -121,10 +118,10 @@ extern "C" {
 /// `n` values of `T` in a new private mapping, page-aligned and never
 /// unmapped: the first bytes of the file `fd`, read-only (its pages are
 /// already in the page cache, so this costs page-table entries, not copies),
-/// or with `fd` -1 zeroed pages that are only backed by memory once touched
-/// and never made huge pages (MADV_NOHUGEPAGE): where the kernel gives huge
-/// pages to every mapping that can hold one, a sparse map would be charged
-/// 2 MiB for each of them. Only `mapped_huge` asks for them.
+/// or with `fd` -1 zeroed pages that are only backed by memory once touched.
+/// Never made huge pages (MADV_NOHUGEPAGE): where the kernel gives huge pages
+/// to every mapping that can hold one, a sparse map would be charged 2 MiB
+/// for each of them. Only `mapped_huge` asks for them.
 ///
 /// # Safety
 /// The bytes must make valid `T`s: zero bytes for a fresh mapping (true for
@@ -141,10 +138,8 @@ pub unsafe fn mapped<T>(n: usize, fd: i32) -> &'static mut [T] {
     if base as isize == -1 {
         die(&format!("mmap: {}", std::io::Error::last_os_error()));
     }
-    if fd < 0 {
-        // SAFETY: our new mapping; the advice changes no bytes.
-        unsafe { madvise(base, bytes, 15) };
-    }
+    // SAFETY: our new mapping; the advice changes no bytes.
+    unsafe { madvise(base, bytes, 15) };
     // SAFETY: bytes for `n` values, never unmapped or aliased, valid as `T`s
     // (the caller's promise).
     unsafe { std::slice::from_raw_parts_mut(base.cast(), n) }
@@ -171,15 +166,4 @@ pub unsafe fn mapped_huge<T>(n: usize) -> &'static mut [T] {
     // SAFETY: bytes for `n` values, aligned (a multiple of `HUGE` from the
     // page-aligned start), never unmapped or aliased.
     unsafe { std::slice::from_raw_parts_mut(base.cast(), n) }
-}
-
-/// Faults in the pages of `mem` (from `mapped`) without changing
-/// them (MADV_POPULATE_WRITE): one call for the whole range, which the
-/// kernel walks far faster than it takes one page fault after another. Only
-/// a hint: on a kernel without the call (before 5.14) the pages fault in
-/// when first used.
-pub fn populate<T>(mem: &[T]) {
-    // SAFETY: the range is our own mapping, and populating leaves its bytes
-    // as they are.
-    unsafe { madvise(mem.as_ptr().cast(), size_of_val(mem), 23) };
 }
