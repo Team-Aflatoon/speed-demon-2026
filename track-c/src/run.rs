@@ -7,8 +7,11 @@
 use crate::names::{Table, PAGES};
 use crate::parse::{merge, Agg, Local, Parser, Res, Span, EMPTY, PAD};
 use crate::{die, or_die, GROUPS};
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
-use std::{fs::File, os::unix::fs::FileExt, sync::Mutex, thread};
+use std::sync::Mutex;
+use std::thread::{self, Scope};
 
 /// The most worker threads (the scoring machine gives us twelve).
 const MAX_THREADS: usize = 12;
@@ -21,6 +24,9 @@ const STACK: usize = 256 << 10;
 /// Bytes read past a chunk's nominal end to find its real end, at first
 /// (records average 61 bytes); a longer last record doubles it until found.
 const SLACK: usize = 1 << 10;
+
+/// Every group's numbers (see `Agg`).
+pub type Totals = Vec<Agg>;
 
 /// Counts the whole file, `len` bytes, with one worker per CPU (at most
 /// 12), in chunks of nominally `piece` bytes: totals by group.
@@ -35,42 +41,43 @@ const SLACK: usize = 1 << 10;
 /// parsed exactly as one sequential pass would have parsed it. If not, this
 /// returns the offset of a chunk cut it could not prove, and the caller
 /// retries with a single chunk.
-pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Vec<Agg>> {
-    let cpus = thread::available_parallelism().map_or(1, usize::from);
+pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Totals> {
+    let threads = thread::available_parallelism().map_or(1, usize::from);
+    let threads = threads.min(MAX_THREADS);
     let (table, chunks) = (Table::new(), len.div_ceil(piece).max(1));
     let quotes: Vec<AtomicU64> = (0..chunks).map(|_| AtomicU64::new(0)).collect();
     // Shared counters: the next chunk and start-up task to claim, and the
     // start-up tasks to wait for.
     let [chunk, task] = [0, 0].map(AtomicUsize::new);
     let pending = AtomicUsize::new(PARTS + PAGES);
-    // The lowest offset where the file broke the grammar (`usize::MAX` if it
-    // did not).
-    let fail = AtomicUsize::new(usize::MAX);
+    // The lowest offset where the file broke the grammar, if it did. No
+    // chunk is claimed after that.
+    let fail = Mutex::new(None::<usize>);
+    let failed = |at: usize| {
+        chunk.store(usize::MAX / 2, Relaxed);
+        let mut fail = fail.lock().unwrap();
+        *fail = Some(fail.map_or(at, |old| old.min(at)));
+    };
     let total = Mutex::new(vec![EMPTY; GROUPS]);
     let work = |_| {
         // The start-up tasks go to whichever workers are up first, so that
         // none waits for the last thread to start, only for the tasks.
         loop {
             match task.fetch_add(1, Relaxed) {
-                k if k < PAGES => table.touch(k),
-                k if k < PAGES + PARTS => regions.parse(k - PAGES),
+                k if k < PAGES => table.touch(k, &pending),
+                k if k < PAGES + PARTS => regions.parse(k - PAGES, &pending),
                 _ => break,
             }
-            pending.fetch_sub(1, Release);
         }
-        let (tables, aggs, ids) = ((&table, regions.map), [EMPTY; GROUPS], 0..0);
-        let (mut parser, mut buffer) = (Parser::default(), Vec::new());
-        let mut local = Local { tables, aggs, ids };
-        // Wait for the start-up tasks, yielding rather than spinning, so that
-        // a crowded machine can run the workers still busy.
-        while pending.load(Acquire) > 0 {
-            thread::yield_now();
-        }
+        let aggs = [EMPTY; GROUPS];
+        let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
+        let mut local = Local { aggs, ids: [0; 2] };
+        wait(&pending);
         while let Some(c) = Some(chunk.fetch_add(1, Relaxed)).filter(|&c| c < chunks) {
             let span = read(file, len - c * piece, c * piece, piece, &mut buffer);
             match parser.chunk(&buffer, span, &mut local) {
                 Ok(n) => quotes[c].store(n, Relaxed),
-                Err(at) => _ = fail.fetch_min(c * piece + at, Relaxed),
+                Err(at) => failed(c * piece + at),
             }
         }
         let mut total = total.lock().unwrap();
@@ -78,22 +85,37 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Vec<
             merge(t, a);
         }
     };
-    thread::scope(|s| grow(s, 0, cpus.min(MAX_THREADS), &work));
+    thread::scope(|s| grow(s, 0, threads, &work));
     let mut before = 0;
     for (c, q) in quotes.iter().enumerate() {
         if before % 2 == 1 {
-            fail.fetch_min(c * piece, Relaxed);
+            failed(c * piece);
         }
         before += q.load(Relaxed);
     }
-    let (fail, total) = (fail.into_inner(), total.into_inner().unwrap());
-    (fail == usize::MAX).then_some(total).ok_or(fail)
+    let (fail, total) = (fail.into_inner().unwrap(), total.into_inner().unwrap());
+    // Debug builds check the matrix against the counts: a group's row holds
+    // exactly as many set bits as it has distinct names.
+    #[cfg(debug_assertions)]
+    for (g, (t, row)) in total.iter().zip(table.bits.chunks(table.bits.len() / GROUPS)).enumerate() {
+        let ones: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
+        assert!(fail.is_some() || i64::from(ones) == t[6] & 0xFFFF_FFFF, "group {g}");
+    }
+    fail.map_or(Ok(total), Err)
+}
+
+/// Waits, yielding rather than spinning, so that a crowded machine can run
+/// the workers still busy, until `left` reaches 0.
+fn wait(left: &AtomicUsize) {
+    while left.load(Acquire) > 0 {
+        thread::yield_now();
+    }
 }
 
 /// Starts workers `2t + 1` and `2t + 2` (and, through them, the rest of the
 /// `n`), then runs worker `t` on this thread. Starting threads in a tree
 /// takes about log2(n) thread starts before the last worker runs, not n.
-fn grow<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, t: usize, n: usize, work: &'s F) {
+fn grow<'s, F: Fn(usize) + Sync>(s: &'s Scope<'s, '_>, t: usize, n: usize, work: &'s F) {
     for child in [2 * t + 1, 2 * t + 2].into_iter().filter(|&c| c < n) {
         let builder = thread::Builder::new().stack_size(STACK);
         let spawned = builder.spawn_scoped(s, move || grow(s, child, n, work));
@@ -183,8 +205,9 @@ impl Regions {
         if lines.last() != Some(&b'\n') {
             die(&format!("{path}: bad header, or no LF at its end"));
         }
-        let last = lines.rsplit(|&c| c == b'\n').nth(1).unwrap(); // the last line
-        let max = last.iter().take_while(|c| c.is_ascii_digit());
+        let last = lines[..lines.len() - 1].iter().rposition(|&c| c == b'\n');
+        let last = last.map_or(0, |p| p + 1);
+        let max = lines[last..].iter().take_while(|c| c.is_ascii_digit());
         let max = max.fold(0, |n, &c| (n * 10 + usize::from(c - b'0')).min(1 << 27));
         // SAFETY: zero is a valid AtomicU8.
         let map = unsafe { crate::mapped(max + 2, -1) };
@@ -193,9 +216,10 @@ impl Regions {
         Regions { lines, map, codes }
     }
 
-    /// Adds share `t` of `PARTS` of the lines `id,CCC\n`. A share runs from the first line start at or after its nominal
+    /// Adds share `t` of `PARTS` of the lines `id,CCC\n`, then counts it off
+    /// `left`. A share runs from the first line start at or after its nominal
     /// start to the next share's.
-    fn parse(&self, t: usize) {
+    fn parse(&self, t: usize, left: &AtomicUsize) {
         let b = self.lines;
         let start = |k: usize| match k * b.len() / PARTS {
             0 => 0,
@@ -203,20 +227,24 @@ impl Regions {
         };
         let (mut p, end) = (start(t), start(t + 1));
         while p < end {
-            // The id: all at once if it is 1 to 7 digits, else byte by byte.
-            let (mut id, mut q) = id_of(&b[p..]).map_or((0, p), |(id, n)| (id, p + n));
-            while b[q].is_ascii_digit() && id < self.map.len() {
-                (id, q) = (id * 10 + usize::from(b[q] - b'0'), q + 1);
+            let (line, mut id) = (p, 0);
+            let swar = b.get(p..p + 8).and_then(|w| id_of(w.try_into().unwrap()));
+            if let Some((value, digits)) = swar {
+                (id, p) = (value, p + digits);
             }
-            let code = b.get(q + 1..q + 4).unwrap_or(b"");
-            let ok = q > p && id < self.map.len() - 1 && b[q] == b',';
-            if !ok || b.get(q + 4) != Some(&b'\n') || !code.iter().all(u8::is_ascii_uppercase) {
-                die(&format!("regions.csv byte {p}: not `id,CCC` in order"));
+            while b[p].is_ascii_digit() && id < self.map.len() {
+                (id, p) = (id * 10 + usize::from(b[p] - b'0'), p + 1);
+            }
+            let code = b.get(p + 1..p + 4).unwrap_or(b"");
+            let ok = p > line && id < self.map.len() - 1 && b[p] == b',';
+            if !ok || b.get(p + 4) != Some(&b'\n') || !code.iter().all(u8::is_ascii_uppercase) {
+                die(&format!("regions.csv byte {line}: not `id,CCC` in order"));
             }
             let code = code.iter().fold(0, |c, &l| c * 26 + usize::from(l - b'A'));
             self.map[id].store(self.group_of(code), Relaxed);
-            p = q + 5;
+            p += 5;
         }
+        left.fetch_sub(1, Release);
     }
 
     /// The group of country code `code`, handing it the next one if new.
@@ -243,14 +271,13 @@ impl Regions {
     }
 }
 
-/// The id a line `b` starts with and its length, read off its first eight
-/// bytes, if it is 1 to 7 digits followed by a comma: the digits
+/// The id a line starts with and its length, read off the line's first
+/// eight bytes `w`, if it is 1 to 7 digits followed by a comma: the digits
 /// right-aligned with '0's below them, then checked and converted eight at
 /// once. Anything else is left to the caller's loop, one byte at a time.
-fn id_of(b: &[u8]) -> Option<(usize, usize)> {
+fn id_of(w: [u8; 8]) -> Option<(usize, usize)> {
     const ONES: u64 = 0x0101_0101_0101_0101;
-    let w = u64::from_le_bytes(b.get(..8)?.try_into().unwrap());
-    let commas = w ^ 0x2C * ONES;
+    let (w, commas) = (u64::from_le_bytes(w), u64::from_le_bytes(w) ^ 0x2C * ONES);
     let n = ((commas.wrapping_sub(ONES) & !commas & 0x80 * ONES).trailing_zeros() / 8) as usize;
     let low = |n: usize| (w << (64 - 8 * n) | 0x30 * ONES >> (8 * n)) ^ 0x30 * ONES;
     let digits = (1..8).contains(&n).then(|| low(n))?;

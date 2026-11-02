@@ -74,20 +74,18 @@ type Ctx<'a> = (&'a Table, &'a [u8], &'a [[u64; 2]]);
 /// Where a record starts, and the quotes in the chunk before it.
 type At = (usize, u64);
 
-/// What a worker owns: the tables it joins against (the name table and the
-/// region map), and what it accumulates: aggregates by group, and the dense
-/// ids it has reserved for new names.
-pub struct Local<'a> {
-    pub tables: (&'a Table, &'a [AtomicU8]),
+/// What a worker accumulates: aggregates by group, and the dense ids it has
+/// reserved for new names.
+pub struct Local {
     pub aggs: [Agg; crate::GROUPS],
     pub ids: Ids,
 }
 
-/// A worker's parser state, reused for every chunk: per 64-byte block of the
-/// chunk its quotes (see `Ctx`), the separators found in the current window,
-/// and a batch of its records.
-#[derive(Default)]
-pub struct Parser {
+/// A worker's parser: the tables it joins against, and its state, reused
+/// for every chunk: per 64-byte block of the chunk its quotes (see `Ctx`),
+/// the separators found in the current window, and a batch of its records.
+pub struct Parser<'a> {
+    tables: (&'a Table, &'a [AtomicU8]),
     /// While scanning a chunk: the in-quotes state (all ones or 0) after the
     /// last block, and the quotes so far.
     state: [u64; 2],
@@ -97,7 +95,12 @@ pub struct Parser {
     batch: Vec<Record>,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
+    pub fn new(table: &'a Table, map: &'a [AtomicU8]) -> Self {
+        let (seps, batch) = (vec![0; WINDOW + 128], vec![Record::default(); BATCH]);
+        Parser { tables: (table, map), state: [0; 2], quotes: Vec::new(), seps, batch }
+    }
+
     /// Parses the records in `b[start..end]` into `out`: one chunk of the
     /// file (after the header, for the first), read into a buffer and
     /// followed there by `PAD` zero bytes, but for an LF just past a last
@@ -119,18 +122,18 @@ impl Parser {
         if b[end] == b'\n' && b[end - 1] == b'\r' {
             return Err(end - 1);
         }
-        self.quotes.resize(end / 64 + 2, [0; 2]);
-        self.seps.resize(WINDOW + 128, 0);
-        self.batch.resize(BATCH, Record::default());
+        let blocks = self.quotes.len().max(end / 64 + 2);
+        self.quotes.resize(blocks, [0; 2]);
         let (mut at, mut carry) = ((start, 0), 0);
         self.state = [0; 2];
         for window in (start & !63..end).step_by(WINDOW) {
             let last = (window + WINDOW).min(end);
+            // SAFETY: main checked that the CPU has PCLMULQDQ.
             let span = [window, last + usize::from(last == end)];
-            let (n, records) = self.scan(b, span, carry);
+            let (n, records) = unsafe { self.scan(b, span, carry) };
             // Five separators a record, and at most four commas of the next.
             carry = n.checked_sub(5 * records).filter(|&c| c < 5).ok_or(at.0)?;
-            let (table, map) = out.tables;
+            let (table, map) = self.tables;
             for seps in self.seps[..5 * records].chunks(5 * BATCH) {
                 let c = (table, b, &self.quotes[..]);
                 let batch = &mut self.batch[..seps.len() / 5];
@@ -148,14 +151,17 @@ impl Parser {
     /// block's quotes, and lists its separators in `self.seps` after the
     /// `n` there; returns how many there are then, and how many records
     /// they end.
-    fn scan(&mut self, b: &[u8], [from, last]: [usize; 2], mut n: usize) -> (usize, usize) {
+    ///
+    /// # Safety
+    /// The CPU must have PCLMULQDQ (see `prefix_xor`).
+    #[target_feature(enable = "pclmulqdq")]
+    unsafe fn scan(&mut self, b: &[u8], [from, last]: [usize; 2], mut n: usize) -> (usize, usize) {
         let (first, mut records, state) = (from / 64, 0, &mut self.state);
         let blocks = (last - from).div_ceil(64);
         for (k, quotes) in self.quotes[first..first + blocks].iter_mut().enumerate() {
             let o = from + 64 * k;
             let [quote, comma, lf] = masks(b, o);
-            // SAFETY: PCLMULQDQ is part of the build (see main.rs).
-            let inside = unsafe { prefix_xor(quote) } ^ state[0];
+            let inside = prefix_xor(quote) ^ state[0];
             state[0] = ((inside as i64) >> 63) as u64; // bit 63, broadcast
             *quotes = [state[1], quote];
             state[1] += u64::from(quote.count_ones());
@@ -189,13 +195,14 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
         if unsafe { *c.1.get_unchecked(e) } != b'\n' {
             return Err(s);
         }
-        let quotes = quotes_before(c.2, e);
+        let (quotes, seps) = (quotes_before(c.2, e), [c0, c1, c2, c3, e]);
         // The quotes in the record, and in its name's field.
         let q = [quotes, quotes_before(c.2, c1)].map(|q| (q - quotes_before_s) as u32);
-        let rec = (s, [c0, c1, c2, c3, e], q);
-        fields(f, c, rec).or_else(|| slow(f, c, rec)).ok_or(s)?;
+        if !fields(f, c, (s, seps, q)) {
+            slow(f, c, (s, seps, q)).ok_or(s)?;
+        }
         crate::prefetch(map, f.region as usize);
-        c.0.prefetch(f.key);
+        c.0.prefetch(&f.key);
         (s, quotes_before_s) = (e + 1, quotes);
     }
     Ok((s, quotes_before_s))
@@ -218,7 +225,7 @@ fn join((table, _, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut 
         let [id, cents, text, name] = f.nums;
         let agg = &mut out.aggs[usize::from(group)];
         merge(agg, &[id, cents, text, cents, cents, name, 1 << 32]);
-        let id = table.find(f.key, &mut out.ids);
+        let id = table.find(&f.key, &mut out.ids);
         let word = usize::from(group) * ROW + id / 64;
         crate::prefetch_write(table.bits, word);
         (f.word, f.region) = (word as u32, (id % 64) as u32 | u32::from(group) << 8);
@@ -243,7 +250,7 @@ type Rec = (usize, [usize; 5], [u32; 2]);
 /// id of at most 8 digits, an amount of at most 5 before the dot. Anything
 /// else is left to `slow`.
 #[inline(always)]
-fn fields(f: &mut Record, c: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()> {
+fn fields(f: &mut Record, c: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> bool {
     let b = c.1;
     // SAFETY (all reads): the record's bytes, and these are within it.
     let byte = |p| unsafe { *b.get_unchecked(p) };
@@ -251,23 +258,28 @@ fn fields(f: &mut Record, c: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()
     let negative = byte(c3 + 1) == b'-';
     let a = c3 + 1 + usize::from(negative);
     // (`end - 3` is past `s`, as the four commas come before `e`.)
-    (byte(end - 3) == b'.').then_some(())?;
+    if byte(end - 3) != b'.' {
+        return false;
+    }
     // Each number's field, the amount's with its dot, from its first byte
     // (the word's lowest): `digits` shifts it to the word's top.
     // SAFETY: each field ends before `end`, and the loads reach at most 8
     // bytes past a field's start (see `load`).
     let starts = [s, c2 + 1, a].map(|p| unsafe { load(b, p) });
     // A non-digit, a BOM before the id among them, takes the slow path.
-    let [id, region, cents] = digits(starts, [c0 - s, c3 - c2 - 1, end - a])?;
+    let Some([id, region, cents]) = digits(starts, [c0 - s, c3 - c2 - 1, end - a]) else {
+        return false;
+    };
     let cents = (1 - 2 * i64::from(negative)) * cents as i64;
     finish(f, c, [c0, c1, c2], [id as i64, region as i64, cents], q);
-    Some(())
+    true
 }
 
 /// `fields` for any record that is not in its common form: its numbers one
 /// byte at a time; `None` if it breaks the grammar. Out of line, so that the
 /// hot loop keeps its registers.
 #[cold]
+#[inline(never)]
 fn slow(f: &mut Record, ctx: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()> {
     let b = ctx.1;
     let crlf = e > c3 + 1 && b[e - 1] == b'\r';
@@ -292,7 +304,7 @@ fn slow(f: &mut Record, ctx: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()
 /// (and its quotes, if it is quoted), and its unescaped length is its width,
 /// less its delimiters, less one per `""`.
 #[inline(always)]
-fn finish(f: &mut Record, (_, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: [u32; 2]) {
+fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: [u32; 2]) {
     let [id, region, cents] = nums;
     // SAFETY: `c0 + 1` and `c1 + 1` are at most `c2`, within the record.
     let quoted = |c: usize| usize::from(unsafe { *b.get_unchecked(c + 1) } == b'"');
@@ -302,7 +314,7 @@ fn finish(f: &mut Record, (_, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 
     let text = c2 as i64 - c0 as i64 - 2 - (name_quoted + note_quoted) as i64 - i64::from(q[0] / 2);
     let name = c0 + 1 + name_quoted;
     let len = (c1 - name).saturating_sub(name_quoted);
-    (f.key, f.region) = (Table::key(b, name, len), region as u32);
+    (f.key, f.region) = (t.key(b, name, len), region as u32);
     // The name's unescaped length: its raw length, less half its quotes
     // (every escape is two), but for its delimiting pair, which is not one.
     let name_bytes = len as i64 + name_quoted as i64 - i64::from(q[1] / 2);
@@ -353,8 +365,9 @@ fn flatten(seps: &mut [u32], n: usize, mut mask: u64, o: u32) -> usize {
     for i in n..n + 7 {
         mask = sep(i, mask);
     }
-    for i in n + 7..n + count {
-        mask = sep(i, mask);
+    let mut i = n + 7;
+    while mask != 0 {
+        (mask, i) = (sep(i, mask), i + 1);
     }
     n + count
 }
@@ -364,9 +377,9 @@ fn flatten(seps: &mut [u32], n: usize, mut mask: u64, o: u32) -> usize {
 ///
 /// # Safety
 /// `p + 8 <= b.len()`. Every caller loads within a chunk's buffer at most
-/// 24 bytes past the end of a field, so at most 32 past the chunk's end, and
-/// every buffer has `PAD` (128) bytes after it.
-unsafe fn load(b: &[u8], p: usize) -> u64 {
+/// 24 bytes past the end of a field or name (`Table::key`), so at most 32
+/// past the chunk's end, and every buffer has `PAD` (128) bytes after it.
+pub unsafe fn load(b: &[u8], p: usize) -> u64 {
     debug_assert!(p + 8 <= b.len());
     // SAFETY: the caller's promise.
     unsafe { b.as_ptr().add(p).cast::<u64>().read_unaligned() }
