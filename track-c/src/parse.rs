@@ -253,8 +253,9 @@ fn join((table, _, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut 
     for f in records.iter() {
         let pair = f.region as usize;
         let bit = 1u64 << (pair % 64);
-        // SAFETY: `pair / 64` is below `GROUPS * ROW`, the length of `bits`:
-        // the group is below `GROUPS` (a `u8`) and `id` below `ROW_BITS`.
+        // SAFETY: `pair / 64` is below `MATRIX_ROWS * ROW`, the length of `bits`:
+        // the group is below `MATRIX_ROWS` (`Regions::group_of` stops at 241) and `id`
+        // below `ROW_BITS`.
         let word = unsafe { table.bits.get_unchecked(pair / 64) };
         // As a branch, not an add of the flag: only then does LLVM turn the
         // OR and the test into `lock bts`, not a compare-and-swap loop.
