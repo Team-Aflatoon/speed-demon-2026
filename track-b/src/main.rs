@@ -342,6 +342,7 @@ fn wait(count: &AtomicU32, n: usize) {
 fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
     let mut scanner = Scanner::new(table, queries, parsed);
     let mut eval = Evaluator::default();
+    let mut cursor = Vec::new();
     let (terms, ranges) = (table.ids().div_ceil(PARTS), parsed.len());
     let count = |s: usize, which: usize| &sh.counts[s][which];
     while let Some(&task) = sh.tasks.get(sh.next.fetch_add(1, Relaxed)) {
@@ -361,23 +362,23 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
                 if s >= 1 {
                     wait(count(s - 1, EVALUATED), 2 * ranges); // the eval of s - 1 read `parts`
                 }
-                build(sh, s, p, terms);
+                build(sh, s, p, terms, &mut cursor);
                 count(s, BUILT)
             }
             Task::Eval(s, h) => {
                 wait(count(s, BUILT), PARTS + 1);
                 let guards: Vec<_> = sh.parts.iter().map(|p| p.read().unwrap()).collect();
                 let parts: Vec<&Part> = guards.iter().map(|p| &**p).collect();
-                let (docs, base) = (count(s, DOCS).load(Relaxed), sh.segments[s].first);
+                let (docs, base) = (count(s, DOCS).load(Relaxed) as usize, sh.segments[s].first);
                 let (r, mut answers) = (h / 2, sh.bool_answers[h].write().unwrap());
                 let first = parsed[r].ends.len() / 2 * (h % 2); // the half's first query
                 let queries = first + answers.len();
                 for (q, answer) in (first..).zip(answers.iter_mut()) {
                     if q + 2 * AHEAD < queries {
-                        index::prefetch(&parts, parsed[r].bool_steps(q + 2 * AHEAD), false);
+                        index::prefetch(&parts, parsed[r].bool_steps(q + 2 * AHEAD));
                     }
                     if q + AHEAD < queries {
-                        index::prefetch(&parts, parsed[r].bool_steps(q + AHEAD), true);
+                        index::prefetch_lists(&parts, parsed[r].bool_steps(q + AHEAD));
                     }
                     eval.run(&parts, parsed[r].bool_steps(q), docs, base, answer);
                 }
@@ -420,13 +421,13 @@ fn work(sh: &Shared, table: &Table, queries: &[u8], parsed: &[&Parsed]) {
     // Freeing the scratch would unmap memory while the other threads run,
     // which costs every core a TLB flush; the process is about to exit and
     // frees it all at once.
-    std::mem::forget((scanner, eval));
+    std::mem::forget((scanner, eval, cursor));
 }
 
 /// Build task `p` of segment `s`: partition `p`'s postings, or (`p == PARTS`)
 /// the segment's phrase matches folded into the phrase answers, in document
 /// order. Each records the segment's document count, the chunks' lines.
-fn build(sh: &Shared, s: usize, p: usize, terms: usize) {
+fn build(sh: &Shared, s: usize, p: usize, terms: usize, cursor: &mut Vec<u32>) {
     let chunks = &sh.chunks[s % 2][..sh.segments[s].chunks()];
     let chunks: Vec<_> = chunks.iter().map(|c| c.read().unwrap()).collect();
     let docs: u32 = chunks.iter().map(|c| c.lines).sum();
@@ -434,7 +435,7 @@ fn build(sh: &Shared, s: usize, p: usize, terms: usize) {
     if p < PARTS {
         let streams: Vec<&[u32]> = chunks.iter().map(|c| c.stream(p)).collect();
         let mut part = sh.parts[p].write().unwrap();
-        return part.build(&streams, terms, docs as usize);
+        return part.build(&streams, terms, docs as usize, cursor);
     }
     for &(phrase, doc) in chunks.iter().flat_map(|c| &c.matches) {
         let (range, i) = (phrase >> RANGE_SHIFT, phrase & ((1 << RANGE_SHIFT) - 1));
