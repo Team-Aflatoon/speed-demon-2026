@@ -44,6 +44,12 @@ const _: () = assert!(query::USES_CAP + MAX_THREADS as u32 <= 127);
 
 /// `track-b [data dir] [out dir]`, by default `/data` and `/out`.
 fn main() {
+    // Transparent huge pages off for this process (PR_SET_THP_DISABLE), so
+    // partly used 2 MB heap regions are not backed (and counted in our
+    // memory peak) as whole huge pages. It is only a hint, so a failure is
+    // ignored.
+    // SAFETY: PR_SET_THP_DISABLE takes integer arguments and touches no memory of ours.
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize, default: &'static str| args.get(i).map_or(default, String::as_str);
     run(arg(1, "/data"), arg(2, "/out"));
@@ -68,7 +74,6 @@ fn or_fail<T, E: std::fmt::Display>(value: Result<T, E>, what: &str) -> T {
 
 extern "C" {
     fn prctl(option: i32, ...) -> i32;
-    pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
 
@@ -142,14 +147,6 @@ fn run(data: &str, out_dir: &str) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS));
     let open = |name: &str| or_fail(File::open(format!("{data}/{name}")), name);
     let setup = Setup::new(map_queries(&open("queries.txt")), threads);
-    // The table first, alone: its huge page must be populated before any other
-    // thread exists. Then transparent huge pages go off for the rest of the
-    // process (PR_SET_THP_DISABLE), so partly used 2 MB heap regions are not
-    // backed (and counted in our memory peak) as whole huge pages. It is only
-    // a hint, so a failure is ignored.
-    setup.make_table();
-    // SAFETY: PR_SET_THP_DISABLE takes integer arguments and touches no memory of ours.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let shared: OnceLock<Shared> = OnceLock::new();
     let parsed: Vec<OnceLock<Parsed>> = many(threads);
     std::thread::scope(|s| {
@@ -167,6 +164,9 @@ fn run(data: &str, out_dir: &str) {
             work(shared, table, setup.text, &parsed);
         };
         (0..threads).for_each(|i| drop(s.spawn(move || worker(i))));
+        // While the workers parse their queries; the threads have all started,
+        // so they do not wait for the kernel to map the table's pages.
+        setup.make_table();
         let file = open("docs.txt");
         let out = File::create(format!("{out_dir}/results.txt"));
         let out = or_fail(out, "results.txt");
