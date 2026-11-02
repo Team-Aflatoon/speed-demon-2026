@@ -138,9 +138,11 @@ Then the hour's log pages are given back with `madvise(MADV_DONTNEED)`, so the l
 while the output grows. A group of up to 64 gets its three percentiles by rank counting:
 the value of rank r is the largest x with at most r values below it, found with vector
 compares and no branch on the data (sorting small groups mispredicted about every other
-compare). Larger groups get three `select_nth_unstable` calls, each searching only above
-the previous rank. The byte order of the names is a sorted list of endpoint ids, rebuilt
-when new ids have come in since the last report. Numbers are formatted eight digits at a
+compare). Larger groups get a radix select: a key per value (the exponent and top mantissa
+bits of its float, so a bin is 1/8 to 1/32 of its values' scale at any scale), one
+histogram, a scan to the bin of each rank, one pass that copies the three bins' values
+out, and `select_nth_unstable` inside those small copies. The byte order of the names is a
+sorted list of endpoint ids, rebuilt when new ids have come in since the last report. Numbers are formatted eight digits at a
 time by SWAR arithmetic, with the leading zeros shifted out, so there is no loop whose
 length depends on the value.
 
@@ -237,8 +239,9 @@ None. `mmap`, `munmap`, `madvise`, `prctl` and `mallopt` are declared by hand wi
   selection and the small sorts were 14% of the instructions and 62% of all branch
   mispredicts (cachegrind). A histogram of 264 log-spaced buckets to bracket the ranks of
   big groups bought nothing in a microbenchmark (9.71 against 9.75 ms over all 126,908 groups
-  of seed 1, one core), so what is left to try is a one-pass selection from a small sorted
-  sample.
+  of seed 1, one core). That was bracketing followed by quickselect; the radix select that
+  copies only the three bins (PERF.md, step 78) cut the instructions by 5.5% and the same
+  microbenchmark over the groups above 64 from 4.3 to 2.7 ms.
 - Page faults are what the scoring box charges most for. A recycled pool of log blocks cut
   them from 6.2k to 2.4k and CPU by 4%, but wall time was equal and the memory peak grew
   by 2 MiB or more under stalls (PERF.md, step 58). `LEAD` now bounds how far ahead blocks
