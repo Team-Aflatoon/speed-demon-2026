@@ -228,20 +228,32 @@ pub struct Table {
 
 /// `n` zeroed values in fresh anonymous pages, never unmapped (the table
 /// lives until the process exits). With `populate`, the kernel maps and
-/// zeroes them all at once (`MAP_POPULATE`), far cheaper than faulting them
-/// in one at a time from twelve threads, or than the allocator zeroing them
-/// (as it does for 64-byte aligned memory); otherwise pages are faulted in
-/// where they are touched.
+/// zeroes them all at once, far cheaper than faulting them in one at a time
+/// from twelve threads, or than the allocator zeroing them (as it does for
+/// 64-byte aligned memory), and the caller's thread does it before any other
+/// exists: on 2 MB-aligned memory asked for huge pages, so the table needs
+/// one TLB entry per 2 MB. Whatever pages the kernel finds, all of it is
+/// populated, so the memory is the same. Otherwise pages are faulted in where
+/// they are touched.
 ///
 /// SAFETY: `T` must be valid as zero bytes, and need no more than page alignment.
 unsafe fn zeroed<T>(n: usize, populate: bool) -> &'static [T] {
+    const HUGE: usize = 2 << 20;
     let len = (n * std::mem::size_of::<T>()).max(1);
-    // MAP_PRIVATE | MAP_ANONYMOUS, and MAP_POPULATE.
-    let flags = 0x22 | if populate { 0x8000 } else { 0 };
+    // MAP_PRIVATE | MAP_ANONYMOUS.
+    let span = if populate { len + HUGE } else { len };
     // SAFETY: an anonymous mapping (PROT_READ | PROT_WRITE) at an address of
     // the kernel's choosing touches no memory of ours.
-    let p = unsafe { crate::mmap(std::ptr::null_mut(), len, 0x3, flags, -1, 0) };
+    let mut p = unsafe { crate::mmap(std::ptr::null_mut(), span, 0x3, 0x22, -1, 0) };
     assert!(p as isize != -1, "cannot map {len} bytes for the table");
+    if populate {
+        // SAFETY: advice on our own range, inside the mapping.
+        unsafe {
+            p = p.add(p.align_offset(HUGE));
+            crate::madvise(p, len, 14); // MADV_HUGEPAGE
+            crate::madvise(p, len, 23); // MADV_POPULATE_WRITE (Linux 5.14)
+        }
+    }
     // SAFETY: the mapping is `len` bytes, page aligned, zeroed, used for
     // nothing else and never unmapped; the caller vouches for `T`.
     unsafe { std::slice::from_raw_parts(p.cast(), n) }
