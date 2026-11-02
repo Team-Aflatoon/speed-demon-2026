@@ -6,11 +6,28 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-Final: v13 (S 1,491, D 1, no crates). Board: run-12996e3a24f3 gave 88.5 ms, 38.3 MB, K 36.28 and run-3d4480a45f74 gave 95.7 ms, 38.1 MB, K 34.89; the v12 production runs in the same two sessions took 88.8 and 89.8 ms, so v13 tied once and was 6.6% slower once (v12's own runs span 87.3 to 99.0 ms). The box shows no speed gain from the size cut; the gain is in S. The step before it, v12, ran on the
-board at 88.9 ms, 37.7 MB, K 36.03, 77.83 points (run-fe126b463988); a second run on a busy box,
-run-98bc3fd89798, gave 99.0 ms, K 34.12. In three paired sessions v12 beat v11 by 3.6% (mean
-89.2 against 92.5 ms, faster in 3 of 3 pairs). That is about 630 times faster than the
-reference (56.35 s) in about a fifty-eighth of its memory (2,200 MB).
+Final: **v13** (commit be2c27b, S 1,491, D 1, no crates). Board, final commits: run-39dd151ec1b7 (f9f4afd), 86.4 ms, 38.0 MB,
+K 36.72, 78.24 points, the fastest B run so far, and run-34a8a8288297 (f929929, which changes only Track C), 87.7 ms, 38.2 MB, K 36.43, 78.08 points. That is about 640 times faster than the reference (56.35 s) in about a
+fifty-eighth of its memory (2,200 MB).
+
+v13 against v12 is a tie on the box, within the spread. The pairs are a v13 candidate run (code of commit 5e7741f) and a
+v12 production run straight after it:
+
+| Pair | v13 | v12 |
+|---|---|---|
+| 1 | run-12996e3a24f3: 88.5 ms, 38.3 MB, K 36.28 | run-cbc79a44d139: 88.8 ms, 38.4 MB, K 36.04 |
+| 2 | run-3d4480a45f74: 95.7 ms, 38.1 MB, K 34.89 | run-f20b7353a552: 89.8 ms, 38.0 MB, K 35.83 |
+| 3 | run-26294481f7ef: 89.7 ms, 38.0 MB, K 36.03 | run-0c7664bbc162: 108.2 ms, 38.1 MB, K 32.64 |
+| 4 | run-4136d4104f42: 101.9 ms, 38.2 MB, K 33.81 | run-9e73373e8fd0: 88.2 ms, 38.1 MB, K 36.17 |
+
+v13 is faster in 2 of the 4 pairs; the means are 93.95 and 93.75 ms and the medians 92.7 and 89.3 ms. The box's own spread
+(v12 ran 87.3 to 108.2 ms over its runs) is larger than any difference these pairs can show. v13 was adopted on its
+instruction count (-1.2%, local) and its size (S 1,540 to 1,491), not on a measured gain in T. The final commit differs
+from the boxed candidate in comments and two local variable names only (`half` to `split`, `end` to `lf_end`).
+
+The step before it, v12, ran on the board at 88.9 ms, 37.7 MB, K 36.03, 77.83 points (run-fe126b463988); a second run on a
+busy box, run-98bc3fd89798, gave 99.0 ms, K 34.12. In three paired sessions v12 beat v11 by 3.6% (mean 89.2 against
+92.5 ms, faster in 3 of 3 pairs).
 
 What the last two steps are:
 
@@ -236,7 +253,7 @@ binary statically so that a run never pays for the dynamic loader.
   corpus (which needs no table) while the table is filled would hide most of it, and is the
   one start-up idea we did not try.
 - We never measured Track B's phases on the box, only locally; where the 21 to 25 ms between our
-  89 ms and the leaders' 64-68 ms goes there is a guess from instruction counts (lookup 35%,
+  86 to 90 ms and the leaders' 64-68 ms goes there is a guess from instruction counts (lookup 35%,
   finish 15%, lex 14%, PERF.md), and no single idea we found closes it.
 - CPU time is about 60% scan, 25% eval and 10% build (v6, local), and eval's cost is mostly
   the glue of each query-segment pair (about 250 instructions a pair in `run` itself, PERF.md

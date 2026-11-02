@@ -23,3 +23,7 @@ Expected outputs come from the organisers' reference implementations (`reference
 ## Not covered here
 
 The heavier checks are not in this suite: full-size seeds 1, 7, 101 and 202, fuzzing, stress runs and race injection. They were run with `bench/bench.sh` and scratch scripts, and the results are recorded in each track's `PERF.md`.
+
+## Last full run
+
+33 of 33 cases passed on the tree of commit f9f4afd (A v14, B v13, C with the two-huge-page layout, D v4) at 11:46 UTC on Nov 2. Track C's source changed afterwards, in commit f929929 (v15's layout with three instruction cuts), and the C cases have not been re-run on it.

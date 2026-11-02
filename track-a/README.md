@@ -6,30 +6,42 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-Final code: **v13** (commit dae0fd7, this tree, **S 447**: Rust 441 + Dockerfile 6, D 1, no crates). It is v12 (commit
-7d7779d, S 466, the code on the live board today) with a behaviour-preserving size cut, and its output is byte-identical
-(seeds 1 and 7 re-checked on this tree, PERF.md step 76). The reference takes 32.05 s and 228 MB. M is in MB of 10^6
-bytes, as the board reports it.
+Final code: **v14** (commit c104d78, **S 484**: Rust 478 + Dockerfile 6, D 1, no crates). It is v13 (commit dae0fd7,
+S 447) with one change: percentiles for groups of more than 64 values come from a histogram radix select instead of three
+chained `select_nth_unstable` calls (PERF.md, step 78). v13 is v12 (commit 7d7779d, S 466) after a behaviour-preserving
+size cut. The output is byte-identical to the reference's (seeds 1, 7, 101 and 202 and the local case set; PERF.md step
+78). The reference takes 32.05 s and 228 MB. M is in MB of 10^6 bytes, as the board reports it.
 
-Scoring box, v12, five runs on Nov 2 (PERF.md step 75): 19.7 to 19.9 ms, 16.8 to 17.3 MB, K 49.12 to 49.29
-(84.56 to 84.64 points). Best: **19.7 ms, 17.1 MB, K 49.29, 84.64 points** (run-8d63f862b12c). The others:
-run-28bed15e9c09 19.8 ms, 17.1 MB, K 49.15; run-a6e0c93c5bdc 19.7 ms, 17.3 MB, K 49.12; run-e8ada4910704 19.9 ms,
-16.8 MB, K 49.14; run-3a42a8e95305 19.9 ms, 16.9 MB, K 49.16. v13's first box run: run-8dff5d3d18e6, 19.8 ms,
-17.4 MB, K 49.32, 84.65 points; more are pending (PERF.md step 76). The size cut from 466 to 447 is worth about 0.14 points by the K
-formula, if the box confirms it runs as fast as v12.
+What v14 changes is the instruction count, not a measured box time: cachegrind, one thread, seed 1 (local) gives
+705.2 M instructions for v13 and 666.1 M for v14 (-5.5%), with the branch mispredicts level (1.605 M and 1.588 M). The box
+did not separate the two builds clearly, in a noisy period. Two candidate runs of v14, each followed by a run of v13 production:
 
-Why v12 and not v9 (commit 6ded953, S 521: 19.3 to 21.1 ms, 16.9 to 17.3 MB when steady, run-ccb75cc37209 at best): the
-final score takes the **maximum** `memory.peak` of 5 runs, and v9 peaked at 21 to 22 MB instead of 17 MB in a fifth to a
-half of its board runs (run-b4ba6a189863 21.1 MB, run-8e6cfdf092c8 21.6 MB, run-7d7450969105 21.8 MB,
-run-d024bbf208cc 22.1 MB). The cause, as far as we can tell, is a stalled frontier: a descheduled thread holding the oldest unparsed piece
-stops hours from being reported, while the other threads race ahead and pile up logs and texts. v12 hands out a
-piece only within 64 pieces (`LEAD`) of that oldest piece. v12's S 466 is v11's trim of v9 (S 521 to 464, plus 2 lines
-for the cap); v11 had been dropped on Nov 1 for one slow run in two, which in hindsight was the same stall, not the
-trim (PERF.md, lessons).
+| Pair | v14 | v13 production straight after it |
+|---|---|---|
+| 1 | run-601a6a2c1a8c: 24.1 ms, 17.3 MB, K 44.20 | run-682954fdef79: 26.1 ms, 18.8 MB, K 42.27 |
+| 2 | run-f02970944525: 19.5 ms, 17.3 MB, K 49.11 | run-f764e971bd78: 20.1 ms, 17.0 MB, K 49.12 |
+
+In pair 2, the quiet one, v14 is 3% faster in T and level in K, which is inside the spread of A's own runs (19.5 to 20.5 ms
+in the quiet runs of v12 and v13); pair 1 is slower for both builds and v13's run also read 18.8 MB. The 37 added
+lines of S cost about 0.26 points by the K formula and a 2.4% faster T pays for them, so v14 is adopted on the
+instruction count and on the quiet pair, not on a proven box gain. The board runs of the final tree are
+run-be6b2041d9b7 (commit f9f4afd): 19.3 ms, 17.3 MB, K 49.32, 84.65 points, and run-7c876b605dbe (commit f929929, which
+changes only Track C): 19.8 ms, 17.4 MB, K 48.73, 84.39 points; none of v14's four runs has a higher K than v13's best. For comparison, v13: run-c0023c08eb4f 19.6 ms, 17.2 MB, K 49.61, 84.78 points (the best run of v13), run-674156b107d1
+19.8 ms, K 49.59, run-8dff5d3d18e6 19.8 ms, K 49.32 (the last two on dae0fd7's code, comments aside); v12 (five runs):
+19.7 to 19.9 ms, 16.8 to 17.3 MB, K 49.12 to 49.29, best run-8d63f862b12c.
+
+Why a cap and not v9 (commit 6ded953, S 521: 19.3 to 21.4 ms, 16.9 to 17.3 MB when steady, run-ccb75cc37209 at best): the
+final score takes the **maximum** `memory.peak` of 5 runs, and v9 peaked at 21 to 22 MB instead of 17 MB in 5 of its 27
+runs in the public run history (run-b4ba6a189863 21.1 MB, run-8e6cfdf092c8 21.6 MB, run-7d7450969105 21.8 MB,
+run-d024bbf208cc 22.1 MB, run-f2a7fc3d23c7 21.8 MB). The cause, as far as we can tell, is a stalled frontier: a descheduled
+thread holding the oldest unparsed piece stops hours from being reported, while the other threads race ahead and pile up
+logs and texts. Since v12 a piece is handed out only within 64 pieces (`LEAD`) of that oldest piece. v12's S 466 is v11's
+trim of v9 (S 521 to 464, plus 2 lines for the cap); v11 had been dropped on Nov 1 for one slow run in two, which in
+hindsight was the same stall, not the trim (PERF.md, lessons).
 
 v9 is v8 (20.4 ms, 18.2 MB, S 532, K 46.93, run-996cb0022b51) with quiescent reports (an hour is reported only
 after every piece that could write it is parsed, so no count check is needed), two-slot records for wide
-latencies instead of side lists, branch-free percentiles for small groups, and memory cuts. v13 keeps all of that.
+latencies instead of side lists, branch-free percentiles for small groups, and memory cuts. v14 keeps all of that.
 
 The idea, in three lines:
 
@@ -50,7 +62,8 @@ that skip work on purpose, so their output is wrong):
 | Ingest only | v6, parse everything, report nothing | 21.3 ms | run-d570a81674c0 |
 | Report after ingest | v3 to v5 whole: the report phase after the ingest barrier added about 11 ms | 31.8-34.6 ms | run-f4376824385c |
 | v9 | reports while parsing, reads with `pread`, hours closed before they are reported | 19.3 ms | run-ccb75cc37209 |
-| This version's algorithm (v12) | the same plus the lookahead cap and the trimmed code | 19.7 ms | run-8d63f862b12c |
+| v12 | the same plus the lookahead cap and the trimmed code | 19.7 ms | run-8d63f862b12c |
+| This version (v14) | v12 with the size cut and the radix select for percentiles | 19.5 ms (a noisy pair: 24.1 ms) | run-f02970944525 (run-601a6a2c1a8c) |
 
 ## How to run
 
@@ -63,8 +76,8 @@ that skip work on purpose, so their output is wrong):
 One Rust binary, `src/main.rs`, no crates. Eleven worker threads read and parse the log
 and report its hours while they parse; the main thread writes the output, and parses pieces
 between writes. PERF.md has the history and the measurements behind each choice; this design
-is v13: v9's algorithm (steps 58 to 65 on top of v8's steps 42 to 57), trimmed in v11, with v12's lookahead
-cap and v13's further size cut (steps 71 to 76; PERF.md's Labels section maps the step, version and build names).
+is v14: v9's algorithm (steps 58 to 65 on top of v8's steps 42 to 57), trimmed in v11, with v12's lookahead
+cap, v13's further size cut and v14's radix select (steps 71 to 78; PERF.md's Labels section maps the step, version and build names).
 
 **Reading in pieces.** The file is cut into 128 KB pieces, which workers take in file
 order. A worker reads its piece with `pread` into its own buffer: from the byte before
@@ -183,7 +196,7 @@ pieces, and the last worker to finish unmaps the logs, page tables included, bef
 final hours are written. Recycling log blocks through a pool instead of `madvise` cut page
 faults from 6.2k to 2.4k, but the memory peak then followed the stalls of the run (PERF.md,
 step 58), so the logs stay per hour. The `LEAD` cap is what keeps that peak steady when a thread stalls: before it,
-v9 peaked at 21 to 22 MB instead of about 17 MB in some runs; with it, the board's five v12 runs read 16.8 to 17.3 MB.
+v9 peaked at 21 to 22 MB instead of about 17 MB in some runs; with it, the board's five v12 runs read 16.8 to 17.3 MB and all four v14 runs 17.3 to 17.4 MB.
 
 **Errors.** An I/O failure (with the file's path where it has one), a failed `mmap`, or a
 timestamp outside the 72-hour span (with the hour it names) goes to stderr with exit code 1;
@@ -230,8 +243,9 @@ None. `mmap`, `munmap`, `madvise`, `prctl` and `mallopt` are declared by hand wi
 
 ## With another 24 hours
 
-- Wait for the box: v13's runs decide whether the 19 lines of S it saves are free (PERF.md, step 76). If it ran as
-  fast as v12 on the board it is final; if not, v12 (commit 7d7779d) is the fallback with the same behaviour.
+- Measure v14 against v13 on more box runs. The four v14 runs we have (Result) are one noisy, one level in K, one at 19.3 ms (K 49.32) and one at 19.8 ms (K 48.73),
+  so the radix select's saving of 5.5% of the instructions is not yet shown in T on the box; v13
+  (commit dae0fd7) is the fallback with the same behaviour and 37 fewer lines.
 - The cap leaves one memory mode: about a quarter of capped runs locally showed a peak 3 MiB above the rest,
   from the in-order writer, which the cap does not bound. A smaller `LEAD` is the obvious thing to try; untested,
   and it would have to be judged on the board's max of 5, not on medians.

@@ -2,41 +2,51 @@
 
 ## Summary
 
-**Final: v13** (commit dae0fd7, branch experiment/a-scut; S 447, D 1). v12 (commit 7d7779d, S 466) is the same program
-one size cut earlier and is what the board runs today; v13 has the same output, algorithm and memory behaviour as v12,
-so if v13's box runs below show anything slower than v12's, v12 is the final. Both are v9's algorithm (steps 58 to 65)
-trimmed in v11 (step 71) plus a lookahead cap, `LEAD = 64` (steps 73 to 75).
+**Final: v14** (commit c104d78; S 484 = Rust 478 + Dockerfile 6, D 1). It is v13 (commit dae0fd7, S 447) plus a radix
+select for the percentiles of groups of more than 64 values (step 78). v13 is v12 (commit 7d7779d, S 466) after a
+behaviour-preserving size cut; v12 is v11's trim of v9 plus a lookahead cap, `LEAD = 64` (steps 71 to 76). All of them keep
+v9's algorithm (steps 58 to 65). The reference is 32.05 s and 228 MB.
 
-Board runs of the final code (T and M as the board reports them; points are 50 log10 K):
+Board runs of the final code and of its predecessors (T and M as the board reports them; points are 50 log10 K):
 
 | Build | Run ID | T (ms) | M (MB) | K | Points |
 |---|---|---|---|---|---|
-| v12 | run-28bed15e9c09 | 19.8 | 17.1 | 49.15 | 84.58 |
-| v12 | run-8d63f862b12c | 19.7 | 17.1 | 49.29 | 84.64 |
-| v12 | run-a6e0c93c5bdc | 19.7 | 17.3 | 49.12 | 84.56 |
-| v12 | run-e8ada4910704 | 19.9 | 16.8 | 49.14 | 84.57 |
-| v12 | run-3a42a8e95305 | 19.9 | 16.9 | 49.16 | 84.58 |
-| v13 | run-8dff5d3d18e6 | 19.8 | 17.4 | 49.32 | 84.65 |
-| v13 | further box runs | pending | pending | pending | pending |
+| **v14, final commit f929929** | run-7c876b605dbe | 19.8 | 17.4 | 48.73 | 84.39 |
+| v14, f9f4afd | run-be6b2041d9b7 | 19.3 | 17.3 | 49.32 | 84.65 |
+| v14 candidate, pair 2 | run-f02970944525 | 19.5 | 17.3 | 49.11 | 84.56 |
+| v14 candidate, pair 1 (noisy period) | run-601a6a2c1a8c | 24.1 | 17.3 | 44.20 | 82.27 |
+| v13 production after pair 2 | run-f764e971bd78 | 20.1 | 17.0 | 49.12 | 84.56 |
+| v13 production after pair 1 (noisy period) | run-682954fdef79 | 26.1 | 18.8 | 42.27 | 81.30 |
+| v13, adoption run | run-c0023c08eb4f | 19.6 | 17.2 | 49.61 | 84.78 |
+| v13 (candidate runs on dae0fd7's code) | run-8dff5d3d18e6; run-674156b107d1 | 19.8; 19.8 | 17.4; 16.9 | 49.32; 49.59 | 84.65; 84.77 |
+| v12 | run-28bed15e9c09; run-8d63f862b12c; run-a6e0c93c5bdc; run-e8ada4910704; run-3a42a8e95305 | 19.8; 19.7; 19.7; 19.9; 19.9 | 17.1; 17.1; 17.3; 16.8; 16.9 | 49.15; 49.29; 49.12; 49.14; 49.16 | 84.58; 84.64; 84.56; 84.57; 84.58 |
 
-(v12 against v9, the earlier final, which read 19.3 to 21.4 ms and 16.8 to 22.1 MB over at least 18 board runs: steps 65
-and 73. The reference is 32.05 s, 228 MB.)
+What the radix select is worth on the box is not settled. It cuts the instructions by 5.5% (local, cachegrind), but the box
+runs of v14 are four: one in a noisy period (v13 production ran just as slowly then, and read 18.8 MB), one 3% faster in T
+than the v13 run after it with the same K, and the two final-commit runs at 19.3 and 19.8 ms. None has a higher K than v13's best
+(49.61). The 37 added lines of S cost about 0.26 points by the K formula, which a 2.4% faster T pays back. We adopted
+v14 on the instruction count and the quiet pair, within the spread of A's runs (19.3 to 20.5 ms in quiet sessions).
+v13 is the fallback with the same behaviour.
+
+(v12 against v9, the earlier final, which read 19.3 to 21.4 ms and 16.3 to 22.1 MB over 27 board runs at S 521: steps 65
+and 73.)
 
 What changed on Nov 2, and why:
 
-- **Memory spikes in v9.** The final score takes the maximum `memory.peak` of 5 runs. v9 read 21.1, 21.6, 21.8 and
-  22.1 MB instead of about 17 MB in 4 of the 18 board runs we can cite by ID (the coordinator's notes count 3 spikes in
-  about 8 runs on Nov 2 alone). One 21.6 MB run in five costs about 1 point by the K formula. The cause, as far as we can
-  tell, is a stalled frontier: a descheduled thread holds the oldest unparsed piece, no hour can be reported past it,
-  and the other threads race ahead and pile up logs and texts (steps 58, 68 and 73).
+- **Memory spikes in v9.** The final score takes the maximum `memory.peak` of 5 runs. v9 read 21.1, 21.6, 21.8, 21.8 and
+  22.1 MB instead of about 17 MB in 5 of its 27 runs in the public run history (run-b4ba6a189863, run-8e6cfdf092c8,
+  run-7d7450969105, run-f2a7fc3d23c7, run-d024bbf208cc). One 21.6 MB run in five costs about 1 point by the K
+  formula. The cause, as far as we can tell, is a stalled frontier: a descheduled thread holds the oldest unparsed piece, no
+  hour can be reported past it, and the other threads race ahead and pile up logs and texts (steps 58, 68 and 73).
 - **The cap, `LEAD = 64`:** a piece is handed out only within 64 pieces of the oldest piece still being parsed. It never
   binds in a normal run. Locally it lowered the maximum memory by 2.2 to 4.2 MiB and the median by 1.8 to 2.9 MiB without slowing the run
   (wall median equal or lower; tables of steps 74 and 75). On the board the capped builds ran 5 of 5 at 16.8 to 17.3 MB (v12) and 2 of 2 at
-  17.1 to 17.2 MB (v9 plus cap).
+  17.1 to 17.2 MB (v9 plus cap); every later run of v13 and v14 read 16.8 to 17.4 MB, except the 18.8 MB v13 run in the noisy pair above.
 - **v11's trim comes back (S 464 + 2 lines for the cap = 466)** because the cap, not the trim, was what protected the
   memory: v12 is v11 plus the cap (step 75). v9 plus the cap (S 522) gave the same protection with 56 more lines and was
   not adopted (step 74).
-- **v13: S 466 to 447**, behaviour-preserving (step 76). Worth about 0.14 points by the K formula, if it runs as fast as v12.
+- **v13: S 466 to 447**, behaviour-preserving (step 76), worth about 0.14 points by the K formula. Its box runs matched v12's.
+- **v14: the radix select (step 78).** Percentiles were 9.4% of v13's instructions. Now 705.2 M to 666.1 M (local).
 - **Judge-review pass:** comments and safety notes only, S unchanged at 447 and output byte-identical on seeds 1 and 7
   (step 77).
 
@@ -45,13 +55,11 @@ Lessons from Nov 2:
 1. **The final M is the maximum of 5 runs**, so a rare memory spike matters as much as the median. We had optimised and
    compared builds on the median T and on typical M; a 4 to 5 MB spike in one run of five costs about 1 point, more than
    twice what the whole S 521 to 464 trim is worth (about 0.4).
-2. **v11 was dropped on Nov 1 on one slow run out of two** (28.9 ms, then 20.4 ms, step 71). One slow run in two is what an
-   identical build would show with probability about 0.14 (the coordinator's estimate, if v11 were no different from v9),
-   so it did not separate the builds. The spike's real cause was frontier stalls, not the size cut: v9 itself spiked
+2. **v11 was dropped on Nov 1 on one slow run out of two** (28.9 ms, then 20.4 ms, step 71). Two runs inside a spread this
+   wide did not separate the builds. The spike's real cause was frontier stalls, not the size cut: v9 itself spiked
    (step 65 already lists run-7d7450969105 and run-d024bbf208cc at 21.8 and 22.1 MB, called "milder"; step 72 compared T only
-   and did not count them),
-   and v11 with the cap ran 5 of 5. Rejecting a build on one or two board runs was a mistake of method; we lost a day of
-   S 464.
+   and did not count them), and v11 with the cap ran 5 of 5. Rejecting a build on one or two board runs was a mistake of
+   method; we lost a day of S 464.
 3. **The hour label from a date table** (`["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24]`, in v13's `report`)
    is an idea we saw in the public AVENGERS entry (github.com/Mukul07777/speed-demon-2026). The code is ours; the idea
    is theirs, and it saved the day and month arithmetic.
@@ -61,7 +69,7 @@ Lessons from Nov 2:
 **19% fewer instructions did not help on the board (v5 even ran about 9% slower than v3);
 moving 11 ms of work off the critical path made it 25% faster.**
 
-Final on Nov 1: **v9** (steps 58 to 65, commit 6ded953; superseded on Nov 2 by v12 and v13, see above): v8's design with quiescent reports (an hour is
+Final on Nov 1: **v9** (steps 58 to 65, commit 6ded953; superseded on Nov 2 by v12, v13 and v14, see above): v8's design with quiescent reports (an hour is
 closed, and reported once every piece that could write it is parsed, so no count check is needed), two-slot records for
 wide latencies instead of side lists, branch-free percentiles for groups of up to 64, and memory cuts. Board: 19.3 ms,
 17.1 MB, K 48.94, 84.48 points (run-ccb75cc37209); earlier runs of the same code 19.5 ms, 16.9 MB, K 48.84
@@ -138,7 +146,7 @@ of this track passed.
 
 ## Labels
 
-- **Steps** 0 to 77 number every change in order; a step is one row.
+- **Steps** 0 to 78 number every change in order; a step is one row.
 - **v1 to v8** are the versions submitted in turn: v1 step 8, v2 step 14, v3 step 18, v4
   step 25, v5 step 28, v6 step 31 (never run whole on the board), v7 step 41; v8 is the
   pread line that followed, submitted as a13 (step 48), a19 (51), a20 (53) and finally
@@ -146,7 +154,7 @@ of this track passed.
 - **v9** is steps 58 to 65 (commit 6ded953, built as a9). **a9b**, **a9c** (steps 66, 67), **a10** (v10, step 69), **a10b** (step 70) and **a11** (v11, step 71) are board builds of the v9 work; a10, a10b and a11 were not kept (step 72). v10 was shipped for a short while (commit 799d8d3) and reverted (commit 501b40f). The steps below 58 are numbered as before.
 - **v12** is v11 plus the lookahead cap `LEAD = 64` (commit 7d7779d; box candidate a11-cap, commit 1c1ef8c, which has the
   same code), step 75. **a-cap** is v9 plus the cap (commit 2ac40cd, step 74), not adopted. **v13** is v12 after a
-  behaviour-preserving size cut (commit dae0fd7, step 76); it is not the a13 of step 48, which is a v8 build.
+  behaviour-preserving size cut (commit dae0fd7, step 76); it is not the a13 of step 48, which is a v8 build. **v14** is v13 plus the radix select (box candidate a14, commit bf7eb73, same source as the shipped commit c104d78; step 78).
 - **a12 to a21** are board builds of the v8 work: a12 v7's mmap reading with steps 42-46
   (step 47); a13 the same reading with pread (step 48); **a14** a12 plus one
   `MADV_POPULATE_READ` per piece (run-d5a15d3df29a, 26.0 ms; v8 experiments); a19, a20 as
@@ -508,9 +516,9 @@ of capped runs; the cap bounds the logs and texts of hours that cannot be report
 | 73 | **Diagnosis.** The six production v9 runs above (Nov 2, between candidate pushes): two of them read 21.1 and 21.6 MB (K 44.76 and 44.41) against 16.8 to 17.5 MB for the other four; the coordinator's notes count 3 spikes in about 8 v9 runs that day, and step 65 had 21.8 and 22.1 MB in 2 of 12. Final M is the max of 5, so one of these in a batch costs about 1 point (17.1 to 21.6 MB, K^0.2). Mechanism, from earlier local work: when a thread holding the oldest piece is descheduled, no later hour can be reported, the other threads keep parsing, and logs and texts pile up (step 58: a pool's high-water mark followed the stalls, 18.4 to 29.9 MiB; step 68: stalls under load left all hours to report at the end). The cause is inferred from those observations; the evidence that it is right is that capping the lookahead removed the spikes in every capped board run (steps 74 and 75) | run-b4ba6a189863, run-8e6cfdf092c8 | 0.0212, 0.0214 | 21.1, 21.6 | 82.55, 82.37 |
 | 74 | **a-cap: v9 + `LEAD = 64`, not adopted** (commit 2ac40cd, S 522). A piece is handed out only if it is fewer than 64 pieces past the oldest piece being parsed; with no piece being parsed the frontier is the next piece. Local table above. Board: 21.7 ms, 17.2 MB, K 46.09 (run-2472148cc8ac), then 19.5 ms, 17.1 MB, K 48.69 (run-bb4e55391e4d), against the day's production v9 runs of 19.8 to 21.4 ms and 16.8 to 21.6 MB (step 73). Same protection as step 75, without v11's trim: S 522 against 466 | run-2472148cc8ac, run-bb4e55391e4d | 0.0217, 0.0195 | 17.2, 17.1 | 83.18, 84.37 |
 | 75 | **v12 = v11 + `LEAD = 64`** (box candidate a11-cap, commit 1c1ef8c; adopted as commit 7d7779d, S 466: v11's 464 and two lines for the cap). Local table above. Three interleaved box pairs, candidate against production v9 run straight after it: run-28bed15e9c09 19.8 ms, 17.1 MB, K 49.15 against run-b1ad24c6c883 20.1 ms, 17.0 MB, K 48.05; run-8d63f862b12c 19.7 ms, 17.1 MB, K 49.29 against run-8e6cfdf092c8 (the 21.6 MB spike); run-a6e0c93c5bdc 19.7 ms, 17.3 MB, K 49.12 against run-239d08c1a504 19.8 ms, 17.2 MB, K 48.34. Candidate ahead in 3 of 3 pairs, all 3 steady. Adopted. Production runs of the adopted code: run-e8ada4910704 19.9 ms, 16.8 MB, K 49.14 (adoption push) and run-3a42a8e95305 19.9 ms, 16.9 MB, K 49.16 (a later push of the same code): 5 board runs of v12, T 19.7 to 19.9 ms, M 16.8 to 17.3 MB, K 49.12 to 49.29 | run-8d63f862b12c | 0.0197 | 17.1 | 84.64 |
-| 76 | **v13** (commit dae0fd7, S 447 = Rust 441 + Dockerfile 6; v12's 466 less 19): size cut only, behaviour unchanged. The task loop ends on `None` from `next_task` (an `Option<Task>`), not on a `Stop` task; the output's hour stamp comes from a four-entry date table and one `format!` of 21 bytes instead of day-and-month arithmetic into a 32-byte padded array (the table is the AVENGERS idea credited in the Summary); the endpoint table's insert count and its byte-order list share one lock, `ids`; the percentile ranks are an array and the small-group loop is one `from_fn`; empty groups are filtered out of the report loop instead of skipped with `continue`; `rows` is built in `Job::new` without a `pieces` local and the 5xx flag without an `error` local; and the five `#[inline(always)]` hints on the per-line helpers are gone, which a comment in the source justifies: the release build's disassembly is the same without them. This pass re-checked output only: `bench/bench.sh a 3` on seed 1 (sha 495ca096...) and seed 7 (sha b384b9dd...) passed 3 of 3 each, byte-identical to the reference's; the wider case set and stress runs of step 75 were not re-run here. Board, first run (candidate round at 09:56 UTC, commit dae0fd7 code): 19.8 ms, 17.4 MB, K 49.32, against v12's 19.7 to 19.9 ms and 16.8 to 17.3 MB: T equal, M 0.1 MB above v12's highest (one run, inside the spread of v12's own 16.8 to 17.3 MB); further runs pending | run-8dff5d3d18e6 | 0.0198 | 17.4 | 84.65 |
+| 76 | **v13** (commit dae0fd7, S 447 = Rust 441 + Dockerfile 6; v12's 466 less 19): size cut only, behaviour unchanged. The task loop ends on `None` from `next_task` (an `Option<Task>`), not on a `Stop` task; the output's hour stamp comes from a four-entry date table and one `format!` of 21 bytes instead of day-and-month arithmetic into a 32-byte padded array (the table is the AVENGERS idea credited in the Summary); the endpoint table's insert count and its byte-order list share one lock, `ids`; the percentile ranks are an array and the small-group loop is one `from_fn`; empty groups are filtered out of the report loop instead of skipped with `continue`; `rows` is built in `Job::new` without a `pieces` local and the 5xx flag without an `error` local; and the five `#[inline(always)]` hints on the per-line helpers are gone, which a comment in the source justifies: the release build's disassembly is the same without them. This pass re-checked output only: `bench/bench.sh a 3` on seed 1 (sha 495ca096...) and seed 7 (sha b384b9dd...) passed 3 of 3 each, byte-identical to the reference's; the wider case set and stress runs of step 75 were not re-run here. Board, first run (candidate round at 09:56 UTC, commit dae0fd7 code): 19.8 ms, 17.4 MB, K 49.32, against v12's 19.7 to 19.9 ms and 16.8 to 17.3 MB: T equal, M 0.1 MB above v12's highest (one run, inside the spread of v12's own 16.8 to 17.3 MB). More v13 runs: run-674156b107d1 19.8 ms, 16.9 MB, K 49.59 (same code, round 2 of that candidate); adoption run run-c0023c08eb4f 19.6 ms, 17.2 MB, K 49.61 | run-8dff5d3d18e6 | 0.0198 | 17.4 | 84.65 |
 | 77 | **Judge-review pass on v13: comments only.** The 256-byte slack named where the code used a bare 256 (there is no `SLACK` constant); SAFETY notes at `parse`'s call (`from` and `to` follow a newline or are the buffer ends, 256 zero bytes follow), at `parse_latency` (a line has at least 40 bytes, so `e - 16 >= start + 23`) and at `Endpoints::id` (`name >= start + 32`, `name + 128 <= e + 121 < end + 256`); why `Relaxed` is enough for the record stores (a report starts only after the plan mutex has seen every writer's `parsed()`); the `close` rule with a worked example; `Task::Piece` and `Task::Hour` documented; the lock-poison note moved out of `Job`'s doc comment; the cap's comment covers an empty `parsing` list and the `late` rerun starting with the first run's pages resident; the scratch's `2 * room` explained (see below). No code line changed: S stays 447, and seeds 1 and 7 give the same bytes (3 runs each) | | — | — | |
-| 78 | **v14 candidate: radix select for groups over 64** (branch experiment/a-radix; S 484 = Rust 478 + Dockerfile 6, v13's 447 plus 37). The three chained `select_nth_unstable` calls (about 25 instructions a value, with their pivots: 9.4% of v13's instructions) become: a key per value (the exponent and top `ilog2(n) / 2` (3 to 5) mantissa bits of its float, so a bin is 1/8 to 1/32 of its values' scale), one histogram, a scan to the bin of each rank, one pass copying the three bins' values into scratch (eight keys compared at a time, only matches looked at), and `select_nth_unstable` inside those copies. The n^2 rank counting for up to 64 is unchanged. Cachegrind, seed 1, one thread: 705.2M to 666.1M instructions (-5.5%); mispredicts 1.605M to 1.588M. Microbenchmark over the 5,937 groups above 64 of seed 1 (one core, min of 30): 4.3 ms to 2.7 ms. Tuning (instructions, all with the same output): a linear histogram was not tried, since the latencies span decades; fixed 16 steps per octave with threshold 64, 676.4M; 8 steps, 671.3M; sizes by `ilog2(n) / 2` capped at 5, 668.2M (adopted); the same with the quickselect kept up to 96 or 128 values, 670.1M and 671.6M. The scratch is now `5 * room + 1024` entries (untouched pages cost nothing; the radix table in front is left zero between groups). Lowering the rank-counting threshold is a separate question: with radix select from 32, 16 or 8 values up the instructions fall to 643M, 632M and 631M but mispredicts rise to 1.74M, 1.91M and 2.23M, and the microbenchmark over all groups did not improve (about 8.4 ms at 64, 9.0 ms at 16). Box: pending | | — | — | |
+| 78 | **v14 (commit c104d78, final): radix select for groups over 64** (branch experiment/a-radix, box candidate bf7eb73; S 484 = Rust 478 + Dockerfile 6, v13's 447 plus 37). The three chained `select_nth_unstable` calls (about 25 instructions a value, with their pivots: 9.4% of v13's instructions) become: a key per value (the exponent and top `ilog2(n) / 2` (3 to 5) mantissa bits of its float, so a bin is 1/8 to 1/32 of its values' scale), one histogram, a scan to the bin of each rank, one pass copying the three bins' values into scratch (eight keys compared at a time, only matches looked at), and `select_nth_unstable` inside those copies. The n^2 rank counting for up to 64 is unchanged. Cachegrind, seed 1, one thread: 705.2M to 666.1M instructions (-5.5%); mispredicts 1.605M to 1.588M. Microbenchmark over the 5,937 groups above 64 of seed 1 (one core, min of 30): 4.3 ms to 2.7 ms. Tuning (instructions, all with the same output): a linear histogram was not tried, since the latencies span decades; fixed 16 steps per octave with threshold 64, 676.4M; 8 steps, 671.3M; sizes by `ilog2(n) / 2` capped at 5, 668.2M (adopted); the same with the quickselect kept up to 96 or 128 values, 670.1M and 671.6M. The scratch is now `5 * room + 1024` entries (untouched pages cost nothing; the radix table in front is left zero between groups). Lowering the rank-counting threshold is a separate question: with radix select from 32, 16 or 8 values up the instructions fall to 643M, 632M and 631M but mispredicts rise to 1.74M, 1.91M and 2.23M, and the microbenchmark over all groups did not improve (about 8.4 ms at 64, 9.0 ms at 16). Box, candidate bf7eb73 against v13 production in two interleaved pairs, in a noisy box period: run-601a6a2c1a8c 24.1 ms, 17.3 MB, K 44.20 against run-682954fdef79 (v13) 26.1 ms, 18.8 MB, K 42.27; run-f02970944525 19.5 ms, 17.3 MB, K 49.11 against run-f764e971bd78 (v13) 20.1 ms, 17.0 MB, K 49.12. Final commits: f9f4afd run-be6b2041d9b7 19.3 ms, 17.3 MB, K 49.32; f929929 (Track C changed, A not) run-7c876b605dbe 19.8 ms, 17.4 MB, K 48.73. The local saving of 5.5% in instructions shows as 3% in T in the one quiet pair and as nothing in K; adopted on that and on the instruction count, with the 37 lines of S priced at about 0.26 points (a 2.4% faster T pays for them) | run-601a6a2c1a8c; run-f02970944525; run-be6b2041d9b7; run-7c876b605dbe | 0.0241; 0.0195; 0.0193; 0.0198 | 17.3; 17.3; 17.3; 17.4 | 82.27; 84.56; 84.65; 84.39 |
 
 Notes on step 77. The scratch `sorted` is allocated as `2 * room` entries; the scatter writes one entry per slot of the hour's
 log, and a reported hour has at most `room` slots (a reservation past the room makes the run late before the hour could be
@@ -518,3 +526,12 @@ reported), so `room` entries would be enough and the factor 2 is spare capacity 
 it as it is, since removing it would be a code change we have not boxed. A first note gave `e - 16 >= start + 24`
 for the `parse_latency` call; the shortest line has 40 bytes (27-byte timestamp, space, `GET`, space, `/`,
 space, three status digits, space, one latency digit, newline), which gives `start + 23`, and that is what the comment says.
+
+## Tried on Nov 2 and dropped
+
+| Idea | Result | Run IDs |
+|---|---|---|
+| `target-cpu=raptorlake` instead of x86-64-v3 (v13 code) | no gain: 20.3 ms against 20.5 for production in the first pair; 24.3 ms against 20.0 in the second, which is a slow run, not a gain. Dropped | run-36622b20feed, run-3f387c70fe8a (production: run-6e113910a8a5, run-8c73bb434a36) |
+| glibc `arena_max=1` | negligible: the workers' own buffers (about 90 KB each) stay; only per-arena overhead of a few KB would go | none |
+| Radix select from 32, 16 or 8 values up instead of 64 | instructions fall to 643 M, 632 M and 631 M but mispredicts rise (1.74 M, 1.91 M, 2.23 M) and the microbenchmark over all groups does not improve (step 78) | none (local) |
+| v9 plus the cap (a-cap, S 522) | same protection as v12 with 56 more lines (step 74) | run-2472148cc8ac, run-bb4e55391e4d |
