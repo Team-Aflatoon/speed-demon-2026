@@ -15,10 +15,9 @@
 //! line it needs, and `join` uses them, by which time most of those cache
 //! misses have overlapped.
 
-use crate::names::{Key, Table, ROW};
+use crate::names::{Key, Pairs, Table};
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
-use std::sync::atomic::AtomicU64;
 
 /// Zero bytes after every chunk in its buffer (but see `Parser::chunk`): the
 /// parser reads whole 64-byte blocks, and names' and numbers' words, up to
@@ -39,13 +38,12 @@ pub type Res<T> = Result<T, usize>;
 /// smallest and largest amount. `text` sums both text fields' unescaped
 /// lengths; note bytes are it minus name bytes. Records, distinct names and
 /// name bytes come from phase 2 (names.rs).
-pub type Agg = [i64; 7];
-pub const EMPTY: Agg = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
+pub type Agg = [i64; 5];
+pub const EMPTY: Agg = [0, 0, 0, i64::MAX, i64::MIN];
 
 /// Adds `b` into `a`.
 pub fn merge(a: &mut Agg, b: &Agg) {
     (a[0], a[1], a[2]) = (a[0] + b[0], a[1] + b[1], a[2] + b[2]);
-    (a[5], a[6]) = (a[5] + b[5], a[6] + b[6]);
     (a[3], a[4]) = (a[3].min(b[3]), a[4].max(b[4]));
 }
 
@@ -74,8 +72,7 @@ type At = (usize, u64);
 /// What a worker accumulates: aggregates by group, and its name pairs.
 pub struct Local {
     pub aggs: [Agg; crate::GROUPS],
-    pub dense: [usize; 2],
-
+    pub pairs: Pairs,
 }
 
 /// A worker's parser: the tables it joins against, and its state, reused
@@ -193,8 +190,7 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
             return Err(s);
         }
         let (quotes, seps) = (quotes_before(c.2, e), [c0, c1, c2, c3, e]);
-        // PROBE p1: quotes in the whole record (low half), in its name (high).
-        let q = (quotes - quotes_before_s) | (quotes_before(c.2, c1) - quotes_before_s) << 32;
+        let q = (quotes - quotes_before_s) as u32;
         if !fields(f, c, (s, seps, q)) {
             slow(f, c, (s, seps, q)).ok_or(s)?;
         }
@@ -209,43 +205,23 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
 /// (id, group) pairs. Every region id past the map's end shares its last
 /// entry, a 0 (`_UNMATCHED`).
 #[inline(never)]
-fn join((table, b, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut Local) {
-    for f in records.iter_mut() {
+fn join((table, b, _): Ctx, map: &[AtomicU8], records: &[Record], out: &mut Local) {
+    for f in records {
         // SAFETY (both): the map has at least one entry (regions sized it),
         // and a name starts within its record.
         let entry = (f.region as usize).min(map.len() - 1);
         let group = unsafe { map.get_unchecked(entry) }.load(Relaxed);
-        let [id, cents, packed] = f.nums;
+        let [id, cents, text] = f.nums;
         let agg = &mut out.aggs[usize::from(group)];
-        let both = 1 << 32 | (packed & 0xFFFF_FFFF);
-        merge(agg, &[id, cents, packed >> 32, cents, cents, both, 0]);
-        let id = table.find(&f.key, unsafe { b.get_unchecked(f.name as usize..) }, &mut out.dense);
-        // PROBE p1: the pair's bit word, prefetched for writing now and set
-        // in the second loop.
-        let word = usize::from(group) * ROW + id / 64;
-        prefetchw(table.bits, word);
-        (f.name, f.region) = (word as u32, (id % 64) as u32 | u32::from(group) << 8);
+        merge(agg, &[id, cents, text, cents, cents]);
+        let id = table.find(&f.key, unsafe { b.get_unchecked(f.name as usize..) });
+        out.pairs.push(id, group);
     }
-    for f in records.iter() {
-        let bit = 1u64 << (f.region & 63);
-        // SAFETY: `word` is below 256 * ROW.
-        let w: &AtomicU64 = unsafe { table.bits.get_unchecked(f.name as usize) };
-        let new = w.fetch_or(bit, Relaxed) & bit == 0;
-        out.aggs[(f.region >> 8) as usize][6] += i64::from(new);
-    }
-}
-
-/// PROBE p1: PREFETCHW of element `i` of `s` (no feature flag needed).
-#[inline(always)]
-fn prefetchw<T>(s: &[T], i: usize) {
-    let p = s.as_ptr().wrapping_add(i);
-    // SAFETY: a prefetch never faults and changes no memory.
-    unsafe { std::arch::asm!("prefetchw [{0}]", in(reg) p, options(nostack, preserves_flags, readonly)) }
 }
 
 /// A record: where it starts, its four commas and terminator, and the quote
 /// bytes in it.
-type Rec = (usize, [usize; 5], u64);
+type Rec = (usize, [usize; 5], u32);
 
 /// Parses into `f` record `r`, if it takes the common form: an id and region
 /// id of at most 8 digits, an amount of at most 5 before the dot. Anything
@@ -305,8 +281,7 @@ fn slow(f: &mut Record, ctx: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()
 /// if it is quoted), and its unescaped length is its width, less its
 /// delimiters, less one per `""`.
 #[inline(always)]
-fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: u64) {
-    let (q, qn) = (q as u32, (q >> 32) as i64);
+fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: u32) {
     let [id, region, cents] = nums;
     // SAFETY: `c0 + 1` and `c1 + 1` are at most `c2`, within the record.
     let quoted = |c: usize| usize::from(unsafe { *b.get_unchecked(c + 1) } == b'"');
@@ -317,10 +292,7 @@ fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 
     let name = c0 + 1 + name_quoted;
     let len = (c1 - name).saturating_sub(name_quoted);
     (f.key, f.name, f.region) = (t.key(b, name, len), name as u32, region as u32);
-    // PROBE p1: the name's unescaped length: raw length, plus its delimiting
-    // quote pair, less half its quotes.
-    let name_bytes = len as i64 + name_quoted as i64 - qn / 2;
-    f.nums = [id, cents, text << 32 | name_bytes];
+    f.nums = [id, cents, text];
 }
 
 /// Masks of the bytes equal to `"`, `,` and LF among the 64 at `o`; bit i
