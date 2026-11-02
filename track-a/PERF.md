@@ -43,9 +43,11 @@ were over 24 ms; v9 had none in 12. We shipped the steadier build.
 Lesson: on the box, phase structure and kernel work (faults, barriers) set T; local
 instruction counts did not (v3 to v5: 1,358M → 1,099M instructions, 31.8 → 34.6 ms).
 
-Red runs on the board: besides the two probes of item 3 (wrong output by design), two
-read-floor probes aborted at start, run-f70b36471354 and run-f71c8ec82249: they took
-their mode from argv and the probe runner passes none (see v8). Every other board run
+Red runs on the board: besides the two probes of item 3 (wrong output by design), three
+read-floor probes aborted at start, run-f70b36471354, run-f71c8ec82249 and a third on commit
+2e78b12 (no run ID in the public history; that commit changed only Track D, so the probe from
+the commit before was still in the tree): they took their mode from argv and the probe runner
+passes none (see v8). Every other board run
 of this track passed.
 
 ## Measures
@@ -198,7 +200,7 @@ and each row gives the evidence. The box ratio and its noise are in Measures.
 - **`MAP_POPULATE` on the input** (pre-map all of it in the `mmap` call): page faults fell
   from 9.9k to 7.0k, but the single-threaded populate added about 4 ms of wall time
   before any worker started (sandbox median 27.6 vs 21.7 ms). Reverted.
-- **Is the 239 MB input mapping itself expensive (faults, and tearing it down at exit)?**
+- **Is the 239 MB input (238,836,234 bytes on seed 1) mapping itself expensive (faults, and tearing it down at exit)?**
   Probed with a trivial program that reads every byte of the input on 12 threads and
   exits, timed inside and from outside the process (outside includes exec and exit,
   like the board's timer; a shell running nothing costs ~0.8 ms the same way):
@@ -272,8 +274,9 @@ hours of records ever exist. The input promises no bound on lateness, so the spe
 is checked rather than trusted: every line is exactly one record in its hour, so the
 reports saw every line exactly when their counts add up to the number of lines parsed. If
 they do not, the output is truncated and the job runs again with all reports at the end.
-On the generator's data the margin is about 50 minutes (shard 0 uploads an hour 5 to 10
-minutes after it ends; the other shards are at most 2.5 minutes late); full seeds 1, 3, 7
+On the generator's data the margin is about 50 minutes (an hour closes at a line 60 minutes
+after it ends; shard 0 uploads an hour 5 to 10 minutes after it ends; the other shards are at
+most 2.5 minutes late); full seeds 1, 3, 7
 and 11 and sample seeds 1 and 5 never rerun, while a shuffled file, a reversed file and a
 sorted file with one early line moved to the end do, and all give the reference's bytes.
 

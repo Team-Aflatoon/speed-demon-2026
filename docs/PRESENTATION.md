@@ -37,7 +37,7 @@ Second-round redesigns on B and C, each judged head to head on the box: B 186 â†
 | C | v4.2 | 48.5 to 50.5 ms | 12.3 to 12.6 MB | 25.15 to 25.38 |
 | D | v4, S 551, median of five (140.4 to 147.9); best run | 142.1 ms; 140.4 ms | 70.4 MB | best 25.80 |
 
-D = 1 on every track. Every run ID is in its track's PERF.md. Red runs in our history are all deliberate probes (README, "Red runs").
+D = 1 on every track. Every run ID is in its track's PERF.md. Red runs in our history are deliberate probes, except one Track C v3 run that hit the name-table race later fixed in v4.1 (README, "Red runs").
 
 ---
 

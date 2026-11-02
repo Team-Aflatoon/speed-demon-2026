@@ -43,7 +43,7 @@ Ids are block-dense: each thread takes 1,024 at a time from a shared counter and
 in order, so an id costs no shared counter per term and each thread leaves at most one block
 partly unused. The table has a slot for every query word (the bucket count is the word count
 over three, rounded up to a power of two, and at least 1,024), so it can never fill up,
-whatever the input; on seed 1 it is 4 MiB. The buckets come from `mmap(MAP_POPULATE)`, which
+whatever the input; on seed 1 it is 4 MiB (152,904 query words, so 50,968 buckets rounded up to 65,536, 64 bytes each). The buckets come from `mmap(MAP_POPULATE)`, which
 the kernel maps and zeroes in one go; the per-id arrays are plain anonymous mappings, faulted in
 only where ids are.
 
@@ -103,7 +103,8 @@ a document at a time.
 0 within a segment as `u16`. The scan of each 512 KB chunk leaves its documents' distinct BOOL
 terms as `doc << 16 | id / 64` in 64 streams, chosen by `id % 64`. One build task per stream
 counting-sorts it into a sorted list per term and adds a bitmap for terms found in more than 1/64
-of the segment's documents. Everything a build task touches fits in about 100 KB.
+of the segment's documents. Everything a build task touches is about 160 KB on seed 1: its partition's 75 KB of
+stream, 37 KB of lists, 31 KB of three per-term arrays and 21 KB of bitmaps.
 
 **BOOL queries** are answered once per segment, strictly left to right. The first term's set
 is borrowed until a second set has to be combined with it. AND and NOT against a dense term

@@ -79,7 +79,9 @@ being parsed. Once that piece's first line is two hours past hour h, hour h is c
 piece handed out from then on may write it. It is reported as soon as every piece handed
 out before it closed has been parsed, so a report never races a writer and the hour's log
 is final. The generator's shard 0 uploads each hour 5 to 10 minutes after it ends and the
-streaming shards are at most 2.5 minutes late, so this leaves about 50 minutes of margin.
+streaming shards are at most 2.5 minutes late (the spec's Order paragraph). An hour closes at a
+line at least 60 minutes after it ends, and its own lines arrive at most 10 minutes after it
+ends, so this leaves about 50 minutes of margin.
 The scheduler (one lock and a condition variable, signalled only when a worker waits) gives
 due hours priority over pieces, so reports are spread over the run instead of waiting
 behind a barrier. The main thread writes each hour once all earlier hours are out, and
@@ -164,7 +166,7 @@ and 125). A rerun after a late line is noted on stderr; it still exits 0.
 and only the checks above are made. `WORKERS = 11` assumes the 12-CPU scoring box (the
 main thread is the twelfth). Speculating, the logs are one `MAP_NORESERVE` reservation of
 72 hours of 2^17 records (38 MB of address space); the rerun's reservation holds every line
-of the file in every hour, about 3.4 GB for the 239 MB input. Neither costs memory until
+of the file in every hour, about 3.4 GB for the 239 MB input (238,836,234 bytes on seed 1; room is len/20 slots of 4 bytes per hour). Neither costs memory until
 touched, but they need the kernel to allow overcommit (Linux's default heuristic mode does;
 with `vm.overcommit_memory = 2` the `mmap` fails and says so).
 

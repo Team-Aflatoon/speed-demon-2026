@@ -176,8 +176,8 @@ What changed, and why:
    faster on the box (its page-fault path is slow); locally the two were the same.
 3. **Postings built once per 8 MB segment, by partition.** Each document's distinct BOOL terms
    go into 64 streams by `id % 64`; one build task per stream counting-sorts it into `u16`
-   lists, plus bitmaps for terms in more than 1/16 of the segment. Each build task touches about
-   100 KB.
+   lists, plus bitmaps for terms in more than 1/16 of the segment. Each build task touches only its
+   own partition's streams, counters and lists.
 4. **BOOL queries answered once per segment** (32 segments instead of ~84 batches), against
    real lists: AND/NOT against a dense term test its bitmap; two lists are combined by
    spreading one into an L1 mask and testing the other; gallop when one is 16x longer.
