@@ -6,7 +6,7 @@
 
 use crate::names::{Table, PAGES};
 use crate::parse::{merge, Agg, Local, Parser, Res, Span, EMPTY, PAD};
-use crate::{die, or_die, GROUPS, MATRIX_ROWS};
+use crate::{die, or_die, GROUPS};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::{fs::File, os::unix::fs::FileExt, sync::Mutex, thread};
 
@@ -158,7 +158,7 @@ fn cut(b: &[u8], from: usize) -> Option<usize> {
 
 /// regions.csv: a direct-indexed map from region id to group, filled by the
 /// workers in parallel at start-up. Group 0 is `_UNMATCHED`; countries get
-/// 1..=240 in order of first sight, and are listed in code order at the end.
+/// 1..=255 in order of first sight, and are listed in code order at the end.
 /// Any line that is not `id,CCC` stops the program with its byte offset.
 pub struct Regions {
     /// The lines after the header line.
@@ -231,11 +231,8 @@ impl Regions {
             let mut groups = groups.lock().unwrap();
             // Another worker may have handed this code a group meanwhile.
             if codes[code].load(Relaxed) == 0 {
-                // Group 0 is `_UNMATCHED`, so the countries take 1 to 240.
-                if usize::from(*groups) + 1 >= MATRIX_ROWS {
-                    die("regions.csv: more than 240 countries");
-                }
-                *groups += 1;
+                let next = groups.checked_add(1);
+                *groups = next.unwrap_or_else(|| die("regions.csv: over 255 countries"));
                 codes[code].store(*groups, Relaxed);
             }
         }
