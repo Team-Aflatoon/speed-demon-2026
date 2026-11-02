@@ -13,9 +13,10 @@
 //! `scan` makes the masks and lists the separators, `parse` reads each
 //! record's fields and starts loading the region-map entry and name-table
 //! line it needs, and `join` uses them, by which time most of those cache
-//! misses have overlapped.
+//! misses have overlapped. `join` is itself two loops: the second sets the
+//! matrix bits whose lines the first started loading.
 
-use crate::names::{Key, Pairs, Table};
+use crate::names::{Ids, Key, Table, ROW};
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
@@ -33,29 +34,33 @@ const BATCH: usize = 128;
 /// (or a chunk did not start and end at record boundaries).
 pub type Res<T> = Result<T, usize>;
 
-/// Per group, what a worker adds while parsing: `[ids, cents, text, min,
-/// max]`, the sums of ids, of amounts in cents and of text bytes, then the
-/// smallest and largest amount. `text` sums both text fields' unescaped
-/// lengths; note bytes are it minus name bytes. Records, distinct names and
-/// name bytes come from phase 2 (names.rs).
-pub type Agg = [i64; 5];
-pub const EMPTY: Agg = [0, 0, 0, i64::MAX, i64::MIN];
+/// Per group, what a worker adds: `[ids, cents, text, min, max, name_bytes,
+/// recdist]`, the sums of ids, of amounts in cents and of text bytes, then
+/// the smallest and largest amount, the sum of names' unescaped lengths, and
+/// the records and distinct names together, `records << 32 | distinct`, so
+/// that one add counts a record and one more a new pair. `text` sums both
+/// text fields' unescaped lengths; note bytes are it minus name bytes.
+pub type Agg = [i64; 7];
+pub const EMPTY: Agg = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
 
 /// Adds `b` into `a`.
 pub fn merge(a: &mut Agg, b: &Agg) {
     (a[0], a[1], a[2]) = (a[0] + b[0], a[1] + b[1], a[2] + b[2]);
     (a[3], a[4]) = (a[3].min(b[3]), a[4].max(b[4]));
+    (a[5], a[6]) = (a[5] + b[5], a[6] + b[6]);
 }
 
-/// A record parsed and waiting for its join: its name's key and where its
-/// raw bytes start, its region id, and its id, amount in cents and text
-/// bytes (see `Agg`). 64 bytes.
+/// A record parsed and waiting for its join: its name's key, its region id,
+/// and its id, amount in cents, text bytes and name bytes (see `Agg`). The
+/// join's first loop reuses `region` for the group and the pair's bit
+/// (`group << 8 | bit`) and sets `word` to the pair's word of the matrix,
+/// for the second. 48 bytes.
 #[derive(Clone, Copy, Default)]
 struct Record {
     key: Key,
-    name: u32,
     region: u32,
-    nums: [i64; 3],
+    word: u32,
+    nums: [i64; 4],
 }
 
 /// Where a chunk starts and ends in its buffer.
@@ -69,10 +74,11 @@ type Ctx<'a> = (&'a Table, &'a [u8], &'a [[u64; 2]]);
 /// Where a record starts, and the quotes in the chunk before it.
 type At = (usize, u64);
 
-/// What a worker accumulates: aggregates by group, and its name pairs.
+/// What a worker accumulates: aggregates by group, and the dense ids it has
+/// reserved for new names.
 pub struct Local {
     pub aggs: [Agg; crate::GROUPS],
-    pub pairs: Pairs,
+    pub ids: Ids,
 }
 
 /// A worker's parser: the tables it joins against, and its state, reused
@@ -190,7 +196,8 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
             return Err(s);
         }
         let (quotes, seps) = (quotes_before(c.2, e), [c0, c1, c2, c3, e]);
-        let q = (quotes - quotes_before_s) as u32;
+        // The quotes in the record, and in its name's field.
+        let q = [quotes, quotes_before(c.2, c1)].map(|q| (q - quotes_before_s) as u32);
         if !fields(f, c, (s, seps, q)) {
             slow(f, c, (s, seps, q)).ok_or(s)?;
         }
@@ -202,26 +209,42 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
 }
 
 /// Joins the parsed records: their groups' aggregates, and their names'
-/// (id, group) pairs. Every region id past the map's end shares its last
-/// entry, a 0 (`_UNMATCHED`).
+/// (group, id) pairs, in two loops. The first finds each record's group and
+/// name id, adds the record to its group, and starts loading, for writing,
+/// the word of the matrix its pair's bit is in. By the second loop that line
+/// has arrived, and the record sets the bit: an atomic OR (`lock bts`) that
+/// says whether the bit was clear, which makes the pair a new distinct name
+/// of its group. Every region id past the map's end shares its last entry, a
+/// 0 (`_UNMATCHED`).
 #[inline(never)]
-fn join((table, b, _): Ctx, map: &[AtomicU8], records: &[Record], out: &mut Local) {
-    for f in records {
-        // SAFETY (both): the map has at least one entry (regions sized it),
-        // and a name starts within its record.
+fn join((table, _, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut Local) {
+    for f in records.iter_mut() {
+        // SAFETY: the map has at least one entry (regions sized it).
         let entry = (f.region as usize).min(map.len() - 1);
         let group = unsafe { map.get_unchecked(entry) }.load(Relaxed);
-        let [id, cents, text] = f.nums;
+        let [id, cents, text, name] = f.nums;
         let agg = &mut out.aggs[usize::from(group)];
-        merge(agg, &[id, cents, text, cents, cents]);
-        let id = table.find(&f.key, unsafe { b.get_unchecked(f.name as usize..) });
-        out.pairs.push(id, group);
+        merge(agg, &[id, cents, text, cents, cents, name, 1 << 32]);
+        let id = table.find(&f.key, &mut out.ids);
+        let word = usize::from(group) * ROW + id / 64;
+        crate::prefetch_write(table.bits, word);
+        (f.word, f.region) = (word as u32, (id % 64) as u32 | u32::from(group) << 8);
+    }
+    for f in records.iter() {
+        let bit = 1u64 << (f.region & 63);
+        // SAFETY: `word` is below `GROUPS * ROW`.
+        let word = unsafe { table.bits.get_unchecked(f.word as usize) };
+        // As a branch, not an add of the flag: only then does LLVM turn the
+        // OR and the test into `lock bts`, not a compare-and-swap loop.
+        if word.fetch_or(bit, Relaxed) & bit == 0 {
+            out.aggs[(f.region >> 8) as usize][6] += 1;
+        }
     }
 }
 
 /// A record: where it starts, its four commas and terminator, and the quote
-/// bytes in it.
-type Rec = (usize, [usize; 5], u32);
+/// bytes in it and in its name's field.
+type Rec = (usize, [usize; 5], [u32; 2]);
 
 /// Parses into `f` record `r`, if it takes the common form: an id and region
 /// id of at most 8 digits, an amount of at most 5 before the dot. Anything
@@ -276,23 +299,26 @@ fn slow(f: &mut Record, ctx: Ctx, (s, [c0, c1, c2, c3, e], q): Rec) -> Option<()
 }
 
 /// The rest of `fields`, given a record's first three commas and its
-/// numbers: its text bytes and its name's key. The text fields need no
-/// parsing: a field's raw bytes are between its separators (and its quotes,
-/// if it is quoted), and its unescaped length is its width, less its
-/// delimiters, less one per `""`.
+/// numbers: its text bytes, its name's bytes and its name's key. The text
+/// fields need no parsing: a field's raw bytes are between its separators
+/// (and its quotes, if it is quoted), and its unescaped length is its width,
+/// less its delimiters, less one per `""`.
 #[inline(always)]
-fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: u32) {
+fn finish(f: &mut Record, (t, b, _): Ctx, [c0, c1, c2]: [usize; 3], nums: [i64; 3], q: [u32; 2]) {
     let [id, region, cents] = nums;
     // SAFETY: `c0 + 1` and `c1 + 1` are at most `c2`, within the record.
     let quoted = |c: usize| usize::from(unsafe { *b.get_unchecked(c + 1) } == b'"');
     let (name_quoted, note_quoted) = (quoted(c0), quoted(c1));
     // Name and note together; only the quotes, delimiting or escaping, are
     // not value bytes, and an escape is two of them for one value byte.
-    let text = c2 as i64 - c0 as i64 - 2 - (name_quoted + note_quoted) as i64 - i64::from(q / 2);
+    let text = c2 as i64 - c0 as i64 - 2 - (name_quoted + note_quoted) as i64 - i64::from(q[0] / 2);
     let name = c0 + 1 + name_quoted;
     let len = (c1 - name).saturating_sub(name_quoted);
-    (f.key, f.name, f.region) = (t.key(b, name, len), name as u32, region as u32);
-    f.nums = [id, cents, text];
+    (f.key, f.region) = (t.key(b, name, len), region as u32);
+    // The name's unescaped length: its raw length, less half its quotes
+    // (every escape is two), but for its delimiting pair, which is not one.
+    let name_bytes = len as i64 + name_quoted as i64 - i64::from(q[1] / 2);
+    f.nums = [id, cents, text, name_bytes];
 }
 
 /// Masks of the bytes equal to `"`, `,` and LF among the 64 at `o`; bit i
