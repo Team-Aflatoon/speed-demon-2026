@@ -8,18 +8,17 @@
 //! OR says whether the bit was clear, so the record counts the pair then and
 //! nothing is counted afterwards.
 //!
-//! Hash identity: two names are one if their hashes agree on 61 bits (14 for
+//! Hash identity: two names are one if their hashes agree on 62 bits (15 for
 //! the bucket, 47 for the stored tag). For the spec's pool of 100,000 names
-//! the chance that any two do is n^2 / 2 / 2^61, about 2.2e-9 a dataset. The
+//! the chance that any two do is n^2 / 2 / 2^62, about 1.1e-9 a dataset. The
 //! hash is fixed and unseeded, so a dataset gives the same output every run.
 //! It is three AES rounds over the name's first 32 bytes (`Table::key`), and
 //! the same again for each further 32.
 //!
-//! The table (1 MiB) and the matrix (241 rows of 1,600 words, 2.9 MiB) share
-//! one mapping on two huge pages, so that the random reads and bit writes of 3
-//! million records touch few pages and few TLB entries; each page is faulted
-//! in by one start-up task (see `Table::touch`). The sizes follow the spec:
-//! its pool is 100,000 names and it lists 240 countries.
+//! The table and the matrix share one 6 MiB mapping on three huge pages, so
+//! that the random reads and bit writes of 3 million records touch few pages
+//! and few TLB entries; each page is faulted in by one start-up task (see
+//! `Table::touch`).
 //!
 //! Concurrency. A slot is one aligned `AtomicU64` that changes exactly once,
 //! from 0 to its final value, by a compare-and-swap, and nothing else writes
@@ -36,19 +35,17 @@
 //! counted once.
 //!
 //! The plain AVX2 load. The one place that relies on the hardware, not on
-//! Rust's memory model, is `Table::lanes` (the fast path of `Table::find`, and
-//! the skip over full lines in `insert`): it reads a line's eight `AtomicU64`
-//! slots with two 32-byte vector loads, which Rust counts as plain reads
-//! racing with the compare-and-swaps that fill the slots. It is sound on x86
-//! for three reasons.
+//! Rust's memory model, is the fast path of `Table::find`: it reads a line's
+//! eight `AtomicU64` slots with two 32-byte vector loads, which Rust counts
+//! as plain reads racing with the compare-and-swaps that fill the slots. It
+//! is sound on x86 for three reasons.
 //! - Each slot is an aligned 8-byte lane, and x86 never reads such a lane
 //!   torn (the 32-byte load as a whole is not atomic, so the lanes may come
 //!   from different moments, but no lane is ever half old and half new).
 //! - A slot only ever goes from 0 to its final value, so a lane is 0 or
-//!   final. A stale 0 gives no tag match (and shows a full line as having a
-//!   free slot), and the lookup goes to `insert`'s walk, which reads and
-//!   claims slots atomically and so finds the name if it was published
-//!   meanwhile. A non-zero lane is final, never a stale
+//!   final. A stale 0 gives no tag match, and the lookup goes to `insert`,
+//!   which reads and claims slots atomically and so finds the name if it
+//!   was published meanwhile. A non-zero lane is final, never a stale
 //!   half-way value, so a match is a real match.
 //! - A hit's id is read again through the atomic slot (`Relaxed`, as the
 //!   slot publishes no other data: names are not stored), so the plain load
@@ -62,32 +59,27 @@
 //! not measure that build, and did not pay for a safety the hardware already
 //! gives.
 
-use crate::{mapped_huge, MATRIX_ROWS};
+use crate::{mapped_huge, GROUPS};
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 
-/// Buckets: one cache line of 8 one-word slots each (1 MiB all together).
-const BUCKETS: usize = 1 << 14;
+/// Buckets: one cache line of 8 one-word slots each (2 MiB all together).
+const BUCKETS: usize = 1 << 15;
 /// Dense ids: bit columns of the matrix, so the most distinct names it holds
-/// (a slot stores an id plus one in `ID_BITS` bits, which are enough for it).
-const DENSE: usize = 102_400;
-/// Bits of a slot that hold an id plus one; the tag is above them.
-const ID_BITS: i32 = 17;
-const _: () = assert!(DENSE < 1 << ID_BITS);
-/// The id bits of a slot.
-const ID_MASK: u64 = (1 << ID_BITS) - 1;
+/// (a slot stores an id plus one in 17 bits).
+const DENSE: usize = 1 << 17;
 /// Words in a group's row of the matrix.
 pub const ROW: usize = DENSE / 64;
 /// Words in the table and the matrix, the table first.
-const WORDS: usize = 8 * BUCKETS + MATRIX_ROWS * ROW;
+const WORDS: usize = 8 * BUCKETS + GROUPS * ROW;
 /// Words in a 2 MiB huge page.
 const HUGE: usize = 1 << 18;
 /// Huge pages in the mapping (see `Table::touch`).
-pub const PAGES: usize = 2;
+pub const PAGES: usize = WORDS / HUGE;
 /// Dense ids a worker reserves at once.
 const BLOCK: usize = 64;
-// The table and the matrix must fit the mapping's huge pages.
-const _: () = assert!(WORDS <= PAGES * HUGE);
+// The table and the matrix must each be whole huge pages.
+const _: () = assert!(8 * BUCKETS % HUGE == 0 && GROUPS * ROW % HUGE == 0);
 
 /// The dense ids a worker has reserved and not yet used.
 pub type Ids = std::ops::Range<usize>;
@@ -97,21 +89,20 @@ pub type Ids = std::ops::Range<usize>;
 /// equal values, and both empty forms have length 0.
 pub type Key = u64;
 
-/// Where a key's bucket starts in the table (14 bits of the hash, times the 8
-/// slots of a bucket) and the tag a slot stores (the 47 bits from bit 17 up;
-/// bits 14 to 16 are not used). The tag is never 0, so that none matches an
-/// empty slot.
+/// Where a key's bucket starts in the table (15 bits of the hash, times the 8
+/// slots of a bucket) and the tag a slot stores (the 47 bits above those).
+/// The tag is never 0, so that none matches an empty slot.
 fn locate(k: Key) -> (usize, u64) {
-    (8 * (k as usize & (BUCKETS - 1)), (k >> ID_BITS).max(1))
+    (8 * (k as usize & (BUCKETS - 1)), (k >> 17).max(1))
 }
 
 /// The name table, the matrix and the next dense id. A slot is 0 when empty,
-/// else `tag << ID_BITS | (id + 1)`.
+/// else `tag << 17 | (id + 1)`.
 pub struct Table {
     /// The table (one mapping with the matrix, whose `PAGES` huge pages are
     /// faulted in by `touch`).
     slots: &'static [AtomicU64],
-    /// `MATRIX_ROWS` rows of `ROW` words; group g's bit for id i is bit `i % 64` of
+    /// `GROUPS` rows of `ROW` words; group g's bit for id i is bit `i % 64` of
     /// word `g * ROW + i / 64`.
     pub bits: &'static [AtomicU64],
     next: Next,
@@ -143,13 +134,12 @@ impl Table {
     /// kernel cannot give a huge page the same call faults the 4 KiB pages
     /// of its range, which is never more memory.
     pub fn touch(&self, k: usize) {
-        // (`run` hands out `k` below `PAGES`; the last page is only partly
-        // used, and the huge page behind its range is faulted in whole.)
-        let (page, words) = (self.slots.as_ptr().wrapping_add(k * HUGE), WORDS - k * HUGE);
-        // SAFETY: the range is inside our own mapping (the table, then the
-        // matrix), and populating leaves its bytes as they are. 23 is
-        // MADV_POPULATE_WRITE.
-        unsafe { crate::madvise(page.cast(), 8 * words.min(HUGE), 23) };
+        let mut pages = self.slots.chunks(HUGE).chain(self.bits.chunks(HUGE));
+        // (`run` hands out `k` below `PAGES`, and both parts are whole pages.)
+        let page = pages.nth(k).unwrap();
+        // SAFETY: the range is our own mapping, and populating leaves its
+        // bytes as they are. 23 is MADV_POPULATE_WRITE.
+        unsafe { crate::madvise(page.as_ptr().cast(), size_of_val(page), 23) };
     }
 
     /// The key of the `len` raw name bytes at `b[start..]`: a hash of the
@@ -168,34 +158,25 @@ impl Table {
         crate::prefetch(self.slots, locate(k).0);
     }
 
-    /// The slots of the line at `at` whose tag is `tag`, and its empty slots,
-    /// as bit masks over its eight slots (low bit = first slot), compared as
-    /// eight lanes (their value above the low `ID_BITS` bits against the tag).
-    #[inline(always)]
-    fn lanes(&self, at: usize, tag: u64) -> (u32, u32) {
-        // SAFETY: `at` is a line start, so the line is 64-byte aligned (the
-        // mapping is 2 MiB aligned). Each aligned 8-byte lane is read whole
-        // by an x86 load, and a slot is 0 or final, so a lane is too (see
-        // the module's notes): the only place that relies on that.
-        unsafe {
-            let p = self.slots.as_ptr().add(at).cast::<__m256i>();
-            let tags = _mm256_set1_epi64x(tag as i64);
-            let zero = _mm256_setzero_si256();
-            let [a, b] = [p, p.add(1)].map(|q| _mm256_load_si256(q));
-            let mask = |h| _mm256_movemask_pd(_mm256_castsi256_pd(h)) as u32;
-            let eq = |h| mask(_mm256_cmpeq_epi64(_mm256_srli_epi64::<ID_BITS>(h), tags));
-            let empty = |h| mask(_mm256_cmpeq_epi64(h, zero));
-            (eq(a) | eq(b) << 4, empty(a) | empty(b) << 4)
-        }
-    }
-
     /// The dense id of the name with key `k`, giving it the next id of the
     /// worker's block `ids` if it is new. Almost every record finds its name
-    /// in its home bucket, which this compares branch-free (`lanes`).
+    /// in its home bucket, which this compares branch-free: both halves of
+    /// the line, the slots' tags (their value above the low 17 bits) against
+    /// the key's, as eight lanes.
     #[inline(always)]
     pub fn find(&self, k: Key, ids: &mut Ids) -> usize {
         let (at, tag) = locate(k);
-        let hits = self.lanes(at, tag).0;
+        // SAFETY: `at` is a bucket start, so the line is 64-byte aligned (the
+        // mapping is 2 MiB aligned). Each aligned 8-byte lane is read whole
+        // by an x86 load, and a slot is 0 or final, so a lane is too (see
+        // the module's notes): the only place that relies on that.
+        let hits = unsafe {
+            let p = self.slots.as_ptr().add(at).cast::<__m256i>();
+            let tags = _mm256_set1_epi64x(tag as i64);
+            let [a, b] = [p, p.add(1)].map(|q| _mm256_srli_epi64::<17>(_mm256_load_si256(q)));
+            let eq = |h| _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(h, tags)));
+            eq(a) as u32 | (eq(b) as u32) << 4
+        };
         if hits == 0 {
             return self.insert(k, ids);
         }
@@ -203,50 +184,38 @@ impl Table {
         let lane = at + hits.trailing_zeros() as usize;
         // SAFETY: a lane of the bucket's line, which is within the table.
         let slot = unsafe { self.slots.get_unchecked(lane) }.load(Relaxed);
-        (slot & ID_MASK) as usize - 1
+        (slot & (DENSE as u64 - 1)) as usize - 1
     }
 
-    /// `find`, for a name not in its home bucket's line when `find` looked:
-    /// skips the lines from its home that are full and do not hold it (a full
-    /// line stays full), then walks the slots from there, to the name's slot
-    /// or the first empty one, which it claims with a compare-and-swap. If
-    /// another worker claimed that slot first, the swap hands back the value
-    /// there, which is compared as any slot's is.
+    /// `find`, for a name not in its home bucket's first line when `find`
+    /// looked: walks the slots from its home, line by line, to the name's
+    /// slot or the first empty one, which it claims with a compare-and-swap.
+    /// If another worker claimed that slot first, the swap hands back the
+    /// value there, which is compared as any slot's is.
     #[cold]
     fn insert(&self, k: Key, ids: &mut Ids) -> usize {
-        let (mut at, tag) = locate(k);
-        for _ in 0..BUCKETS {
-            let (hits, empty) = self.lanes(at, tag);
-            if hits != 0 {
-                let slot = self.slots[at + hits.trailing_zeros() as usize].load(Relaxed);
-                return (slot & ID_MASK) as usize - 1;
-            }
-            if empty != 0 {
-                break;
-            }
-            at = (at + 8) % (8 * BUCKETS);
-        }
-        // From the line's first slot to the table's end, then round from the
-        // table's start: every slot once, and a full table ends the loop.
+        let (at, tag) = locate(k);
+        // From the bucket's first slot to the table's end, then round from
+        // its start: every slot once, and a full table ends the loop.
         for slot in self.slots[at..].iter().chain(self.slots) {
             let mut v = slot.load(Relaxed);
             if v == 0 {
                 if ids.start == ids.end {
                     let first = self.next.0.fetch_add(BLOCK, Relaxed);
                     if first + BLOCK > DENSE - 1 {
-                        crate::die("more than about 102,000 distinct names");
+                        crate::die("more than about 130,000 distinct names");
                     }
                     *ids = first..first + BLOCK;
                 }
-                let new = tag << ID_BITS | (ids.start as u64 + 1);
+                let new = tag << 17 | (ids.start as u64 + 1);
                 match slot.compare_exchange(0, new, Relaxed, Relaxed) {
                     // (`ids` was refilled above if it was empty.)
                     Ok(_) => return ids.next().unwrap(),
                     Err(now) => v = now,
                 }
             }
-            if v >> ID_BITS == tag {
-                return (v & ID_MASK) as usize - 1;
+            if v >> 17 == tag {
+                return (v & (DENSE as u64 - 1)) as usize - 1;
             }
         }
         crate::die("name table full")
