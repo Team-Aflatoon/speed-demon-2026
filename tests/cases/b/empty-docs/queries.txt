@@ -1,0 +1,3 @@
+BOOL bail
+BOOL bail NOT bond
+PHRASE "bail bond"

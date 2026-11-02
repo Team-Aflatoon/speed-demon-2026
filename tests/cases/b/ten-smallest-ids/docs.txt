@@ -1,0 +1,16 @@
+0	bail
+1	bail
+2	bail
+3	bail
+4	bail
+5	bail
+6	bail
+7	bail
+8	bail
+9	bail
+10	bail
+11	bail
+12	bail
+13	bail
+14	bond
+15	bail

@@ -1,0 +1,13 @@
+BOOL a OR b AND c
+BOOL a AND c OR b
+BOOL c NOT a OR a
+BOOL b NOT b
+BOOL a NOT a OR c NOT c
+BOOL missing
+BOOL missing OR a
+BOOL a AND missing
+BOOL a NOT missing
+BOOL and AND not
+BOOL or
+BOOL b
+BOOL a OR b OR c OR and

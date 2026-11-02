@@ -1,0 +1,12 @@
+BOOL 273
+BOOL 273k
+BOOL duciary
+BOOL fiduciary
+PHRASE "bail bond"
+BOOL stanbul
+BOOL i OR istanbul
+PHRASE "na ve caf"
+BOOL naive OR cafe
+PHRASE "stra e ct"
+BOOL strasse
+PHRASE "mixed case 3rd"

@@ -1,0 +1,8 @@
+0	bail bail bond
+1	bail bond bail
+2	bond. Bail
+3	bail
+4	bond
+5	the bond, the bail
+6	x x
+7	x x x

@@ -1,0 +1,6 @@
+0	a b c
+1	a
+2	b c
+3	c
+4	and or not
+5	b b b b
