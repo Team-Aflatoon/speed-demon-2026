@@ -1,402 +1,241 @@
-//! Distinct names, in two phases, so that the hot path never writes a cache
-//! line another core reads.
+//! Distinct names, counted as the records are parsed, with no second pass.
 //!
-//! Phase 1, while parsing: every name is interned into one shared lock-free
-//! hash table (`Table`), and its slot's index is the name's id. After the
-//! first few percent of the file nearly every name is already there, so the
-//! table is read-mostly and its lines stay shared by all cores. Each record
-//! then appends its (id, group) pair, as 16 bits, to a bucket of its own
-//! worker's `Pairs`: bucket `id >> 8`, entry `group << 8 | id & 255`. Those
-//! are private writes, mostly to a few hot lines.
+//! A name is not stored: it is identified by a 64-bit hash of its raw bytes
+//! and length (`Key`), and a record finds it in one shared lock-free table
+//! (`Table`), which gives each new name the next dense id. A group's distinct
+//! names are the set bits of its row of one shared bit matrix, a bit per
+//! (group, id) pair; a record sets its pair's bit with an atomic OR, and the
+//! OR says whether the bit was clear, so the record counts the pair then and
+//! nothing is counted afterwards.
 //!
-//! Phase 2, once every worker is done: the workers claim buckets, and each
-//! bucket's pairs from all workers are counted against an 8 KiB bitset of
-//! 256 ids x 256 groups that stays in L1: each group's bits set at the end
-//! are its distinct names. Every pair also adds one record and its name's
-//! unescaped length to its group, in one add.
+//! Hash identity: two names are one if their hashes agree on 62 bits (15 for
+//! the bucket, 47 for the stored tag). For the spec's pool of 100,000 names
+//! the chance that any two do is n^2 / 2 / 2^62, about 1.1e-9 a dataset. The
+//! hash is fixed and unseeded, so a dataset gives the same output every run.
+//!
+//! The table and the matrix share one 6 MiB mapping on three huge pages, so
+//! that the random reads and bit writes of 3 million records touch few pages
+//! and few TLB entries; each page is faulted in by one start-up task (see
+//! `Table::touch`).
+//!
+//! Concurrency. A slot is one aligned `AtomicU64` that changes exactly once,
+//! from 0 to its final value, by a compare-and-swap, and nothing else writes
+//! it: a reader sees it empty or complete, never half filled. A slot is
+//! claimed in the order of its line and its bucket's lines (`Table::insert`),
+//! and a full line stays full, so two workers inserting one name walk the same
+//! slots in the same order and meet at the first slot either claims: the
+//! loser of that compare-and-swap reads the winner's value and finds its own
+//! tag there. A dense id is spent only by a successful compare-and-swap, and
+//! ids are handed out in disjoint blocks, so no id names two names; an id
+//! left unused only leaves an empty column in the matrix. Matrix bits are set
+//! with `fetch_or`, an atomic read-modify-write: in a word's modification
+//! order exactly one OR finds a given bit clear, so each (group, id) pair is
+//! counted once. The one place that relies on the hardware, not on Rust's
+//! memory model, is the fast path of `Table::find`, which reads a line's
+//! eight slots with two AVX2 loads: an aligned 8-byte lane is read whole on
+//! x86, so each lane is 0 or final. A slot published a moment after its
+//! lane was read only sends the lookup to `insert`, which reads atomically,
+//! and a hit's id is read again through the atomic slot before it is used.
 
 use crate::parse::load;
-use std::arch::x86_64::{_bzhi_u64, _mm_crc32_u64};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering::*};
-use std::sync::Mutex;
+use crate::{mapped_huge, GROUPS};
+use std::arch::x86_64::*;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 
-/// The longest name kept in a short slot (87% of records' names).
-const SHORT: usize = 15;
-/// The longest name kept in a long slot; longer ones (1 in 5,000 records)
-/// are interned under a lock (see `Table::huge`).
-const INLINE: usize = 24;
-/// `meta` of a slot whose claimer is still writing it (no name's: see
-/// `Table`).
-const FILLING: u64 = u64::MAX;
-/// The most slots a lookup visits: a table so full that a name is not
-/// within this many of its home is full (see `Table::probe`).
-const PROBES: usize = 1024;
-/// Short slots: room for 131,072 short names and 32,768 long ones. The
-/// spec's pool has 100,000 names, of which about 87% are short (up to 15
-/// bytes) and the rest at most 27 bytes long, so the table is at most about
-/// two-thirds full; anything that fills it stops the program.
-const SLOTS: usize = 1 << 17;
-/// Ids per pair bucket.
-const BUCKET: usize = 256;
+/// Buckets: one cache line of 8 one-word slots each (2 MiB all together).
+const BUCKETS: usize = 1 << 15;
+/// Dense ids: bit columns of the matrix, so the most distinct names it holds
+/// (a slot stores an id plus one in 17 bits).
+const DENSE: usize = 1 << 17;
+/// Words in a group's row of the matrix.
+pub const ROW: usize = DENSE / 64;
+/// Words in the table and the matrix, the table first.
+const WORDS: usize = 8 * BUCKETS + GROUPS * ROW;
+/// Words in a 2 MiB huge page.
+const HUGE: usize = 1 << 18;
+/// Huge pages in the mapping (see `Table::touch`).
+pub const PAGES: usize = WORDS / HUGE;
+/// Dense ids a worker reserves at once.
+const BLOCK: usize = 64;
+// The mapping must not end in the middle of a huge page.
+const _: () = assert!(WORDS % HUGE == 0);
 
-/// A name as its table key: its first 24 raw bytes as three zero-padded
-/// words (all of it, but for the rare huge name), its tag (length + 1) and
-/// the word of the table its lookup starts at (see `Table::key`). The raw
-/// bytes keep `""` escapes doubled; escaping is one-to-one, so equal raw
-/// bytes mean equal values, and both empty forms have length 0.
+/// The dense ids a worker has reserved and not yet used, as `[next, end)`.
+pub type Ids = [usize; 2];
+
+/// A name's identity: the hash of its raw bytes and length. The raw bytes
+/// keep `""` escapes doubled; escaping is one-to-one, so equal raw bytes mean
+/// equal values, and both empty forms have length 0.
 #[derive(Clone, Copy, Default)]
-pub struct Key {
-    w: [u64; 3],
-    tag: u32,
-    at: u32,
-}
+pub struct Key(u64);
 
 impl Key {
-    /// What a slot holds for this key, in `W`-word slots: the name words,
-    /// then `meta` (see `Table`).
-    fn slot<const W: usize>(&self) -> [u64; W] {
-        let low = (self.w[1] ^ mix(self.w[0])) << 8;
-        let meta = u64::from(self.tag) | if W == 2 { low } else { 0 };
-        std::array::from_fn(|j| if j == W - 1 { meta } else { self.w[j] })
+    /// The word of the table where the name's bucket starts: 15 bits of the
+    /// hash, times the 8 slots of a bucket.
+    fn bucket(self) -> usize {
+        8 * (self.0 as usize & (BUCKETS - 1))
+    }
+
+    /// The 47 bits above those, which a slot stores. Never 0, so that no tag
+    /// matches an empty slot.
+    fn tag(self) -> u64 {
+        (self.0 >> 17).max(1)
     }
 }
 
-/// 56 bits mixed from a short name's first word: a short slot's `meta`
-/// holds its bytes 8 to 14 XORed with them, so that `meta` alone tells the
-/// names of one line apart, and the bytes are still there (see `count`).
-fn mix(w0: u64) -> u64 {
-    w0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 8
+/// The name table, the matrix and the next dense id. A slot is 0 when empty,
+/// else `tag << 17 | (id + 1)`.
+pub struct Table {
+    /// Table, then matrix: one mapping, each of its `PAGES` huge pages
+    /// faulted in by `touch`.
+    all: &'static [AtomicU64],
+    slots: &'static [AtomicU64],
+    /// `GROUPS` rows of `ROW` words; group g's bit for id i is bit `i % 64` of
+    /// word `g * ROW + i / 64`.
+    pub bits: &'static [AtomicU64],
+    next: Next,
 }
 
-/// Open addressing, in two arrays of slots in one mapping. Short names take
-/// 16-byte slots, four to a cache line: a short name's home is a whole line,
-/// which a lookup checks without a branch per slot, and finds it there for
-/// 89% of records (seed 1); the rest overflowed to other lines. Longer names
-/// take 32-byte slots of three name words and `meta`, probed linearly. A
-/// slot's last word is its `meta`: 0 if empty, `FILLING`, or the name's tag
-/// and, for a short name, its bytes 8 to 14 XORed with `mix` of its first
-/// word, above the tag's byte. A name's
-/// id is its slot's index, long slots counting on after the short ones, and
-/// huge names after those.
-pub struct Table {
-    words: &'static [AtomicU64],
-    /// For `key`: the masks of a hash to its home word, short and long, and
-    /// where long slots start (twice the short slots, a power of two; a
-    /// quarter as many long ones follow).
-    homes: [usize; 3],
-    /// Names over `INLINE` bytes, by id, and their unescaped lengths.
-    huge: Mutex<(HashMap<Box<[u8]>, usize>, Vec<u64>)>,
+/// The first dense id nobody has reserved, alone on its cache line: it is
+/// written by every worker that runs out of ids, and must not share a line
+/// with anything read.
+#[repr(align(64))]
+struct Next(AtomicUsize);
+
+/// 64-bit mix (the finaliser of MurmurHash3).
+fn fmix(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^ h >> 33
+}
+
+/// One word into the running hash. A multiplication by an odd number and a
+/// rotation are both one-to-one, so no word is ever lost from the hash.
+#[inline(always)]
+fn step(h: u64, w: u64) -> u64 {
+    (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31)
 }
 
 impl Table {
-    /// An empty table: `SLOTS` short slots, a quarter as many long ones, and
-    /// room for an eighth as many huge names.
+    /// An empty table and a zeroed matrix, in a new mapping on huge pages.
     pub fn new() -> Self {
-        let short = SLOTS;
-        // SAFETY: zero is a valid AtomicU64. The mapping is page-aligned, so
-        // no slot straddles two cache lines.
-        let words = unsafe { crate::mapped(3 * short, -1) };
-        let (homes, huge) = ([2 * short - 8, short / 4 - 1, 2 * short], Mutex::default());
-        Table { words, homes, huge }
+        // SAFETY: zero is a valid AtomicU64.
+        let all: &'static [AtomicU64] = unsafe { mapped_huge(WORDS) };
+        let (slots, bits) = all.split_at(8 * BUCKETS);
+        Table { all, slots, bits, next: Next(AtomicUsize::new(0)) }
     }
 
-    /// Ids of each kind: short slots, long slots, huge names.
-    fn ids(&self) -> [usize; 3] {
-        let short = self.homes[2] / 2;
-        [short, short / 4, short / 8]
-    }
-
-    /// Pair buckets: all ids over `BUCKET`.
-    pub fn buckets(&self) -> usize {
-        self.ids().iter().sum::<usize>() / BUCKET
-    }
-
-    /// Faults in share `k` of `n` of the table before phase 1 starts, so that
-    /// the workers' first lookups do not each take a page fault.
-    pub fn touch(&self, k: usize, n: usize) {
-        let mut shares = self.words.chunks(self.words.len().div_ceil(n));
-        crate::populate(shares.nth(k).unwrap_or(&[]));
+    /// Faults in huge page `k` of the mapping (MADV_POPULATE_WRITE), then
+    /// counts the task off `left`. One task does each page, and the workers
+    /// wait for all of them before their first record: huge pages that
+    /// several workers touch at once are each charged 2 MiB again (PERF.md,
+    /// row 15), and where the kernel cannot give a huge page the same call
+    /// faults the 4 KiB pages of its range, which is never more memory.
+    pub fn touch(&self, k: usize, left: &AtomicUsize) {
+        crate::populate(&self.all[k * HUGE..(k + 1) * HUGE]);
+        left.fetch_sub(1, Release);
     }
 
     /// The key of the `len` raw name bytes at `b[start..]`. Reads at most 24
-    /// bytes past `start` beyond the name (the buffer's padding covers that).
-    /// Its lookup starts at its home line for a short name, at its home slot
-    /// for a long one.
+    /// bytes past `start` beyond the name (the buffer's padding covers that)
+    /// unless the name is longer, when all of it is hashed out of line.
     #[inline(always)]
     pub fn key(&self, b: &[u8], start: usize, len: usize) -> Key {
-        // `bzhi` keeps the low `bits` bits, and the whole word from 64 on;
-        // it reads only the index's low byte, so the words of a name over 31
-        // bytes are wrong, but only huge names (see `huge`) are that long.
+        if len > 24 {
+            return Key(long_hash(&b[start..start + len]));
+        }
+        // `bzhi` keeps the low `bits` bits, and the whole word from 64 on.
         let bits = |k: usize| (8 * len as u32).saturating_sub(64 * k as u32);
-        // SAFETY (both intrinsics, and the loads): BMI2 and SSE4.2 are part
-        // of x86-64-v3, which the whole crate is compiled for (main.rs
-        // refuses any other build); the loads end at most 24 bytes past the
-        // name (see `load`).
+        // SAFETY (the intrinsic, and the loads): BMI2 is part of x86-64-v3,
+        // which the whole crate is compiled for (main.rs refuses any other
+        // build); the loads end at most 24 bytes past the name (see `load`).
         let w = [0, 1, 2].map(|k| unsafe { _bzhi_u64(load(b, start + 8 * k), bits(k)) });
-        let crc = |h, w| unsafe { _mm_crc32_u64(h, w) };
-        let h = crc(crc(crc(len as u64, w[0]), w[1]), w[2]) as usize;
-        // Without a branch: the kind is as unpredictable as the names.
-        let [short, long, long_at] = self.homes;
-        let long_name = 0usize.wrapping_sub(usize::from(len > SHORT));
-        let at = 2 * h & short & !long_name | (long_at + 4 * (h & long)) & long_name;
-        let (tag, at) = (len as u32 + 1, at as u32);
-        Key { w, tag, at }
+        Key(fmix(step(step(step(len as u64, w[0]), w[1]), w[2])))
     }
 
     /// Starts loading the cache line a lookup of `k` reads first.
     pub fn prefetch(&self, k: &Key) {
-        crate::prefetch(self.words, k.at as usize);
+        crate::prefetch(self.slots, k.bucket());
     }
 
-    /// The id of the name with key `k`, inserting it if new; its raw bytes
-    /// are at the start of `b`.
+    /// The dense id of the name with key `k`, giving it the next id of the
+    /// worker's block `ids` if it is new. Almost every record finds its name
+    /// in its home bucket, which this compares branch-free: both halves of
+    /// the line, the slots' tags (their value above the low 17 bits) against
+    /// the key's, as eight lanes.
     #[inline(always)]
-    pub fn find(&self, k: &Key, b: &[u8]) -> usize {
-        let (len, at) = (k.tag as usize - 1, k.at as usize);
-        if len > SHORT {
-            // A long name's home slot, the same way, before any probing.
-            let want = k.slot::<4>();
-            // SAFETY: `key` masks `at` to a slot within the long slots.
-            let slot = unsafe { self.words.get_unchecked(at..at + 4) };
-            let same = |j: usize| slot[j].load(Acquire) == want[j];
-            let short = self.homes[2] / 2;
-            return match len {
-                _ if same(3) && same(0) && same(1) && same(2) => short + (at - 2 * short) / 4,
-                ..=INLINE => self.probe::<4>(k, 0),
-                _ => self.huge(&b[..len]),
-            };
+    pub fn find(&self, k: &Key, ids: &mut Ids) -> usize {
+        let (at, tag) = (k.bucket(), k.tag());
+        // SAFETY: `at` is a bucket start, so the line is 64-byte aligned (the
+        // mapping is 2 MiB aligned). Each aligned 8-byte lane is read whole
+        // by an x86 load, and a slot is 0 or final, so a lane is too (see
+        // the module's notes): the only place that relies on that.
+        let hits = unsafe {
+            let p = self.slots.as_ptr().add(at).cast::<__m256i>();
+            let tags = _mm256_set1_epi64x(tag as i64);
+            let [a, b] = [p, p.add(1)].map(|q| _mm256_srli_epi64::<17>(_mm256_load_si256(q)));
+            let eq = |h| _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(h, tags)));
+            eq(a) as u32 | (eq(b) as u32) << 4
+        };
+        if hits == 0 {
+            return self.insert(k, ids);
         }
-        // SAFETY: `key` masks `at` to a line start within the short slots.
-        match unsafe { self.line(at, k.slot()) } {
-            (hit @ 0..4, _) => at / 2 + hit,
-            (_, full) => self.probe::<2>(k, usize::from(full)),
-        }
+        // The slot read whole and atomically: a hit is already final.
+        let slot = self.slots[at + hits.trailing_zeros() as usize].load(Relaxed);
+        (slot & (DENSE as u64 - 1)) as usize - 1
     }
 
-    /// Looks for the short name whose slot is `[w, meta]` in the line of
-    /// short slots at word `at`, all four slots at once: returns its slot in
-    /// the line, or 4; and whether the line holds four published names, so
-    /// that it is full for good. A slot only matches once published, and the
-    /// Acquire load of its `meta` makes the word written before it (in
-    /// `probe`) visible. The first slot whose `meta` matches is almost
-    /// surely the name's: its first word decides, and in the rare other case
-    /// `probe` does.
-    ///
-    /// # Safety
-    /// `at` must be a line start within the short slots.
-    #[inline(always)]
-    unsafe fn line(&self, at: usize, [w, meta]: [u64; 2]) -> (usize, bool) {
-        // SAFETY: the caller's promise.
-        let l = unsafe { self.words.get_unchecked(at..at + 8) };
-        let metas = [0, 1, 2, 3].map(|j| l[2 * j + 1].load(Acquire));
-        let first = |hit, j: usize| if metas[j] == meta { j } else { hit };
-        let hit = (0..4).rev().fold(4, first);
-        let found = hit < 4 && l[2 * (hit & 3)].load(Relaxed) == w;
-        let full = metas.iter().all(|&m| m.wrapping_add(1) > 1);
-        (if found { hit } else { 4 }, full)
-    }
-
-    /// The id of a name of more than `INLINE` bytes, given as `name`.
+    /// `find`, for a name not in its home bucket's first line when `find`
+    /// looked: walks the buckets from its home, line by line and slot by
+    /// slot, to the name's slot or the first empty one, which it claims with
+    /// a compare-and-swap. If another worker claimed that slot first, the
+    /// swap hands back the value there, which is compared as any slot's is.
     #[cold]
-    fn huge(&self, name: &[u8]) -> usize {
-        let [short, long, huge] = self.ids();
-        let mut lock = self.huge.lock().unwrap();
-        let (ids, lens) = &mut *lock;
-        if let Some(&id) = ids.get(name) {
-            return id;
-        }
-        if lens.len() == huge {
-            crate::die("more than 16,384 distinct names over 24 bytes");
-        }
-        lens.push((name.len() - name.iter().filter(|&&c| c == b'"').count() / 2) as u64);
-        ids.insert(name.into(), short + long + lens.len() - 1);
-        short + long + lens.len() - 1
-    }
-
-    /// Probes the `W`-word slots for the name with key `k`, inserting it in
-    /// the first empty slot if it is not there; returns its id. Long slots
-    /// are probed linearly from the home slot; short ones by lines, the home
-    /// line, then lines `step` (odd, so every line comes up in turn) apart,
-    /// not the next one: linear probing by lines would pile names up in runs
-    /// of full lines. The first `full` lines are known to be full of other
-    /// names, and further full lines are passed a whole line at a time.
-    ///
-    /// A worker inserts by claiming an empty slot's `meta` (0 to `FILLING`)
-    /// with a CAS, so only it writes the slot; nothing else ever writes
-    /// `meta`. A name not found within `PROBES` slots means the table is
-    /// full: every lookup of a name follows the same sequence, so a name in
-    /// the table is always within the `PROBES` its insertion visited.
-    #[cold]
-    fn probe<const W: usize>(&self, k: &Key, mut full: usize) -> usize {
-        let (base, want) = (W / 4 * self.homes[2], k.slot::<W>());
-        let (mask, words) = (self.ids()[W / 4] - 1, &self.words[base..]);
-        let mix = (k.w[0] ^ k.w[1] ^ k.w[2]).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let step = (mix >> 40 | 1) as usize;
-        let home = (k.at as usize - base) / W;
-        while full > 0 && full < PROBES / 4 {
-            let at = 2 * ((home + 4 * step * full) & mask);
-            // SAFETY: `at` is a line start (`home` is one, and `mask` keeps
-            // the low two bits) within the short slots (only short names
-            // have full lines).
-            match unsafe { self.line(at, k.slot()) } {
-                (hit @ 0..4, _) => return at / 2 + hit,
-                (_, true) => full += 1,
-                (_, false) => break,
-            }
-        }
-        let mut i = (home + 4 * step * full) & mask;
-        for _ in 4 * full..PROBES {
-            let slot = &words[W * i..W * i + W];
-            let mut meta = slot[W - 1].load(Acquire);
-            if meta == 0 {
-                // Claim the slot first, so that only one worker writes it.
-                if let Err(now) = slot[W - 1].compare_exchange(0, FILLING, Acquire, Acquire) {
-                    meta = now;
-                } else {
-                    // Every word before the Release store of `meta`, so a
-                    // lookup that sees `meta` published sees the name.
-                    (0..W - 1).for_each(|j| slot[j].store(want[j], Relaxed));
-                    slot[W - 1].store(want[W - 1], Release);
-                    return base / 2 + i;
+    #[inline(never)]
+    fn insert(&self, k: &Key, ids: &mut Ids) -> usize {
+        let (mut at, tag) = (k.bucket(), k.tag());
+        for _ in 0..BUCKETS {
+            for slot in &self.slots[at..at + 8] {
+                let mut v = slot.load(Relaxed);
+                if v == 0 {
+                    if ids[0] == ids[1] {
+                        let first = self.next.0.fetch_add(BLOCK, Relaxed);
+                        if first + BLOCK > DENSE - 1 {
+                            crate::die("more than about 130,000 distinct names");
+                        }
+                        *ids = [first, first + BLOCK];
+                    }
+                    match slot.compare_exchange(0, tag << 17 | (ids[0] as u64 + 1), Relaxed, Relaxed) {
+                        Ok(_) => {
+                            ids[0] += 1;
+                            return ids[0] - 1;
+                        }
+                        Err(now) => v = now,
+                    }
+                }
+                if v >> 17 == tag {
+                    return (v & (DENSE as u64 - 1)) as usize - 1;
                 }
             }
-            while meta == FILLING {
-                std::hint::spin_loop(); // a few stores away from published
-                meta = slot[W - 1].load(Acquire);
-            }
-            // The Acquire load of a published `meta` makes the words written
-            // before its Release store (above) visible here.
-            if meta == want[W - 1] && (0..W - 1).all(|j| slot[j].load(Relaxed) == want[j]) {
-                return base / 2 + i;
-            }
-            let next_line = W == 2 && i % 4 == 3;
-            i = (if next_line { i - 3 + 4 * step } else { i + 1 }) & mask;
+            at = (at + 8) & (8 * BUCKETS - 1);
         }
-        crate::die("more distinct names than the name table holds")
-    }
-
-    /// Phase 2 for one bucket: counts its pairs from every worker into `out`:
-    /// distinct names by group in `out[0]`, and in `out[1]` records above
-    /// bit 32 and name bytes below it (fewer than 2^32 of each, as
-    /// records.csv is under 4 GiB: see main). `bits` must be all zero, and is
-    /// left so. Only called once every worker has finished phase 1.
-    pub fn count(&self, all: &[&Pairs], bucket: usize, bits: &mut Bits, out: &mut [[u64; 256]; 2]) {
-        let [short, long, _] = self.ids();
-        // Locked once per bucket, and only for the huge names' buckets.
-        let huge = (bucket * BUCKET >= short + long).then(|| self.huge.lock().unwrap());
-        // Each id's unescaped name length: its length less half its quote
-        // bytes, since inside the delimiting quotes every quote byte is half
-        // of a `""`. 0 for an empty slot.
-        let short_slot = |w0: u64, m: u64| [w0, m >> 8 ^ mix(w0), 0, m];
-        let lens: [u64; BUCKET] = std::array::from_fn(|j| {
-            let (id, word) = (bucket * BUCKET + j, |k: usize| self.words[k].load(Relaxed));
-            let j = id.wrapping_sub(short); // a long slot's index, if `id` is one
-            let [w0, w1, w2, meta] = match id {
-                _ if id < short => short_slot(word(2 * id), word(2 * id + 1)),
-                _ if j < long => std::array::from_fn(|k| word(2 * short + 4 * j + k)),
-                _ => return 1 << 32 | huge.as_ref().and_then(|h| h.1.get(j - long)).unwrap_or(&0),
-            };
-            let quotes: u32 = [w0, w1, w2].map(quote_bytes).iter().sum();
-            1 << 32 | (u64::from((meta as u8).saturating_sub(1)) - u64::from(quotes / 2))
-        });
-        drop(huge);
-        for pairs in all {
-            pairs.each(bucket, |e| {
-                let (e, group) = (usize::from(e), usize::from(e >> 8));
-                bits[e / 64] |= 1 << (e % 64);
-                out[1][group] += lens[e % BUCKET];
-            });
-        }
-        // A group's distinct names are the bits set in its 256, which this
-        // clears again.
-        for (words, distinct) in bits.chunks_exact_mut(BUCKET / 64).zip(&mut out[0]) {
-            *distinct += words.iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
-            words.fill(0);
-        }
+        crate::die("name table full")
     }
 }
 
-/// The number of `"` bytes in `w`: `y` has bit 7 clear exactly in the bytes
-/// where `x` is zero, with no carry between bytes.
-fn quote_bytes(w: u64) -> u32 {
-    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
-    let x = w ^ 0x2222_2222_2222_2222;
-    (!(((x & LOW7) + LOW7) | x | LOW7)).count_ones()
-}
-
-
-/// Phase 2's bitset: a bit per (id in a bucket, group).
-pub type Bits = [u64; BUCKET * 256 / 64];
-
-/// u16s per pair block: a 32-bit link to the bucket's previous block, then
-/// 62 entries. 128 bytes, so a block is two whole cache lines, and a bucket's
-/// last, partly filled block wastes 64 bytes on average.
-const BLOCK: usize = 64;
-
-/// One worker's (id, group) pairs, by bucket of `BUCKET` ids: entry
-/// `group << 8 | id % BUCKET`. Each bucket is a chain of blocks in the
-/// worker's own arena, a mapping of its own (private writes, no allocator
-/// locks); `cur[bucket]` is where its next entry goes, or 0 before its first.
-/// An entry at a block boundary means the block is full. `n` blocks are in
-/// use.
-pub struct Pairs {
-    cur: Vec<u32>,
-    arena: &'static mut [u16],
-    n: usize,
-}
-
-impl Pairs {
-    /// Room for every record of a file of `len` bytes (a record takes at
-    /// least 11) in `buckets` buckets, backed by memory only where used; the
-    /// first `touch` entries are faulted in now.
-    pub fn new(buckets: usize, len: usize, touch: usize) -> Self {
-        // SAFETY: zero is a valid u16.
-        let blocks = len / 11 / (BLOCK - 2) + buckets + 1;
-        let arena: &mut [u16] = unsafe { crate::mapped(blocks * BLOCK, -1) };
-        crate::populate(&arena[..touch.min(arena.len())]);
-        let cur = vec![0; buckets];
-        Pairs { cur, arena, n: 0 }
+/// The hash of a name of over 24 bytes: every 8-byte word of it (the last
+/// padded with zeros), from a start that holds its length and differs from
+/// the short names'.
+#[cold]
+#[inline(never)]
+fn long_hash(name: &[u8]) -> u64 {
+    let mut h = name.len() as u64 ^ 0x5555_5555_5555_5555;
+    for c in name.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = step(h, u64::from_le_bytes(w));
     }
-
-    #[inline(always)]
-    pub fn push(&mut self, id: usize, group: u8) {
-        // SAFETY: every id has a bucket (`Table::buckets`).
-        let bucket = unsafe { self.cur.get_unchecked_mut(id / BUCKET) };
-        let mut p = *bucket as usize;
-        if p % BLOCK == 0 {
-            // A new block for a bucket whose cursor is 0 or the end of its
-            // full block; its link is that block's index + 1, or 0.
-            let (at, link) = (self.n * BLOCK, p / BLOCK);
-            (self.arena[at], self.arena[at + 1]) = (link as u16, (link >> 16) as u16);
-            (self.n, p) = (self.n + 1, at + 2);
-        }
-        // SAFETY: the arena has room for every record (see `new`), and `p`
-        // is within the block of this bucket that has room.
-        *unsafe { self.arena.get_unchecked_mut(p) } = u16::from(group) << 8 | (id % BUCKET) as u16;
-        *bucket = p as u32 + 1;
-    }
-
-    /// Every entry of `bucket`, newest block first.
-    fn each(&self, bucket: usize, mut f: impl FnMut(u16)) {
-        let mut p = self.cur[bucket] as usize;
-        while p != 0 {
-            let at = (p - 1) / BLOCK * BLOCK;
-            let link = usize::from(self.arena[at]) | usize::from(self.arena[at + 1]) << 16;
-            // The next block (another core wrote it) loads while this one is
-            // counted.
-            let next = (link * BLOCK).wrapping_sub(BLOCK);
-            crate::prefetch(self.arena, next);
-            crate::prefetch(self.arena, next + 32);
-            // Four at a time: a quarter of the loop's instructions were its own.
-            let four = self.arena[at + 2..p].chunks_exact(4);
-            let rest = four.remainder();
-            four.for_each(|e| e.iter().for_each(|&e| f(e)));
-            rest.iter().for_each(|&e| f(e));
-            p = link * BLOCK;
-        }
-    }
+    fmix(h)
 }
-
-/// What phase 2 adds to one group (see `Table::count`).
-pub type Counts = [u64; 2];
