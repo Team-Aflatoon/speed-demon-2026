@@ -32,7 +32,7 @@ fn main() {
     // kernel compacts memory, and would charge 2 MiB for a barely used table.
     // SAFETY: a plain prctl (PR_SET_THP_DISABLE) with integer arguments; if
     // the kernel refuses, we just keep its default.
-    // PROBE p2h: THP left on; the table mapping asks for huge pages.
+    unsafe { prctl(41, 1, 0, 0, 0) };
     let args: Vec<String> = env::args().collect();
     let data = args.get(1).map_or("/data", |s| s);
     let out = args.get(2).map_or("/out", |s| s);
@@ -52,7 +52,7 @@ fn main() {
     let mut text = String::new();
     // `_` sorts after every capital letter, so _UNMATCHED comes last.
     for (key, group) in regions.countries().chain([("_UNMATCHED".into(), 0)]) {
-        let [ids, cents, txt, min, max, both, distinct] = totals[usize::from(group)];
+        let ([ids, cents, txt, min, max], [distinct, both]) = totals[usize::from(group)];
         let (records, names) = (both >> 32, both & 0xFFFF_FFFF);
         let (sum, min, max, notes) = (money(cents), money(min), money(max), txt - names as i64);
         let line = format!("{key} {records} {ids} {sum} {min} {max} {distinct} {names}");
@@ -146,10 +146,4 @@ pub fn populate<T>(mem: &[T]) {
     // SAFETY: the range is our own mapping, and populating leaves its bytes
     // as they are.
     unsafe { madvise(mem.as_ptr().cast(), size_of_val(mem), 23) };
-}
-
-/// PROBE p2h: MADV_HUGEPAGE on `mem`.
-pub fn hugepage<T>(mem: &[T]) {
-    // SAFETY: our own mapping; the advice changes no bytes.
-    unsafe { madvise(mem.as_ptr().cast(), size_of_val(mem), 14) };
 }
