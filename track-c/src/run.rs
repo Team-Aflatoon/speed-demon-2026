@@ -1,22 +1,24 @@
 //! The parallel engine. The workers first build the region map and fault in
-//! the name table and matrix, then claim chunks of records.csv until none are
-//! left. A worker waits on the others only once: for those start-up tasks.
+//! the name table, then claim chunks of records.csv until none are left
+//! (phase 1), then claim name buckets until none are left (phase 2, see
+//! names.rs). A worker waits on the others only twice: for the region map,
+//! and at the end of phase 1.
 //!
 //! Choosing the chunk cuts is where the quote-parity problem lives; see `run`.
 
-use crate::names::{Table, PAGES};
+use crate::names::{Bits, Counts, Pairs, Table};
 use crate::parse::{merge, Agg, Local, Parser, Res, Span, EMPTY, PAD};
 use crate::{die, or_die, GROUPS};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, Scope};
 
 /// The most worker threads (the scoring machine gives us twelve).
 const MAX_THREADS: usize = 12;
-/// Start-up tasks: the huge pages of the name table and matrix to fault in
-/// (`PAGES` of them), then pieces of regions.csv to parse.
+/// Start-up tasks: pieces of regions.csv to parse, then of the name table
+/// to fault in.
 const PARTS: usize = 32;
 /// Stack size for workers, which need about 40 KiB; a small stack can never
 /// be given a huge page.
@@ -25,8 +27,10 @@ const STACK: usize = 256 << 10;
 /// (records average 61 bytes); a longer last record doubles it until found.
 const SLACK: usize = 1 << 10;
 
-/// Every group's numbers (see `Agg`).
-pub type Totals = Vec<Agg>;
+/// One output line's numbers: the parser's (see `Agg`), then phase 2's (see
+/// `Table::count`).
+pub type Total = (Agg, Counts);
+pub type Totals = Vec<Total>;
 
 /// Counts the whole file, `len` bytes, with one worker per CPU (at most
 /// 12), in chunks of nominally `piece` bytes: totals by group.
@@ -45,11 +49,12 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
     let threads = thread::available_parallelism().map_or(1, usize::from);
     let threads = threads.min(MAX_THREADS);
     let (table, chunks) = (Table::new(), len.div_ceil(piece).max(1));
+    let buckets = table.buckets();
     let quotes: Vec<AtomicU64> = (0..chunks).map(|_| AtomicU64::new(0)).collect();
-    // Shared counters: the next chunk and start-up task to claim, and the
-    // start-up tasks to wait for.
-    let [chunk, task] = [0, 0].map(AtomicUsize::new);
-    let pending = AtomicUsize::new(PARTS + PAGES);
+    // Shared counters: the next chunk, start-up task and name bucket to
+    // claim, start-up tasks to wait for, workers still in phase 1.
+    let [chunk, task, bucket] = [0, 0, 0].map(AtomicUsize::new);
+    let (pending, parsing) = (AtomicUsize::new(PARTS), AtomicUsize::new(threads));
     // The lowest offset where the file broke the grammar, if it did. No
     // chunk is claimed after that.
     let fail = Mutex::new(None::<usize>);
@@ -58,20 +63,24 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
         let mut fail = fail.lock().unwrap();
         *fail = Some(fail.map_or(at, |old| old.min(at)));
     };
-    let total = Mutex::new(vec![EMPTY; GROUPS]);
-    let work = |_| {
+    let all_pairs: Vec<OnceLock<Pairs>> = (0..threads).map(|_| OnceLock::new()).collect();
+    let total = Mutex::new(vec![(EMPTY, [0; 2]); GROUPS]);
+    let work = |t: usize| {
         // The start-up tasks go to whichever workers are up first, so that
-        // none waits for the last thread to start, only for the tasks.
+        // none waits for the last thread to start, only for the region map.
         loop {
             match task.fetch_add(1, Relaxed) {
-                k if k < PAGES => table.touch(k, &pending),
-                k if k < PAGES + PARTS => regions.parse(k - PAGES, &pending),
+                k if k < PARTS => regions.parse(k, &pending),
+                k if k < 2 * PARTS => table.touch(k - PARTS, PARTS),
                 _ => break,
             }
         }
+        // Most of this worker's pairs, at 2 bytes for a record of about 61,
+        // are faulted in now.
+        let pairs = Pairs::new(buckets, len, len / 64 / threads);
         let aggs = [EMPTY; GROUPS];
         let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
-        let mut local = Local { aggs, ids: [0; 2] };
+        let mut local = Local { aggs, pairs };
         wait(&pending);
         while let Some(c) = Some(chunk.fetch_add(1, Relaxed)).filter(|&c| c < chunks) {
             let span = read(file, len - c * piece, c * piece, piece, &mut buffer);
@@ -80,9 +89,22 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
                 Err(at) => failed(c * piece + at),
             }
         }
+        _ = all_pairs[t].set(local.pairs);
+        parsing.fetch_sub(1, Release);
+        wait(&parsing);
+        // Phase 2, unless phase 1 failed somewhere; then nothing is counted.
+        let mut counts = [[0; GROUPS]; 2];
+        if fail.lock().unwrap().is_none() {
+            let all: Vec<&Pairs> = all_pairs.iter().filter_map(OnceLock::get).collect();
+            let mut bits: Box<Bits> = Box::new([0; 1024]);
+            while let Some(b) = Some(bucket.fetch_add(1, Relaxed)).filter(|&b| b < buckets) {
+                table.count(&all, b, &mut bits, &mut counts);
+            }
+        }
         let mut total = total.lock().unwrap();
-        for (t, a) in total.iter_mut().zip(&local.aggs) {
-            merge(t, a);
+        for (g, (t, a)) in total.iter_mut().zip(&local.aggs).enumerate() {
+            merge(&mut t.0, a);
+            (t.1[0], t.1[1]) = (t.1[0] + counts[0][g], t.1[1] + counts[1][g]);
         }
     };
     thread::scope(|s| grow(s, 0, threads, &work));
@@ -93,15 +115,8 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
         }
         before += q.load(Relaxed);
     }
-    let (fail, total) = (fail.into_inner().unwrap(), total.into_inner().unwrap());
-    // Debug builds check the matrix against the counts: a group's row holds
-    // exactly as many set bits as it has distinct names.
-    #[cfg(debug_assertions)]
-    for (g, (t, row)) in total.iter().zip(table.bits.chunks(table.bits.len() / GROUPS)).enumerate() {
-        let ones: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        assert!(fail.is_some() || i64::from(ones) == t[6] & 0xFFFF_FFFF, "group {g}");
-    }
-    fail.map_or(Ok(total), Err)
+    let fail = fail.into_inner().unwrap();
+    fail.map_or(Ok(total.into_inner().unwrap()), Err)
 }
 
 /// Waits, yielding rather than spinning, so that a crowded machine can run
