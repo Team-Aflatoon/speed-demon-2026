@@ -6,7 +6,7 @@
 
 use crate::fail;
 use crate::index::PARTS;
-use crate::query::{Parsed, Probe, Table, ID_MASK, NEVER, NONE, RANGE_SHIFT, SHORT};
+use crate::query::{Parsed, Probe, Table, ID_MASK, NEVER, NONE, RANGE_SHIFT};
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -154,7 +154,6 @@ impl<'a> Scanner<'a> {
         // file reads from `from - 1` and drops everything up to the first LF:
         // that is the end of the previous chunk's last line.
         let (mut off, mut len, mut skip) = (from.saturating_sub(1), 0, from > 0);
-        let mut known = false; // whether `doc.local` is set
         let mut buf = std::mem::take(&mut self.buf); // put back on return
         loop {
             buf.resize(buf.len().max(len + PIECE + PAD), 0);
@@ -174,21 +173,19 @@ impl<'a> Scanner<'a> {
             // The chunk's last line is the one holding byte `to - 1`, so it
             // ends at the first LF from there.
             let last = (to - 1).saturating_sub(off) as usize;
-            let last_lf = buf[last.min(len)..len].iter().position(|&b| b == b'\n');
             let (end, done) = if off + start as u64 >= to {
                 (start, true)
-            } else if let Some(i) = last_lf {
+            } else if let Some(i) = buf[last.min(len)..len].iter().position(|&b| b == b'\n') {
                 (last + i + 1, true)
             } else {
                 let lf = buf[start..len].iter().rposition(|&b| b == b'\n');
                 (lf.map_or(start, |i| start + i + 1), n == 0)
             };
             if end > start {
-                if !known {
+                if out.lines == 0 {
                     out.first = parse_id(&buf[start..end], off + start as u64);
                     let local = out.first.checked_sub(first);
                     self.doc.local = local.unwrap_or_else(|| fail("document ids out of order"));
-                    known = true;
                 }
                 self.region(&buf, start, end, out);
             }
@@ -199,8 +196,7 @@ impl<'a> Scanner<'a> {
             (off, len) = (off + end as u64, len - end);
         }
         self.buf = buf;
-        let doc = &self.doc;
-        out.partition(&doc.fresh, &doc.ends, doc.local - out.lines);
+        out.partition(&self.doc.fresh, &self.doc.ends, self.doc.local - out.lines);
     }
 
     /// Finds the tokens and LFs of `buf[start..end]` (whole lines, the first
@@ -275,13 +271,12 @@ impl<'a> Scanner<'a> {
             self.vals.resize(tokens.next_power_of_two(), 0);
         }
         let bounds = self.bounds[..2 * tokens].as_chunks::<2>().0;
-        assert!(end + SHORT <= buf.len()); // `scan` leaves `PAD` bytes after the data
         let mut probes = [Probe::default(); BATCH];
         for (bounds, vals) in bounds.chunks(BATCH).zip(self.vals.chunks_mut(BATCH)) {
             for (probe, &[s, e]) in probes.iter_mut().zip(bounds) {
                 // SAFETY: a token starts before `end` (`lex` only finds tokens
-                // in `start..end`), and `buf` has 16 bytes after `end`
-                // (checked above).
+                // in `start..end`), and `lex` checked that `buf` has `PAD >= 16`
+                // bytes after `end`.
                 *probe = unsafe { look.probe(buf.as_ptr().add(s as usize), (e - s) as usize) };
             }
             for ((val, &probe), &[s, e]) in vals.iter_mut().zip(&probes).zip(bounds) {
