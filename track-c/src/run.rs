@@ -6,13 +6,13 @@
 //!
 //! Choosing the chunk cuts is where the quote-parity problem lives; see `run`.
 
-use crate::names::Table;
+use crate::names::{Bits, Counts, Pairs, Table};
 use crate::parse::{merge, Agg, Local, Parser, Res, Span, EMPTY, PAD};
 use crate::{die, or_die, GROUPS};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, Scope};
 
 /// The most worker threads (the scoring machine gives us twelve).
@@ -29,7 +29,7 @@ const SLACK: usize = 1 << 10;
 
 /// One output line's numbers: the parser's (see `Agg`), then phase 2's (see
 /// `Table::count`).
-pub type Total = Agg;
+pub type Total = (Agg, Counts);
 pub type Totals = Vec<Total>;
 
 /// Counts the whole file, `len` bytes, with one worker per CPU (at most
@@ -48,29 +48,39 @@ pub type Totals = Vec<Total>;
 pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Totals> {
     let threads = thread::available_parallelism().map_or(1, usize::from);
     let threads = threads.min(MAX_THREADS);
-    let table = Table::new();
-    let chunks = len.div_ceil(piece).max(1);
+    let (table, chunks) = (Table::new(), len.div_ceil(piece).max(1));
+    let buckets = table.buckets();
     let quotes: Vec<AtomicU64> = (0..chunks).map(|_| AtomicU64::new(0)).collect();
-    let [chunk, task] = [0, 0].map(AtomicUsize::new);
-    let pending = AtomicUsize::new(PARTS + 3);
+    // Shared counters: the next chunk, start-up task and name bucket to
+    // claim, start-up tasks to wait for, workers still in phase 1.
+    let [chunk, task, bucket] = [0, 0, 0].map(AtomicUsize::new);
+    let (pending, parsing) = (AtomicUsize::new(PARTS), AtomicUsize::new(threads));
+    // The lowest offset where the file broke the grammar, if it did. No
+    // chunk is claimed after that.
     let fail = Mutex::new(None::<usize>);
     let failed = |at: usize| {
         chunk.store(usize::MAX / 2, Relaxed);
         let mut fail = fail.lock().unwrap();
         *fail = Some(fail.map_or(at, |old| old.min(at)));
     };
-    let total = Mutex::new(vec![EMPTY; GROUPS]);
-    let work = |_t: usize| {
+    let all_pairs: Vec<OnceLock<Pairs>> = (0..threads).map(|_| OnceLock::new()).collect();
+    let total = Mutex::new(vec![(EMPTY, [0; 2]); GROUPS]);
+    let work = |t: usize| {
+        // The start-up tasks go to whichever workers are up first, so that
+        // none waits for the last thread to start, only for the region map.
         loop {
             match task.fetch_add(1, Relaxed) {
-                k if k < 3 => { table.touch(k, 0); pending.fetch_sub(1, Release); }
-                k if k < 3 + PARTS => regions.parse(k - 3, &pending),
+                k if k < PARTS => regions.parse(k, &pending),
+                k if k < 2 * PARTS => table.touch(k - PARTS, PARTS),
                 _ => break,
             }
         }
+        // Most of this worker's pairs, at 2 bytes for a record of about 61,
+        // are faulted in now.
+        let pairs = Pairs::new(buckets, len, len / 64 / threads);
         let aggs = [EMPTY; GROUPS];
         let (mut parser, mut buffer) = (Parser::new(&table, regions.map), Vec::new());
-        let mut local = Local { aggs, dense: [0; 2] };
+        let mut local = Local { aggs, pairs };
         wait(&pending);
         while let Some(c) = Some(chunk.fetch_add(1, Relaxed)).filter(|&c| c < chunks) {
             let span = read(file, len - c * piece, c * piece, piece, &mut buffer);
@@ -79,9 +89,22 @@ pub fn run(piece: usize, file: &File, len: usize, regions: &Regions) -> Res<Tota
                 Err(at) => failed(c * piece + at),
             }
         }
+        _ = all_pairs[t].set(local.pairs);
+        parsing.fetch_sub(1, Release);
+        wait(&parsing);
+        // Phase 2, unless phase 1 failed somewhere; then nothing is counted.
+        let mut counts = [[0; GROUPS]; 2];
+        if fail.lock().unwrap().is_none() {
+            let all: Vec<&Pairs> = all_pairs.iter().filter_map(OnceLock::get).collect();
+            let mut bits: Box<Bits> = Box::new([0; 1024]);
+            while let Some(b) = Some(bucket.fetch_add(1, Relaxed)).filter(|&b| b < buckets) {
+                table.count(&all, b, &mut bits, &mut counts);
+            }
+        }
         let mut total = total.lock().unwrap();
-        for (t, a) in total.iter_mut().zip(&local.aggs) {
-            merge(t, a);
+        for (g, (t, a)) in total.iter_mut().zip(&local.aggs).enumerate() {
+            merge(&mut t.0, a);
+            (t.1[0], t.1[1]) = (t.1[0] + counts[0][g], t.1[1] + counts[1][g]);
         }
     };
     thread::scope(|s| grow(s, 0, threads, &work));
