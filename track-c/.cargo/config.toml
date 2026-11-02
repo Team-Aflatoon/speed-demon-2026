@@ -3,4 +3,4 @@
 # and a static binary, so a run never pays for the dynamic loader. src/main.rs
 # refuses to compile without them.
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static,+pclmulqdq,+aes"]
+rustflags = ["-C", "target-cpu=raptorlake", "-C", "target-feature=+crt-static,+pclmulqdq,+aes"]
