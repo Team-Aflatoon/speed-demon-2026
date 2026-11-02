@@ -112,7 +112,6 @@ enum Task {
     /// Parse a piece; the hours below the second field are closed.
     Piece(usize, usize),
     Hour(usize),
-    Stop,
 }
 
 /// Per hour, a thread's open block, as (next slot, end): both are indices into that
@@ -149,7 +148,6 @@ struct Job<'a> {
 impl<'a> Job<'a> {
     fn new(input: &'a File, speculate: bool) -> Job<'a> {
         let len = input.metadata().unwrap_or_else(|e| die(e)).len() as usize;
-        let pieces = len.div_ceil(PIECE);
         // Room for every line of the file in any one hour (a line takes one slot per 40
         // bytes at most, or two if wide, with at least 46), plus each thread's last,
         // partly used block; or, speculating, less. A whole number of blocks keeps every
@@ -175,7 +173,7 @@ impl<'a> Job<'a> {
             input,
             len,
             lag: if speculate { 2 } else { HOURS },
-            rows: (0..pieces).map(|_| AtomicUsize::new(0)).collect(),
+            rows: Vec::from_iter((0..len.div_ceil(PIECE)).map(|_| AtomicUsize::new(0))),
             room,
             logs: unsafe { slice::from_raw_parts(logs.cast(), HOURS * room) },
             used: (0..HOURS).map(|_| Used(AtomicUsize::new(0))).collect(),
@@ -201,7 +199,7 @@ impl<'a> Job<'a> {
             let (mut open, mut buf) = ([(0, 0); HOURS], Vec::new());
             'run: while let Some((hour, text)) = match receiver.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => match self.next_task(None, true) {
-                    Task::Piece(i, closed) => {
+                    Some(Task::Piece(i, closed)) => {
                         self.piece(i, closed, &mut open, &mut buf);
                         self.parsed(&mut self.plan.lock().unwrap(), i);
                         continue 'run;
@@ -230,8 +228,8 @@ impl<'a> Job<'a> {
     /// One worker: parses pieces and reports hours, whichever is due, until all is done.
     fn work(&self, sender: mpsc::Sender<(usize, Vec<u8>)>) {
         let (mut open, mut buf, mut parsed) = ([(0, 0); HOURS], Vec::new(), None);
-        loop {
-            match self.next_task(parsed.take(), false) {
+        while let Some(task) = self.next_task(parsed.take(), false) {
+            match task {
                 Task::Piece(i, closed) => {
                     self.piece(i, closed, &mut open, &mut buf);
                     parsed = Some(i);
@@ -249,7 +247,6 @@ impl<'a> Job<'a> {
                         scratch.push(sorted);
                     }
                 }
-                Task::Stop => break,
             }
         }
         // The last worker out frees what only reports used, before the writer has written
@@ -309,8 +306,9 @@ impl<'a> Job<'a> {
 
     /// Marks piece `parsed` done and picks the next task: an hour whose pieces are all
     /// parsed, else a piece, else (once all pieces are taken) it waits for an hour. The
-    /// main thread (`writer`) takes only pieces, and stops rather than wait.
-    fn next_task(&self, parsed: Option<usize>, writer: bool) -> Task {
+    /// main thread (`writer`) takes only pieces, and stops rather than wait. None means
+    /// there is nothing left to do (or the speculation failed).
+    fn next_task(&self, parsed: Option<usize>, writer: bool) -> Option<Task> {
         let mut plan = self.plan.lock().unwrap();
         if let Some(i) = parsed {
             self.parsed(&mut plan, i);
@@ -327,14 +325,14 @@ impl<'a> Job<'a> {
             let end = self.rows.len().min(frontier + LEAD);
             plan.closed.resize(close.max(closed), i);
             if plan.late || h == HOURS || writer && i >= end {
-                return Task::Stop;
+                return None;
             } else if !writer && plan.closed.get(h).is_some_and(|&pieces| frontier >= pieces) {
                 plan.next_hour += 1;
-                return Task::Hour(h);
+                return Some(Task::Hour(h));
             } else if i < end {
                 plan.parsing.push(i);
                 plan.next_piece += 1;
-                return Task::Piece(i, plan.closed.len());
+                return Some(Task::Piece(i, plan.closed.len()));
             }
             plan.waiting += 1;
             plan = self.changed.wait(plan).unwrap();
@@ -387,12 +385,12 @@ impl<'a> Job<'a> {
                 }
                 let (latency, space) = parse_latency(p.add(e - 16));
                 let status = e - 16 + space - 3;
-                let error = (*p.add(status) == b'5') as u32;
                 // The endpoint starts after the space that ends the method (which follows
                 // the 27-byte timestamp and its space), and ends before the status.
                 let name = start + 29 + spaces(p.add(start + 28)).trailing_zeros() as usize;
                 let id = ENDPOINTS.id(p.add(name), status - 1 - name);
-                let record = id << ID_SHIFT | error << ERROR_SHIFT;
+                // The status's first digit tells a 5xx.
+                let record = id << ID_SHIFT | ((*p.add(status) == b'5') as u32) << ERROR_SHIFT;
                 // One slot, or two for a wide latency, in one block: a wide one that
                 // would start in the block's last slot leaves it empty.
                 let wide = latency >= LOW;
@@ -453,26 +451,20 @@ impl<'a> Job<'a> {
         // nothing reads this hour's log again. If it is refused, the pages stay.
         // MADV_DONTNEED (4).
         unsafe { madvise(log.as_ptr() as _, size_of_val(log), 4) };
-        // The output's `YYYY-MM-DDTHH:00:00Z ` for the hour, padded to 32 bytes. The span
-        // start is hardcoded here and in `hour_row` (see `HOURS`).
-        let (day, h) = (30 + (hour + 18) / 24, (hour + 18) % 24);
-        let (month, day) = if day > 31 { (11, day - 31) } else { (10, day) };
-        let mut stamp = [0; 32];
-        stamp[..21].copy_from_slice(format!("2026-{month:02}-{day:02}T{h:02}:00:00Z ").as_bytes());
+        // The output's `YYYY-MM-DDTHH:00:00Z ` for the hour. The span start is hardcoded
+        // here and in `hour_row` (see `HOURS`).
+        let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
+        let stamp = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
         // Room for every line at once (untouched pages cost nothing), so the text never
         // grows by copying.
         text.reserve(256 * order.len());
-        // Each group's output line is `stamp` (21 bytes, padded to 32), the endpoint's name,
-        // and the numbers from its latencies `v` and its 5xx count; nothing for an empty
-        // group.
+        // Each group's output line is `stamp`, the endpoint's name, and the numbers from its
+        // latencies `v` and its 5xx count; nothing for an empty group.
         let mut at = 0;
-        for &id in &order {
+        for &id in order.iter().filter(|&&id| count(id) > 0) {
             let (n, name, errors) = (count(id), ENDPOINTS.get(id), tally[2 * id as usize + 1]);
             let v = &mut sorted[at..at + n as usize];
             at += n as usize;
-            if n == 0 {
-                continue;
-            }
             let [p50, p95, p99] = percentiles(v);
             let ppm = (errors as u64 * 1_000_000 / n as u64) as u32;
             text.reserve(256);
@@ -480,7 +472,7 @@ impl<'a> Job<'a> {
             // 21 + 128 (name copy) or 21 + 125 + 6 * 11 + 8 (last digit word) of them.
             unsafe {
                 let start = text.as_mut_ptr().add(text.len());
-                ptr::copy_nonoverlapping(stamp.as_ptr(), start, 32);
+                ptr::copy_nonoverlapping(stamp.as_ptr(), start, 21);
                 // All 128 bytes of the record (a whole number of vector moves, no `memcpy`
                 // call); what follows the name is overwritten below.
                 ptr::copy_nonoverlapping((name as *const Name).cast::<u8>(), start.add(21), 128);
@@ -508,9 +500,7 @@ fn percentiles(v: &mut [u32]) -> [u32; 3] {
         let mut p = [0; 3];
         for &x in v.iter() {
             let below = v.iter().map(|&y| (y < x) as u32).sum::<u32>() as usize;
-            for (p, &r) in p.iter_mut().zip(&ranks) {
-                *p = (*p).max(if below <= r { x } else { 0 });
-            }
+            p = std::array::from_fn(|k| p[k].max(if below <= ranks[k] { x } else { 0 }));
         }
         return p;
     }
@@ -555,11 +545,15 @@ fn eight_digits(v: u32) -> u64 {
     ((x - tens * 10) << 8) | tens
 }
 
+// `newlines`, `spaces`, `parse_latency`, `Name::is` and `Endpoints::id` carry no inline
+// attribute: each is tiny or has one caller, and the release build's disassembly is the
+// same with `#[inline(always)]` on them. If a change to one stops the compiler inlining it
+// into `parse`, the per-line path slows: compare the disassembly.
+
 /// The newlines of the 64 bytes at `p`, as a bitmask.
 ///
 /// # Safety
 /// The 64 bytes must be readable. AVX2 is enabled crate-wide (target-cpu=x86-64-v3).
-#[inline(always)]
 unsafe fn newlines(p: *const u8) -> u64 {
     let eq = |at| _mm256_cmpeq_epi8(_mm256_loadu_si256(p.add(at).cast()), _mm256_set1_epi8(10));
     (_mm256_movemask_epi8(eq(32)) as u32 as u64) << 32 | _mm256_movemask_epi8(eq(0)) as u32 as u64
@@ -569,7 +563,6 @@ unsafe fn newlines(p: *const u8) -> u64 {
 ///
 /// # Safety
 /// The 16 bytes must be readable. SSE2 is part of x86-64.
-#[inline(always)]
 unsafe fn spaces(p: *const u8) -> u32 {
     let eq = _mm_cmpeq_epi8(_mm_loadu_si128(p.cast()), _mm_set1_epi8(b' ' as i8));
     _mm_movemask_epi8(eq) as u32
@@ -581,7 +574,6 @@ unsafe fn spaces(p: *const u8) -> u32 {
 ///
 /// # Safety
 /// The 16 bytes must be readable. SSE4.1 is enabled crate-wide (target-cpu=x86-64-v3).
-#[inline(always)]
 unsafe fn parse_latency(p: *const u8) -> (u32, usize) {
     let space = 31 - spaces(p).leading_zeros();
     let index = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -624,7 +616,6 @@ impl Name {
     ///
     /// # Safety
     /// 128 bytes at `p` must be readable. AVX2 and BMI2 are enabled crate-wide.
-    #[inline(always)]
     unsafe fn is(&self, p: *const u8, len: usize) -> bool {
         // `b` is taken from the whole struct: the last block also covers `len`, masked off.
         let eq = |at: usize| {
@@ -643,13 +634,12 @@ impl Name {
 struct Endpoints {
     slots: [AtomicU16; SLOTS],
     names: [UnsafeCell<Name>; IDS],
-    /// Ids handed out so far; its lock serialises inserts.
-    count: Mutex<usize>,
-    /// Ids in output (byte) order of their names, sorted again when new ones came in.
-    order: Mutex<Vec<u16>>,
+    /// The ids handed out so far, and those ids in output (byte) order of their names, sorted
+    /// again when new ones came in. The lock serialises inserts.
+    ids: Mutex<(usize, Vec<u16>)>,
 }
 
-// SAFETY: a name is written once, under `count`'s lock, before its id is published with
+// SAFETY: a name is written once, under the `ids` lock, before its id is published with
 // a Release store to its slot; readers reach a name only through an id they loaded with
 // Acquire, or one below a count read under the same lock, and nobody writes it again.
 unsafe impl Sync for Endpoints {}
@@ -658,8 +648,7 @@ static ENDPOINTS: Endpoints = Endpoints {
     slots: [const { AtomicU16::new(0) }; SLOTS],
     // SAFETY: all zero bytes are a valid, empty `Name`.
     names: [const { UnsafeCell::new(unsafe { std::mem::zeroed() }) }; IDS],
-    count: Mutex::new(0),
-    order: Mutex::new(Vec::new()),
+    ids: Mutex::new((0, Vec::new())),
 };
 
 impl Endpoints {
@@ -671,10 +660,9 @@ impl Endpoints {
     /// Every id handed out so far, in output order. A report asks once its hour's pieces
     /// are parsed, so the ids in its log are among them.
     fn order(&self) -> Vec<u16> {
-        let mut order = self.order.lock().unwrap();
-        let count = *self.count.lock().unwrap();
-        if order.len() < count {
-            *order = (1..=count as u16).collect();
+        let (count, order) = &mut *self.ids.lock().unwrap();
+        if order.len() < *count {
+            *order = (1..=*count as u16).collect();
             order.sort_unstable_by_key(|&id| &self.get(id).bytes[..self.get(id).len as usize]);
         }
         order.clone()
@@ -684,7 +672,6 @@ impl Endpoints {
     ///
     /// # Safety
     /// 128 bytes at `p` and the 8 bytes before `p + len` must be readable.
-    #[inline(always)]
     unsafe fn id(&self, p: *const u8, len: usize) -> u32 {
         // Hash the first and last 8 bytes and the length. For a name under 8 bytes both
         // words are cut to the name, as their other bytes belong to the line around it.
@@ -710,7 +697,7 @@ impl Endpoints {
     /// As for `id`: 128 bytes at `p` must be readable.
     #[cold]
     unsafe fn insert(&self, p: *const u8, len: usize, mut i: usize) -> u32 {
-        let mut count = self.count.lock().unwrap();
+        let (count, _) = &mut *self.ids.lock().unwrap();
         // Another worker may have added it since our probe found the slot empty.
         while let id @ 1.. = self.slots[i % SLOTS].load(Relaxed) {
             if self.get(id).is(p, len) {

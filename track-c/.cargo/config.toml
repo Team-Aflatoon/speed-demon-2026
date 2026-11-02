@@ -1,5 +1,6 @@
-# AVX2 (and BMI2) for the parser's SIMD on the scoring box, a Raptor Lake i5-13500,
+# AVX2 and BMI2 (x86-64-v3) for the parser's SIMD on the scoring box, a Raptor Lake
+# i5-13500, with PCLMULQDQ and AES-NI, which v3 leaves out but every v3 CPU has,
 # and a static binary, so a run never pays for the dynamic loader. src/main.rs
-# refuses to compile without AVX2.
+# refuses to compile without them.
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static,+pclmulqdq,+aes"]
