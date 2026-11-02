@@ -28,14 +28,13 @@ pub const USES_CAP: u32 = 63;
 /// In a bucket's fourth value only: a term whose search passed this bucket
 /// lives in a later one.
 const OVERFLOW: u32 = 1 << 29;
-/// Query operators, kept in the top two bits of a BOOL step.
+/// Query operators, in the first half of a BOOL step.
 pub const AND: u32 = 0;
 pub const OR: u32 = 1;
 pub const NOT: u32 = 2;
 const OPS: [&[u8]; 3] = [b"AND", b"OR", b"NOT"]; // in the order of their values
-/// A BOOL step is `op << TERM_BITS | term`: the term id in bits 0..30, the
-/// operator in bits 30 and 31.
-pub const TERM_BITS: u32 = 30;
+/// A BOOL step: an operator and a term id.
+pub type Step = (u32, u32);
 /// `order` entries with this bit are phrases.
 pub const PHRASE: u32 = 1 << 31;
 /// Tokens of up to this many bytes are their own key (see `Key`).
@@ -227,31 +226,33 @@ pub struct Table {
 }
 
 /// `n` zeroed values in fresh anonymous pages, never unmapped (the table
-/// lives until the process exits). With `populate`, the kernel maps and
-/// zeroes them all at once, far cheaper than faulting them in one at a time
-/// from twelve threads, or than the allocator zeroing them (as it does for
-/// 64-byte aligned memory), and the caller's thread does it before any other
-/// exists: on 2 MB-aligned memory asked for huge pages, so the table needs
-/// one TLB entry per 2 MB. Whatever pages the kernel finds, all of it is
-/// populated, so the memory is the same. Otherwise pages are faulted in where
-/// they are touched.
+/// lives until the process exits). Without `populate`, pages are faulted in
+/// where they are touched. With it, the values start on a 2 MB boundary, are
+/// advised to use huge pages (one TLB entry per 2 MB instead of per 4 KB) and
+/// are all mapped and zeroed by one kernel call, far cheaper than faulting
+/// them in one at a time from twelve threads, or than the allocator zeroing
+/// them (as it does for 64-byte aligned memory). The caller does this on its
+/// own thread before any other exists. Both pieces of advice are only hints:
+/// if the kernel grants no huge pages, or lacks `MADV_POPULATE_WRITE`, the
+/// table works the same, with 4 KB pages faulted in on use.
 ///
 /// SAFETY: `T` must be valid as zero bytes, and need no more than page alignment.
 unsafe fn zeroed<T>(n: usize, populate: bool) -> &'static [T] {
     const HUGE: usize = 2 << 20;
     let len = (n * std::mem::size_of::<T>()).max(1);
-    // MAP_PRIVATE | MAP_ANONYMOUS.
+    // With `populate`, up to 2 MB spare, to start the values on a 2 MB boundary.
     let span = if populate { len + HUGE } else { len };
-    // SAFETY: an anonymous mapping (PROT_READ | PROT_WRITE) at an address of
-    // the kernel's choosing touches no memory of ours.
+    // SAFETY: an anonymous mapping at an address of the kernel's choosing
+    // touches no memory of ours. Protection 0x3 is PROT_READ | PROT_WRITE,
+    // flags 0x22 are MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20).
     let mut p = unsafe { crate::mmap(std::ptr::null_mut(), span, 0x3, 0x22, -1, 0) };
     assert!(p as isize != -1, "cannot map {len} bytes for the table");
     if populate {
         // SAFETY: advice on our own range, inside the mapping.
         unsafe {
             p = p.add(p.align_offset(HUGE));
-            crate::madvise(p, len, 14); // MADV_HUGEPAGE
-            crate::madvise(p, len, 23); // MADV_POPULATE_WRITE (Linux 5.14)
+            crate::madvise(p, len, 14); // MADV_HUGEPAGE = 14
+            crate::madvise(p, len, 23); // MADV_POPULATE_WRITE = 23 (Linux 5.14)
         }
     }
     // SAFETY: the mapping is `len` bytes, page aligned, zeroed, used for
@@ -267,6 +268,14 @@ impl Table {
     /// Room for the terms of `words` query words, and ids for all of them from
     /// `threads` threads.
     pub fn new(words: usize, threads: usize) -> Table {
+        // One bucket (three slots) per three words, rounded up to a power of
+        // two, so there is a slot for every word and the table cannot fill up.
+        // Seed 1 has 152,904 words (75,747 distinct terms): 65,536 buckets of
+        // 64 bytes, 4 MiB, exactly two huge pages; 38% of the slots are used.
+        // (Any input of 98,305 to 196,608 words gets the same size.) 2,341
+        // buckets (3.6%) are full and flagged `OVERFLOW`; of the scan's 36.3 M
+        // tokens, 430,000 (1.2%) land in one of those and take `find_slow`
+        // (plus 4,000 long tokens): counted with a temporary counter.
         let n = words.div_ceil(3).next_power_of_two().max(1 << 10);
         // Id 0 is the no-term value, so blocks start at 1.
         let ids = 1 + words + threads * ID_BLOCK as usize;
@@ -432,9 +441,9 @@ impl Table {
 pub struct Parsed {
     /// Per line: the index of its BOOL query, or `PHRASE |` its phrase index.
     pub order: Vec<u32>,
-    /// BOOL query `i` is `span(steps, ends, i)`, each step `op << TERM_BITS | term`;
+    /// BOOL query `i` is `span(steps, ends, i)`, each step `(op, term)`;
     /// the first step is `OR t1` applied to an empty set.
-    pub steps: Vec<u32>,
+    pub steps: Vec<Step>,
     pub ends: Vec<u32>,
     /// Phrase `i` is the terms `span(terms, term_ends, i)`.
     pub terms: Vec<u32>,
@@ -445,10 +454,9 @@ pub struct Parsed {
     /// terms), then the terms. A link is `range << RANGE_SHIFT | offset`.
     pub records: Vec<u32>,
     /// `(offset in queries.txt, length)` of each step's and each phrase
-    /// term's word, until `insert` turns them into term ids.
+    /// term's word, until `insert` turns them into term ids; a phrase term's
+    /// offset is then replaced by its table slot, until anchors are chosen.
     words: [Vec<(u32, u8)>; 2],
-    /// Table slots of the phrase terms, until anchors are chosen.
-    slots: Vec<u32>,
 }
 
 /// A phrase is named across ranges by `range << 28 | index`, and its record
@@ -458,13 +466,13 @@ pub struct Parsed {
 pub const RANGE_SHIFT: u32 = 28;
 
 /// Record `i` of a list of variable-length records that end at `ends`.
-fn span<'a>(items: &'a [u32], ends: &[u32], i: usize) -> &'a [u32] {
+fn span<'a, T>(items: &'a [T], ends: &[u32], i: usize) -> &'a [T] {
     let start = if i == 0 { 0 } else { ends[i - 1] as usize };
     &items[start..ends[i] as usize]
 }
 
 impl Parsed {
-    pub fn bool_steps(&self, i: usize) -> &[u32] {
+    pub fn bool_steps(&self, i: usize) -> &[Step] {
         span(&self.steps, &self.ends, i)
     }
 
@@ -503,7 +511,7 @@ impl Parsed {
             let (mut words, mut op) = (rest.split(|&b| b == b' '), OR);
             loop {
                 word(words.next()?, 0)?;
-                self.steps.push(op << TERM_BITS);
+                self.steps.push((op, 0));
                 match words.next() {
                     None => break,
                     Some(o) => op = OPS.iter().position(|&k| k == o)? as u32,
@@ -533,15 +541,15 @@ impl Parsed {
             |&(at, len): &(u32, u8)| table.insert(text, at as usize, len as usize, &mut ids);
         for (step, word) in self.steps.iter_mut().zip(&self.words[0]) {
             let id = insert(word).0;
-            *step |= id;
+            step.1 = id;
             if table.bools[id as usize].load(Relaxed) == 0 {
                 table.bools[id as usize].store(1, Relaxed);
             }
         }
-        for (term, word) in self.terms.iter_mut().zip(&self.words[1]) {
+        for (term, word) in self.terms.iter_mut().zip(&mut self.words[1]) {
             let slot;
             (*term, slot) = insert(word);
-            self.slots.push(slot as u32);
+            word.0 = slot as u32;
         }
     }
 
@@ -553,11 +561,10 @@ impl Parsed {
     pub fn choose_anchors(&mut self, table: &Table, range: usize) {
         for i in 0..self.term_ends.len() {
             let terms = span(&self.terms, &self.term_ends, i);
-            let slots = span(&self.slots, &self.term_ends, i);
-            let words = &self.words[1][self.term_ends[i] as usize - terms.len()..];
-            let rank = |j: usize| (table.uses(slots[j] as usize), u8::MAX - words[j].1);
+            let words = span(&self.words[1], &self.term_ends, i);
+            let rank = |j: usize| (table.uses(words[j].0 as usize), u8::MAX - words[j].1);
             let a = (0..terms.len()).min_by_key(|&j| rank(j)).unwrap();
-            let (term, slot) = (terms[a], slots[a]);
+            let (term, slot) = (terms[a], words[a].0);
             table.flag(slot as usize, ANCHOR);
             let link = (range as u32) << RANGE_SHIFT | self.records.len() as u32;
             let previous = table.heads[term as usize].swap(link + 1, AcqRel);
@@ -566,7 +573,7 @@ impl Parsed {
             self.records.extend_from_slice(&[previous, i as u32, meta]);
             self.records.extend_from_slice(terms);
         }
-        (self.slots, self.words) = Default::default();
+        self.words = Default::default();
     }
 }
 
@@ -578,6 +585,10 @@ pub struct Setup<'a> {
     /// Thread `i` parses the lines in `text[ranges[i]..ranges[i + 1]]`.
     ranges: Vec<usize>,
     pub barrier: Barrier,
+    /// Set once by `make_table`, which `main` calls before it spawns any
+    /// worker, so `OnceLock::wait` in `run` returns at once. (It dates from
+    /// workers parsing while the table was made, and is now only a guard; it
+    /// also lets `make_table` set the table through `&self`.)
     table: OnceLock<Table>,
 }
 
@@ -599,6 +610,9 @@ impl<'a> Setup<'a> {
     /// that parses, every term follows a space (a phrase's first through its
     /// quote), and every other word after a space is an uppercase operator.
     /// (A line that does not parse ends the run before it inserts anything.)
+    /// `main` calls this alone, before any worker exists and before huge
+    /// pages are switched off for the process, so the table's huge pages are
+    /// populated first and without competing threads.
     pub fn make_table(&self) {
         let text = &self.text[..self.text.len() - QUERY_PAD];
         let term = |(&a, &b): (&u8, &u8)| usize::from((a == b' ') & !b.is_ascii_uppercase());
@@ -606,8 +620,10 @@ impl<'a> Setup<'a> {
         let _ = self.table.set(Table::new(words, self.ranges.len() - 1));
     }
 
-    /// Thread `i`'s share of the start-up: its queries, parsed while the
-    /// table is made, and the finished table.
+    /// Thread `i`'s share of the start-up: parses its queries, inserts their
+    /// terms into the table (already made by `make_table`), and once every
+    /// thread has inserted, chooses its phrase anchors; returns them and the
+    /// table.
     pub fn run(&self, i: usize) -> (Parsed, &Table) {
         let mut mine = Parsed::parse(self.text, self.ranges[i], self.ranges[i + 1]);
         let table = self.table.wait();

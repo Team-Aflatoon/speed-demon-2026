@@ -6,7 +6,7 @@
 //! sorted list; a term in more than 1/`DENSE` of the segment's documents also
 //! has a bitmap, which turns AND and NOT against it into bit tests.
 
-use crate::query::{AND, NONE, NOT, OR, TERM_BITS};
+use crate::query::{Step, AND, NONE, NOT, OR};
 use std::arch::x86_64::*;
 
 pub const PARTS: usize = 64;
@@ -26,11 +26,7 @@ pub struct Part {
     docs: Vec<u16>,
     /// Where a dense term's bitmap starts in `bits`, or `NONE`.
     dense: Vec<u32>,
-    /// Bit `l`: term `l` is in the segment (a small array that stays in
-    /// cache, for `Evaluator::run` to skip queries that match nothing).
-    present: Vec<u64>,
     bits: Vec<u64>,
-    docs_in_segment: usize,
 }
 
 impl Part {
@@ -38,7 +34,7 @@ impl Part {
     /// order) by `l`, for a segment of `docs` documents. Every `l` is below
     /// `terms` (the scan emits only term ids below `Table::ids`, and
     /// `terms * PARTS >= Table::ids`).
-    pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize, cursor: &mut Vec<u32>) {
+    pub fn build(&mut self, streams: &[&[u32]], terms: usize, docs: usize) {
         self.offsets = vec![0; terms + 1];
         let counts = &mut self.offsets[1..];
         // The streams were written by other threads: the count runs 256 bytes
@@ -55,17 +51,16 @@ impl Part {
         for l in 0..terms {
             self.offsets[l + 1] += self.offsets[l];
         }
-        cursor.clear();
-        cursor.extend_from_slice(&self.offsets[..terms]);
         let total = self.offsets[terms] as usize;
         self.docs.clear();
         self.docs.reserve(total);
         let out = self.docs.spare_capacity_mut().as_mut_ptr();
+        let cursor = &mut self.offsets[..terms];
         for stream in streams {
             for &x in *stream {
-                // SAFETY: `l < terms` (see above), the length of `cursor`;
-                // the cursor of `l` runs from the term's offset to the next
-                // one, so each of the `total` slots is written exactly once.
+                // SAFETY: `l < terms` (see above), the length of `cursor`; the
+                // cursor of `l` runs from the term's offset to the next one, so
+                // each of the `total` slots is written exactly once.
                 unsafe {
                     let at = cursor.get_unchecked_mut((x & 0xFFFF) as usize);
                     (*out.add(*at as usize)).write((x >> 16) as u16);
@@ -75,45 +70,39 @@ impl Part {
         }
         // SAFETY: every slot below `total` was written above.
         unsafe { self.docs.set_len(total) };
-        let words = words(docs);
-        self.docs_in_segment = docs;
-        (self.dense, self.present) = (vec![NONE; terms], vec![0; terms.div_ceil(64)]);
+        // Each cursor ended at the next term's offset: shift them back.
+        self.offsets.rotate_right(1);
+        self.offsets[0] = 0;
+        self.dense = vec![NONE; terms];
         self.bits.clear();
         for l in 0..terms {
             let (from, to) = (self.offsets[l] as usize, self.offsets[l + 1] as usize);
-            self.present[l / 64] |= u64::from(to > from) << (l % 64);
             if (to - from) * DENSE > docs {
-                self.dense[l] = self.bits.len() as u32;
-                let bits = self.bits.len();
-                self.bits.resize(bits + words, 0);
-                set_bits(&mut self.bits[bits..], &self.docs[from..to]);
+                let at = self.bits.len();
+                self.dense[l] = at as u32;
+                self.bits.resize(at + words(docs), 0);
+                set_bits(&mut self.bits[at..], &self.docs[from..to]);
             }
         }
     }
 }
 
-/// Starts loading the entries of the terms of the BOOL query `steps` (its
-/// list's bounds and bitmap index), whose cache misses would otherwise stall
-/// `Evaluator::run` one after another; `prefetch_lists` follows them a few
-/// queries later.
-pub fn prefetch(parts: &[&Part], steps: &[u32]) {
-    for &step in steps {
-        let term = (step & ((1 << TERM_BITS) - 1)) as usize;
-        let (part, l) = (parts[term % PARTS], term / PARTS);
-        crate::prefetch(part.offsets.as_ptr().wrapping_add(l));
-        crate::prefetch(part.dense.as_ptr().wrapping_add(l));
-    }
-}
-
-/// Starts loading the first line of the list and of the bitmap of each term
-/// of `steps`, whose entries `prefetch` loaded earlier.
-pub fn prefetch_lists(parts: &[&Part], steps: &[u32]) {
-    for &step in steps {
-        let term = (step & ((1 << TERM_BITS) - 1)) as usize;
-        let (part, l) = (parts[term % PARTS], term / PARTS);
-        crate::prefetch(part.docs.as_ptr().wrapping_add(part.offsets[l] as usize));
-        if part.dense[l] != NONE {
-            crate::prefetch(part.bits.as_ptr().wrapping_add(part.dense[l] as usize));
+/// Starts loading what `Evaluator::run` will read for the terms of the BOOL
+/// query `steps`, whose cache misses would otherwise stall it one after
+/// another: first (not `lists`) each term's entries, its list's bounds and
+/// bitmap index; a few queries later (`lists`) the first line of its list
+/// and of its bitmap, which those entries locate.
+pub fn prefetch(parts: &[&Part], steps: &[Step], lists: bool) {
+    for &(_, term) in steps {
+        let (part, l) = (parts[term as usize % PARTS], term as usize / PARTS);
+        if lists {
+            crate::prefetch(part.docs.as_ptr().wrapping_add(part.offsets[l] as usize));
+            if part.dense[l] != NONE {
+                crate::prefetch(part.bits.as_ptr().wrapping_add(part.dense[l] as usize));
+            }
+        } else {
+            crate::prefetch(part.offsets.as_ptr().wrapping_add(l));
+            crate::prefetch(part.dense.as_ptr().wrapping_add(l));
         }
     }
 }
@@ -121,7 +110,6 @@ pub fn prefetch_lists(parts: &[&Part], steps: &[u32]) {
 /// The documents of one term in one segment.
 #[derive(Clone, Copy)]
 enum Set<'a> {
-    Empty,
     List(&'a [u16]),
     Dense(&'a [u16], &'a [u64]),
 }
@@ -129,7 +117,7 @@ enum Set<'a> {
 impl<'a> Set<'a> {
     /// The set of `term` (below `Table::ids`, so that `l` is below the
     /// `terms` the parts were built for) in the `PARTS` parts of a segment.
-    fn of(parts: &'a [&'a Part], term: usize, words: usize) -> Set<'a> {
+    fn of(parts: &'a [&'a Part], term: usize, docs: usize) -> Set<'a> {
         // SAFETY: `Part::build` makes `offsets` (ascending, ending at
         // `docs.len()`) one longer than `dense` (of `terms` entries, `parts`
         // being the `PARTS` parts of a segment), and gives every term whose
@@ -141,21 +129,18 @@ impl<'a> Set<'a> {
             let (from, to) = (*offsets, *offsets.add(1));
             let list = part.docs.get_unchecked(from as usize..to as usize);
             match list.len() {
-                0 => Set::Empty,
-                n if n * DENSE <= part.docs_in_segment => Set::List(list),
+                n if n * DENSE <= docs => Set::List(list),
                 _ => {
                     let at = *part.dense.get_unchecked(l) as usize;
-                    Set::Dense(list, part.bits.get_unchecked(at..at + words))
+                    Set::Dense(list, part.bits.get_unchecked(at..at + words(docs)))
                 }
             }
         }
     }
 
     fn list(self) -> &'a [u16] {
-        match self {
-            Set::Empty => &[],
-            Set::List(list) | Set::Dense(list, _) => list,
-        }
+        let (Set::List(list) | Set::Dense(list, _)) = self;
+        list
     }
 }
 
@@ -183,33 +168,31 @@ pub struct Evaluator {
 impl Evaluator {
     /// Adds the documents of segment `parts` (numbered from `base`, `docs` of
     /// them) that match the BOOL query `steps` to the answer `to`.
-    pub fn run(&mut self, parts: &[&Part], steps: &[u32], docs: usize, base: u32, to: &mut Answer) {
+    pub fn run(&mut self, parts: &[&Part], steps: &[Step], docs: u32, base: u32, to: &mut Answer) {
+        let docs = docs as usize;
         let words = words(docs);
         self.bits.resize(words, 0);
         self.mask.resize(words, 0);
-        let term = |step: u32| (step & ((1 << TERM_BITS) - 1)) as usize;
-        let present = |&step: &u32| {
-            let (part, l) = (parts[term(step) % PARTS], term(step) / PARTS);
-            // SAFETY: `present` has a bit for every `l` (see `Set::of`).
-            unsafe { *part.present.get_unchecked(l / 64) >> (l % 64) & 1 != 0 }
+        let present = |term: u32| {
+            let (part, l) = (parts[term as usize % PARTS], term as usize / PARTS);
+            // SAFETY: `offsets` has an entry past every `l` (see `Set::of`).
+            unsafe { *part.offsets.get_unchecked(l + 1) > *part.offsets.get_unchecked(l) }
         };
         // The query matches nothing here if a term ANDed after the last OR
         // is absent (the first step counts as an OR), or if every term that
         // can add documents (the ORed ones) is absent.
-        let op = |s: &u32| s >> TERM_BITS;
-        let last_or = steps.iter().rposition(|s| op(s) == OR).unwrap_or(0);
-        let and_absent = steps[last_or..].iter().any(|s| op(s) == AND && !present(s));
-        if and_absent || !steps.iter().any(|s| op(s) == OR && present(s)) {
+        let last_or = steps.iter().rposition(|&(op, _)| op == OR).unwrap_or(0);
+        let ands = &steps[last_or..];
+        let and_absent = ands.iter().any(|&(op, term)| op == AND && !present(term));
+        if and_absent || !steps.iter().any(|&(op, term)| op == OR && present(term)) {
             return;
         }
-        let set = |step: u32| Set::of(parts, term(step), words);
         let mut acc = Acc::Empty;
-        for &step in steps {
-            let op = step >> TERM_BITS;
+        for &(op, term) in steps {
             if let (Acc::Empty, AND | NOT) = (acc, op) {
                 continue; // nothing to intersect with or subtract from
             }
-            acc = self.step(acc, op, set(step), docs);
+            acc = self.step(acc, op, Set::of(parts, term as usize, docs), docs);
         }
         match acc {
             Acc::Empty => {}
@@ -227,7 +210,7 @@ impl Evaluator {
     /// bitmap tests against a dense set, by `combine` or a merge with a list,
     /// or, for a large OR, spread into the bitmap.
     fn step<'a>(&mut self, acc: Acc<'a>, op: u32, set: Set<'a>, docs: usize) -> Acc<'a> {
-        if let Set::Empty = set {
+        if set.list().is_empty() {
             return if op == AND { Acc::Empty } else { acc };
         }
         let r = match acc {
@@ -242,6 +225,7 @@ impl Evaluator {
             Acc::List => &mine[..],
             _ => r.list(),
         };
+        let (out, mask) = (&mut self.out, &mut self.mask);
         let next = match (op, set, r) {
             // Two dense sets: one pass over the words.
             (AND | NOT, Set::Dense(_, b), Set::Dense(_, a)) => {
@@ -251,20 +235,15 @@ impl Evaluator {
                 }
                 Acc::Bits
             }
-            (AND | NOT, Set::Dense(_, b), _) => filter(list, b, op == NOT, &mut self.out),
+            (AND | NOT, Set::Dense(_, b), _) => filter(list, b, op == NOT, out),
             // A dense set and a list: test the list against the bitmap.
-            (AND, Set::List(b), Set::Dense(_, a)) => filter(b, a, false, &mut self.out),
+            (AND, Set::List(b), Set::Dense(_, a)) => filter(b, a, false, out),
             (NOT, Set::List(_), Set::Dense(_, a)) => {
                 self.bits.copy_from_slice(a);
-                self.list = mine;
-                return self.bits_op(NOT, set);
+                self.bits_op(NOT, set)
             }
-            (AND | NOT, Set::List(b), _) => {
-                combine(list, b, op == NOT, &mut self.mask, &mut self.out)
-            }
-            _ if (list.len() + set.list().len()) * DENSE <= docs => {
-                union(list, set.list(), &mut self.out)
-            }
+            (AND | NOT, Set::List(b), _) => combine(list, b, op == NOT, mask, out),
+            _ if (list.len() + set.list().len()) * DENSE <= docs => union(list, set.list(), out),
             // A large OR: spread both sides into the bitmap.
             _ => {
                 match r {
@@ -274,8 +253,7 @@ impl Evaluator {
                         set_bits(&mut self.bits, list);
                     }
                 }
-                self.list = mine;
-                return self.bits_op(OR, set);
+                self.bits_op(OR, set)
             }
         };
         self.list = mine;
@@ -331,19 +309,15 @@ fn set_bits(bits: &mut [u64], list: &[u16]) {
 /// `PACK[m]`: the shuffle that moves the u16 lanes set in `m` (of eight) to
 /// the front, in order.
 static PACK: [[u8; 16]; 256] = {
-    let mut t = [[0x80; 16]; 256];
-    let mut m = 0;
-    while m < 256 {
-        let (mut lane, mut k) = (0, 0);
-        while lane < 8 {
-            if m >> lane & 1 == 1 {
-                t[m][2 * k] = 2 * lane as u8;
-                t[m][2 * k + 1] = 2 * lane as u8 + 1;
-                k += 1;
-            }
-            lane += 1;
+    let (mut t, mut i) = ([[0x80; 16]; 256], 0usize);
+    while i < 2048 {
+        // Lane `lane` of `m`, if set, goes after the set lanes below it.
+        let (m, lane) = (i / 8, i % 8);
+        if m >> lane & 1 == 1 {
+            let k = (m & ((1 << lane) - 1)).count_ones() as usize;
+            (t[m][2 * k], t[m][2 * k + 1]) = (2 * lane as u8, 2 * lane as u8 + 1);
         }
-        m += 1;
+        i += 1;
     }
     t
 };
@@ -399,19 +373,11 @@ fn seek(list: &[u16], from: usize, x: u16) -> usize {
     lo + list[lo..hi].partition_point(|&y| y < x)
 }
 
-/// `a` without (`not`) or with only the documents of `b`: `b` is spread into
-/// `mask` and `a` tested against it, which is about three times faster than
-/// a merge (whose steps depend on each other) once neither list is tiny.
-fn sift<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
-    set_bits(mask, b);
-    filter(a, mask, not, out);
-    b.iter().for_each(|&d| mask[usize::from(d) / 64] = 0);
-    Acc::List
-}
-
 /// `a` with only (or, if `not`, without) the documents of `b`. When one list
 /// is `GALLOP` times longer the shorter one gallops through it; otherwise the
-/// one that decides is spread into `mask` and the other tested against it.
+/// one that decides is spread into `mask` and the other tested against it,
+/// which is about three times faster than a merge (whose steps depend on each
+/// other) once neither list is tiny.
 fn combine<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<u16>) -> Acc<'a> {
     if !not && a.len() > b.len() {
         return combine(b, a, not, mask, out); // AND is symmetric: `a` the shorter
@@ -419,7 +385,10 @@ fn combine<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<
     if a.len() * GALLOP >= b.len() {
         // NOT spreads what it removes; AND spreads the shorter list.
         let (tested, spread) = if not { (a, b) } else { (b, a) };
-        return sift(tested, spread, not, mask, out);
+        set_bits(mask, spread);
+        filter(tested, mask, not, out);
+        spread.iter().for_each(|&d| mask[usize::from(d) / 64] = 0);
+        return Acc::List;
     }
     out.clear();
     let mut at = 0;
@@ -436,9 +405,9 @@ fn combine<'a>(a: &[u16], b: &[u16], not: bool, mask: &mut [u64], out: &mut Vec<
 /// short one is sought in it and the runs in between are copied whole;
 /// otherwise a branch-free merge.
 fn union<'a>(a: &[u16], b: &[u16], out: &mut Vec<u16>) -> Acc<'a> {
+    out.clear();
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     if short.len() * GALLOP < long.len() {
-        out.clear();
         let mut at = 0;
         for &x in short {
             let i = seek(long, at, x);
@@ -449,7 +418,6 @@ fn union<'a>(a: &[u16], b: &[u16], out: &mut Vec<u16>) -> Acc<'a> {
         out.extend_from_slice(&long[at..]);
         return Acc::List;
     }
-    out.clear();
     out.reserve(a.len() + b.len());
     let (to, mut n) = (out.as_mut_ptr(), 0);
     let (mut i, mut j) = (0, 0);
@@ -470,61 +438,59 @@ fn union<'a>(a: &[u16], b: &[u16], out: &mut Vec<u16>) -> Acc<'a> {
 }
 
 /// count, sum of ids and the ten smallest ids of a set of documents (spec 4).
+/// The first `min(count, 10)` of `ten` are filled.
 #[derive(Clone, Copy, Default)]
 pub struct Answer {
     count: u32,
-    kept: u32,
     sum: u64,
     ten: [u32; 10],
 }
 
 impl Answer {
-    /// Adds one document; ids must arrive in ascending order.
-    pub fn push(&mut self, id: u32) {
-        self.count += 1;
-        self.sum += u64::from(id);
-        if self.kept < 10 {
-            self.ten[self.kept as usize] = id;
-            self.kept += 1;
+    /// Adds `count` documents whose numbers add up to `sum`, numbered from
+    /// `base`; `ids` are their numbers in ascending order (at least the first
+    /// ten), and all above the documents added so far.
+    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
+        let kept = (self.count as usize).min(10);
+        for (slot, id) in self.ten[kept..].iter_mut().zip(ids) {
+            *slot = base + id;
         }
+        self.count += count as u32;
+        self.sum += count * u64::from(base) + sum;
     }
 
-    /// Adds a sorted list of documents numbered from `base`, all above the
-    /// documents added so far.
+    /// Adds one document.
+    pub fn push(&mut self, id: u32) {
+        self.add(0, 1, id.into(), [id].into_iter());
+    }
+
+    /// Adds a sorted list of documents numbered from `base`.
     fn add_list(&mut self, list: &[u16], base: u32) {
-        let n = list.len() as u32;
-        self.count += n;
-        self.sum +=
-            u64::from(n) * u64::from(base) + list.iter().map(|&d| u64::from(d)).sum::<u64>();
-        for &d in list.iter().take(10 - self.kept as usize) {
-            self.ten[self.kept as usize] = base + u32::from(d);
-            self.kept += 1;
-        }
+        let sum = list.iter().map(|&d| u64::from(d)).sum();
+        self.add(base, list.len() as u64, sum, list.iter().map(|&d| d.into()));
     }
 
     /// Adds every document of a bitmap whose bit 0 is document `base`.
     fn add_bits(&mut self, bits: &[u64], base: u32) {
-        for (i, &word) in bits.iter().enumerate() {
-            let mut rest = word;
-            while self.kept < 10 && rest != 0 {
-                self.ten[self.kept as usize] = base + 64 * i as u32 + rest.trailing_zeros();
-                self.kept += 1;
-                rest &= rest - 1;
-            }
-            if self.kept == 10 {
-                break;
-            }
-        }
         let (count, sum) = count_and_sum(bits);
-        self.count += count as u32;
-        self.sum += count * u64::from(base) + sum;
+        let ids = bits.iter().enumerate().flat_map(|(i, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                let bit = rest.trailing_zeros(); // 64 when nothing is left
+                (bit < 64).then(|| {
+                    rest &= rest - 1;
+                    64 * i as u32 + bit
+                })
+            })
+        });
+        self.add(base, count, sum, ids);
     }
 
     /// Appends the output line (spec 4).
     pub fn write(&self, out: &mut Vec<u8>) {
         // At most 12 numbers of up to 20 digits, each with a space or the LF.
         let (mut line, mut at) = ([0u8; 12 * 21], 0);
-        let ten = self.ten[..self.kept as usize].iter().map(|&i| i.into());
+        let ten = self.ten.iter().take(self.count as usize).map(|&i| i.into());
         for v in [u64::from(self.count), self.sum].into_iter().chain(ten) {
             at = put(&mut line, at, v);
             line[at] = b' ';
@@ -583,21 +549,16 @@ fn count_and_sum(bits: &[u64]) -> (u64, u64) {
 /// without the formatting machinery; returns where they end.
 fn put(line: &mut [u8], at: usize, mut v: u64) -> usize {
     /// `PAIRS[2i..2i + 2]`: the two digits of i.
-    const PAIRS: [u8; 200] = {
-        let (mut t, mut i) = ([0; 200], 0);
-        while i < 100 {
-            (t[2 * i], t[2 * i + 1]) = (b'0' + i as u8 / 10, b'0' + i as u8 % 10);
-            i += 1;
-        }
-        t
-    };
+    const PAIRS: &[u8; 200] =
+        b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
     let (mut digits, mut from) = ([0u8; 20], 20);
     while v >= 10 {
         let pair = 2 * (v % 100) as usize;
         (from, v) = (from - 2, v / 100);
         digits[from..from + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
     }
-    // A last digit (the first pair taken is never one with a leading zero).
+    // A top digit when the number of digits is odd (or v was 0). When it is
+    // even, the last pair taken is the top two digits, so has no leading zero.
     if v > 0 || from == 20 {
         from -= 1;
         digits[from] = b'0' + v as u8;

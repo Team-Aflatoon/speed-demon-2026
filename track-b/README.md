@@ -6,19 +6,33 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Result
 
-Board, v11 (commit 9e6a7d5, PERF.md step 23): **92.3 ms, 38.4 MB, K 35.39, 77.44 points**
-(run-39e71acbc73a); a second run, run-98ab40bbff0b, gave 91.4 ms, 38.1 MB, K 35.56, 77.55
-points. S 1,531, D 1 (no crates). That is about 610 times faster than the reference (56.35 s)
-in about a fifty-seventh of its memory (2,200 MB).
+Final: v13 (S 1,491, D 1, no crates). Board: run-12996e3a24f3 gave 88.5 ms, 38.3 MB, K 36.28 and run-3d4480a45f74 gave 95.7 ms, 38.1 MB, K 34.89; the v12 production runs in the same two sessions took 88.8 and 89.8 ms, so v13 tied once and was 6.6% slower once (v12's own runs span 87.3 to 99.0 ms). The box shows no speed gain from the size cut; the gain is in S. The step before it, v12, ran on the
+board at 88.9 ms, 37.7 MB, K 36.03, 77.83 points (run-fe126b463988); a second run on a busy box,
+run-98bc3fd89798, gave 99.0 ms, K 34.12. In three paired sessions v12 beat v11 by 3.6% (mean
+89.2 against 92.5 ms, faster in 3 of 3 pairs). That is about 630 times faster than the
+reference (56.35 s) in about a fifty-eighth of its memory (2,200 MB).
 
-v11 is v8 (91.2 and 90.7 ms, K 35.30 and 35.40, S 1,618; run-9678ee16f487 and
-run-1bab1a0031d4) with 87 fewer lines and the same speed: cachegrind instructions -0.13%,
-branch mispredicts +0.8%. v8 is v6 with finer bitmaps (terms in more than 1/64 of a segment's
-documents), 14 MB segments and a two-stage eval prefetch. v6 is v5.1 (113.6 ms, K 31.43,
-run-438bfabbceeb) with cheaper inner loops and 25% fewer instructions (95.2 ms, K 34.17,
-run-46aaabc13772). The design underneath is v4's, with v5's much cheaper per-token scan
-(v4.2 took 186.0-192.3 ms at 36.1-36.6 MB, K 25.1-25.5); the output is byte-identical to
-v4.2's. The steps that got here, including the builds we rejected, are in [PERF.md](PERF.md).
+What the last two steps are:
+
+- **v13** is v12 with a behaviour-preserving size cut: S 1,540 to 1,491 (1,531 to 1,482 without the
+  huge-page table), cachegrind instructions -1.2% (4,066.5 M to 4,018.9 M), branch mispredicts
+  16.08 M to 15.21 M, output identical. `Answer` has one shared add path, evaluator steps are
+  `(operator, term)` pairs, the prefetch pair is one function, and the counting sort uses the list
+  bounds as its cursors. Some of these ideas come from the public AVENGERS and Cache Me entries
+  (see PERF.md), written here in our own code.
+- **v12** is v11 with the term table on 2 MiB huge pages: mapped 2 MiB aligned, advised for huge
+  pages and populated by the main thread before transparent huge pages are switched off for the
+  rest of the process. Every token probes this table, and on 4 KiB pages the probes missed the
+  TLB. Our earlier huge-page test (PERF.md step 18) did nothing because our own `PR_SET_THP_DISABLE`
+  rule had switched huge pages off for the whole process.
+- **v11** is v8 (91.2 and 90.7 ms, K 35.30 and 35.40, S 1,618; run-9678ee16f487 and
+  run-1bab1a0031d4) with 87 fewer lines and the same speed (board 92.3 and 91.4 ms, run-39e71acbc73a
+  and run-98ab40bbff0b). v8 is v6 with finer bitmaps (terms in more than 1/64 of a segment's
+  documents), 14 MB segments and a two-stage eval prefetch. v6 is v5.1 (113.6 ms, K 31.43,
+  run-438bfabbceeb) with cheaper inner loops and 25% fewer instructions (95.2 ms, K 34.17,
+  run-46aaabc13772). The design underneath is v4's, with v5's much cheaper per-token scan
+  (v4.2 took 186.0-192.3 ms at 36.1-36.6 MB, K 25.1-25.5); the output is byte-identical to
+  v4.2's. The steps that got here, including the builds we rejected, are in [PERF.md](PERF.md).
 
 | File | What it holds |
 |---|---|
@@ -33,19 +47,34 @@ v4.2's. The steps that got here, including the builds we rejected, are in [PERF.
 ## Approach
 
 The queries are part of the input, so the program reads `queries.txt` first and indexes
-only its terms. Twelve threads parse line-aligned ranges of `queries.txt` while the main thread makes the
-table, then insert every word into one open-addressing hash table at the same time. The table is made of buckets of three
-slots, each bucket one 64-byte cache line (three 16-byte keys and four 32-bit values). A thread
-claims an empty slot with a compare-and-swap on the first word of its key, so no locks are
-needed. A term's value holds its id (22 bits), how many query words are the term (7 bits,
-saturating at 63) and two flags: the term appears in a BOOL query; the term anchors a phrase.
-Ids are block-dense: each thread takes 1,024 at a time from a shared counter and hands them out
-in order, so an id costs no shared counter per term and each thread leaves at most one block
-partly unused. The table has a slot for every query word (the bucket count is the word count
-over three, rounded up to a power of two, and at least 1,024), so it can never fill up,
-whatever the input; on seed 1 it is 4 MiB (152,904 query words, so 50,968 buckets rounded up to 65,536, 64 bytes each). The buckets come from `mmap(MAP_POPULATE)`, which
-the kernel maps and zeroes in one go; the per-id arrays are plain anonymous mappings, faulted in
-only where ids are.
+only its terms. The main thread maps the file, counts its words and makes the term table
+alone, before any worker exists (see Start-up); then twelve threads parse line-aligned ranges of
+`queries.txt` and insert every word into the table at the same time. The table is open
+addressing over buckets of three slots, each bucket one 64-byte cache line (three 16-byte keys
+and four 32-bit values). A thread claims an empty slot with a compare-and-swap on the first word
+of its key, so no locks are needed. A term's value holds its id (22 bits), how many query words
+are the term (7 bits, saturating at 63) and one flag: the term anchors a phrase (whether it is
+in a BOOL query is a byte in a per-id array). Ids are block-dense: each thread takes 1,024 at a
+time from a shared counter and hands them out in order, so an id costs no shared counter per
+term and each thread leaves at most one block partly unused.
+
+**Table size.** There is a slot for every query word: the bucket count is the word count over
+three, rounded up to a power of two (at least 1,024), so the table can never fill up, whatever
+the input. On seed 1 there are 152,904 query words (75,747 distinct terms), so 50,968 buckets
+rounded up to 65,536, 64 bytes each: 4 MiB, exactly two 2 MiB huge pages, with 38% of the slots
+used. 2,341 buckets (3.6%) are full and marked `OVERFLOW`, and 430,000 of the scan's 36.3 M tokens
+(1.2%, measured with a temporary counter) land in one and take the slow path. Any input of 98,305
+to 196,608 words gets the same size.
+
+**Huge pages.** The buckets come from one anonymous `mmap`, rounded to a 2 MiB boundary, then
+`madvise(MADV_HUGEPAGE)` and `madvise(MADV_POPULATE_WRITE)`: the kernel maps and zeroes all of it in
+one call, far cheaper than twelve threads faulting it in a page at a time, and, where it grants huge
+pages, the table needs two TLB entries instead of 1,024. Right after the table is made, `main` calls
+`prctl(PR_SET_THP_DISABLE)`, which switches transparent huge pages off for the rest of the
+process, so partly used 2 MB heap regions are not backed (and counted in the memory peak) as whole
+huge pages. Both calls are hints: if the kernel grants no huge pages, or lacks
+`MADV_POPULATE_WRITE` (before Linux 5.14), the table is the same with 4 KiB pages. The per-id arrays
+are plain anonymous mappings, faulted in only where ids are.
 
 **Term keys and the probe.** A token of up to 16 bytes is its own key: its bytes `| 0x20`
 (which lowercases letters and leaves digits alone), zero padded, so no two tokens share a key.
@@ -103,10 +132,14 @@ a document at a time.
 0 within a segment as `u16`. The scan of each 512 KB chunk leaves its documents' distinct BOOL
 terms as `doc << 16 | id / 64` in 64 streams, chosen by `id % 64`. One build task per stream
 counting-sorts it into a sorted list per term and adds a bitmap for terms found in more than 1/64
-of the segment's documents. Everything a build task touches is about 160 KB on seed 1: its partition's 75 KB of
-stream, 37 KB of lists, 31 KB of three per-term arrays and 21 KB of bitmaps.
+of the segment's documents. Everything a build task touches is about 155 KB on seed 1: its partition's 75 KB of
+stream, 37 KB of lists, about 21 KB of two per-term arrays (list bounds, bitmap index) and 21 KB of
+bitmaps. The counting sort moves the list bounds themselves as its cursors and shifts them back
+afterwards, so it needs no cursor array.
 
-**BOOL queries** are answered once per segment, strictly left to right. The first term's set
+**BOOL queries** are answered once per segment, strictly left to right. A query is skipped for
+a segment where it provably matches nothing: a term ANDed after the last OR has no documents there,
+or none of its ORed terms does. The first term's set
 is borrowed until a second set has to be combined with it. AND and NOT against a dense term
 test its bitmap. Between two lists, one is spread into a small bitmap and the other tested
 against it, which is about three times faster than a merge (whose steps depend on each
@@ -125,17 +158,20 @@ on `PAUSE` (which leaves the core to the other hardware thread) and then yieldin
 are double buffered by segment parity, so threads go on scanning the next segment while the
 last one is built and answered, and no thread idles at a phase boundary.
 
-**Start-up.** The workers are started first, and parse their share of `queries.txt` while the
-main thread makes the table (sized from a count of the query words) and then plans the
-segments (line starts found with a few small reads); the workers then insert their words and,
-after a barrier, choose the phrase anchors. `queries.txt` is mapped read-only (`MAP_POPULATE`,
-over a zeroed page that supplies the padding), so there is no copy into a buffer; the per-term
-use count lives in the term's value word, so there is no shared per-id frequency array for the
-threads to fight over. A worker's scratch is not freed at exit, because each unmap would flush
+**Start-up.** `main` maps `queries.txt` read-only (`MAP_POPULATE`, over a zeroed page that
+supplies the padding), so there is no copy into a buffer, counts its words, makes the table
+with its huge pages and only then calls `prctl`. After that it starts the twelve workers. They
+parse their ranges, insert their words and, after a barrier, choose the phrase anchors, while the main
+thread plans the segments (line starts found with a few small reads); a second barrier makes every
+worker's queries visible to the others before the first scan. (`Setup` still holds the table in a
+`OnceLock` that `run` waits on; since `make_table` runs before the workers exist the wait returns
+at once, a remnant of an earlier order in which workers parsed while the table was made.) The
+per-term use count lives in the term's value word, so there is no shared per-id frequency array for
+the threads to fight over. A worker's scratch is not freed at exit, because each unmap would flush
 every core's TLB and the process is about to end.
 
 An input the program cannot handle ends the run with a message on stderr and a non-zero
-status (see Errors). `unsafe` appears only in the hand-declared `prctl` and `mmap`, the prefetch
+status (see Errors). `unsafe` appears only in the hand-declared `prctl`, `madvise` and `mmap`, the prefetch
 hints, and the SIMD and unchecked accesses of the table probe and the token loop, each with a
 `SAFETY` note.
 
@@ -180,20 +216,28 @@ shrink constants to take every boundary path: `PIECE` (scan.rs) to 1 KB, `CHUNK_
 `SEGMENT_BYTES` (main.rs) to 4 KB and 64 KB, and `BATCH` (scan.rs) to 3 tokens; `PIECE` to 4 KB
 with `MAX_SEGMENT_DOCS` (scan.rs) cut to 100; and `PIECE` of 1 KB with 1-token batches. A fourth
 build whose hash takes only 8 values, so every bucket overflows into long chains, passes the 23
-cases. Seed 1 was run 300 times in one container with no differing output. From v7 the gate also runs `valgrind --tool=none --fair-sched=yes` (5 runs on 30 MB and the 46 fuzz runs): it reproduces a lock-order deadlock between the two format tasks of a range that native runs almost never hit (PERF.md step 19).
+cases. Seed 1 was run 300 times in one container with no differing output. v13 (the final build) passes the 23 cases and seeds 1 and 7 byte for byte, the 23 cases also in the three stress builds and the 8-value-hash build, and seed 1 in two of the stress builds. From v7 the gate also runs `valgrind --tool=none --fair-sched=yes` (5 runs on 30 MB and the 46 fuzz runs): it reproduces a lock-order deadlock between the two format tasks of a range that native runs almost never hit (PERF.md step 19).
 
 ## Dependencies
 
-None. The Rust standard library only. `prctl` and `mmap` are declared by hand with
+None. The Rust standard library only. `prctl`, `madvise` and `mmap` are declared by hand with
 `extern "C"`. The build needs AVX2 (`.cargo/config.toml` sets `x86-64-v3`, which also gives the
 BMI2 and CRC-32C instructions the probe uses) and refuses to compile without it, and links the
 binary statically so that a run never pays for the dynamic loader.
 
 ## With another 24 hours
 
-- The start-up before the scan can begin is about 4.3 to 4.8 ms of wall time locally (instrumented): two barriers, a table filled by
-  all threads, and the inserts' cache misses (prefetching ahead made no difference). Letting the first scan tasks read and lex the corpus (which needs no table)
-  while the table is filled would hide most of it.
+- The start-up before the first scan is still about 4.4 to 4.7 ms locally (instrumented): two
+  barriers, a table filled by all threads, and the inserts' cache misses. It is bound by twelve
+  threads contending on the same table lines and page faults while they parse and insert, not
+  by spawning them: a variant that started the workers first (`experiment/b-startup`,
+  dropped) started the first worker earlier but not the first scan, cost 36 lines of S, and conflicted with building
+  the huge-page table on the main thread first. Letting the first scan tasks read and lex the
+  corpus (which needs no table) while the table is filled would hide most of it, and is the
+  one start-up idea we did not try.
+- We never measured Track B's phases on the box, only locally; where the 21 to 25 ms between our
+  89 ms and the leaders' 64-68 ms goes there is a guess from instruction counts (lookup 35%,
+  finish 15%, lex 14%, PERF.md), and no single idea we found closes it.
 - CPU time is about 60% scan, 25% eval and 10% build (v6, local), and eval's cost is mostly
   the glue of each query-segment pair (about 250 instructions a pair in `run` itself, PERF.md
   step 20); no single piece is large any more, so the next gains are in several small ones,
