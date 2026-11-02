@@ -30,6 +30,10 @@ const WINDOW: usize = 4096;
 /// bytes a record (a window with more takes several batches).
 const BATCH: usize = 128;
 
+/// Bits in a group's row of the matrix, so a pair's bit is `group * ROW_BITS
+/// + id` (see `Table`).
+const ROW_BITS: usize = ROW * 64;
+
 /// A result, or the buffer offset near which the bytes break the grammar
 /// (or a chunk did not start and end at record boundaries).
 pub type Res<T> = Result<T, usize>;
@@ -40,6 +44,9 @@ pub type Res<T> = Result<T, usize>;
 /// the records and distinct names together, `records << 32 | distinct`, so
 /// that one add counts a record and one more a new pair. `text` sums both
 /// text fields' unescaped lengths; note bytes are it minus name bytes.
+///
+/// Key: `[0]` id sum, `[1]` amount sum (cents), `[2]` text bytes, `[3]` min
+/// amount, `[4]` max amount, `[5]` name bytes, `[6]` records << 32 | distinct.
 pub type Agg = [i64; 7];
 pub const EMPTY: Agg = [0, 0, 0, i64::MAX, i64::MIN, 0, 0];
 
@@ -52,14 +59,12 @@ pub fn merge(a: &mut Agg, b: &Agg) {
 
 /// A record parsed and waiting for its join: its name's key, its region id,
 /// and its id, amount in cents, text bytes and name bytes (see `Agg`). The
-/// join's first loop reuses `region` for the group and the pair's bit
-/// (`group << 8 | bit`) and sets `word` to the pair's word of the matrix,
-/// for the second. 48 bytes.
+/// join's first loop reuses `region` for the pair's bit in the matrix
+/// (`group * ROW_BITS + id`), for the second. 48 bytes.
 #[derive(Clone, Copy, Default)]
 struct Record {
     key: Key,
     region: u32,
-    word: u32,
     nums: [i64; 4],
 }
 
@@ -69,9 +74,15 @@ pub type Span = (usize, usize);
 /// What the record loops read: the name table, the chunk's buffer, and per
 /// 64-byte block of the buffer the quotes in the chunk before it and its
 /// quote mask (see `quotes_before`).
+///
+/// Key: `.0` the name table, `.1` the chunk's buffer, `.2` per 64-byte block
+/// `[quote bytes before the block, its quote mask]`.
 type Ctx<'a> = (&'a Table, &'a [u8], &'a [[u64; 2]]);
 
 /// Where a record starts, and the quotes in the chunk before it.
+///
+/// Key: `.0` the record's start offset in the buffer, `.1` the quote bytes
+/// before it in the chunk.
 type At = (usize, u64);
 
 /// What a worker owns: the tables it joins against (the name table and the
@@ -170,8 +181,11 @@ impl Parser {
 /// in a block `scan` has been through.
 fn quotes_before(quotes: &[[u64; 2]], p: usize) -> u64 {
     debug_assert!(p / 64 < quotes.len());
-    // SAFETY: as above; and BMI2 is part of x86-64-v3, which the whole crate
-    // is compiled for (see `masks`).
+    // SAFETY: `p / 64 < quotes.len()`. Every `p` here is the offset of a
+    // separator that `scan` listed, so `scan` went through its block, and it
+    // is at most the chunk's `end` (the added LF included), while
+    // `Parser::chunk` sized `quotes` to `end / 64 + 2` blocks. BMI2 is part
+    // of x86-64-v3, which the whole crate is compiled for (see `masks`).
     let [before, mask] = *unsafe { quotes.get_unchecked(p / 64) };
     before + u64::from(unsafe { _bzhi_u64(mask, (p % 64) as u32) }.count_ones())
 }
@@ -182,6 +196,7 @@ fn quotes_before(quotes: &[[u64; 2]], p: usize) -> u64 {
 /// record starts, and the quotes before it.
 #[inline(never)]
 fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> Res<At> {
+    // `c` is the `Ctx`: `c.1` the buffer, `c.2` the per-block quotes.
     let (mut s, mut quotes_before_s) = at;
     for (seps, f) in seps.chunks_exact(5).zip(out) {
         let [c0, c1, c2, c3, e] = [0, 1, 2, 3, 4].map(|j| seps[j] as usize);
@@ -192,6 +207,7 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
         let quotes = quotes_before(c.2, e);
         // The quotes in the record, and in its name's field.
         let q = [quotes, quotes_before(c.2, c1)].map(|q| (q - quotes_before_s) as u32);
+        // A `Rec`: see its key.
         let rec = (s, [c0, c1, c2, c3, e], q);
         fields(f, c, rec).or_else(|| slow(f, c, rec)).ok_or(s)?;
         crate::prefetch(map, f.region as usize);
@@ -212,31 +228,50 @@ fn parse(c: Ctx, map: &[AtomicU8], seps: &[u32], out: &mut [Record], at: At) -> 
 #[inline(never)]
 fn join((table, _, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut Local) {
     for f in records.iter_mut() {
-        // SAFETY: the map has at least one entry (regions sized it).
+        // SAFETY: `entry` is at most `map.len() - 1`, and the map has at least
+        // one entry (regions sized it).
         let entry = (f.region as usize).min(map.len() - 1);
         let group = unsafe { map.get_unchecked(entry) }.load(Relaxed);
         let [id, cents, text, name] = f.nums;
         let agg = &mut out.aggs[usize::from(group)];
-        merge(agg, &[id, cents, text, cents, cents, name, 1 << 32]);
+        // One record added to its group's `Agg` (`1 << 32` is a record in the
+        // high half of `[6]`). The extremes rarely change, so each is a
+        // well-predicted branch, cheaper than a select and a store.
+        (agg[0], agg[1], agg[2]) = (agg[0] + id, agg[1] + cents, agg[2] + text);
+        (agg[5], agg[6]) = (agg[5] + name, agg[6] + (1 << 32));
+        if cents < agg[3] {
+            agg[3] = cents;
+        }
+        if cents > agg[4] {
+            agg[4] = cents;
+        }
         let id = table.find(f.key, &mut out.ids);
-        let word = usize::from(group) * ROW + id / 64;
-        crate::prefetch_write(table.bits, word);
-        (f.word, f.region) = (word as u32, (id % 64) as u32 | u32::from(group) << 8);
+        let pair = usize::from(group) * ROW_BITS + id;
+        crate::prefetch_write(table.bits, pair / 64);
+        f.region = pair as u32;
     }
     for f in records.iter() {
-        let bit = 1u64 << (f.region & 63);
-        // SAFETY: `word` is below `GROUPS * ROW`.
-        let word = unsafe { table.bits.get_unchecked(f.word as usize) };
+        let pair = f.region as usize;
+        let bit = 1u64 << (pair % 64);
+        // SAFETY: `pair / 64` is below `MATRIX_ROWS * ROW`, the length of `bits`:
+        // the group is below `MATRIX_ROWS` (`Regions::group_of` stops at 241) and `id`
+        // below `ROW_BITS`.
+        let word = unsafe { table.bits.get_unchecked(pair / 64) };
         // As a branch, not an add of the flag: only then does LLVM turn the
         // OR and the test into `lock bts`, not a compare-and-swap loop.
         if word.fetch_or(bit, Relaxed) & bit == 0 {
-            out.aggs[(f.region >> 8) as usize][6] += 1;
+            // `[6]` is `records << 32 | distinct`: this adds to `distinct`.
+            out.aggs[pair / ROW_BITS][6] += 1;
         }
     }
 }
 
 /// A record: where it starts, its four commas and terminator, and the quote
 /// bytes in it and in its name's field.
+///
+/// Key: `.0` the start offset, `.1` the offsets of the commas after the id,
+/// name, note and region id, then of the terminator (`[c0, c1, c2, c3, e]`),
+/// `.2` `[quote bytes in the record, quote bytes in its id and name fields]`.
 type Rec = (usize, [usize; 5], [u32; 2]);
 
 /// Parses into `f` record `r`, if it takes the common form: an id and region
@@ -346,7 +381,12 @@ fn flatten(seps: &mut [u32], n: usize, mut mask: u64, o: u32) -> usize {
     debug_assert!(n + 64 <= seps.len());
     let count = mask.count_ones() as usize;
     let mut sep = |i: usize, mask: u64| {
-        // SAFETY: as above.
+        // SAFETY: `i < n + max(7, count) <= WINDOW + 128 = seps.len()`. A
+        // window holds at most 65 blocks (the added LF can open one more), a
+        // byte is at most one separator, and `Parser::chunk` carries at most
+        // four over from the last window, so before block k of a window
+        // `n <= 4 + 64 k <= 4100`; then `n + 7 <= 4107` and
+        // `n + count <= 4 + 64 (k + 1) <= 4164`, both under 4224.
         *unsafe { seps.get_unchecked_mut(i) } = o + mask.trailing_zeros();
         mask & mask.wrapping_sub(1)
     };
@@ -375,11 +415,12 @@ unsafe fn load(b: &[u8], p: usize) -> u64 {
 /// The values of an id, a region id and an amount (in cents), given the
 /// words at their fields' starts and their lengths in bytes, or `None` if
 /// any byte is not a digit or a length is out of range: 1 to 8, and the
-/// amount's 4 to 8 (with its dot third from last). Each field is shifted to the top of its word, the bytes
-/// after it falling off and zeros (as digits) coming in below it; then
-/// adjacent digits combine into pairs, the pairs into fours, the fours
-/// into eight. The amount's dot is masked out and weighs nothing, and its
-/// last two digits are cents, so its top four digits weigh 1,000 x.
+/// amount's 4 to 8 (with its dot third from last). Each field is shifted to
+/// the top of its word, the bytes after it falling off and zeros (as digits)
+/// coming in below it; then adjacent digits combine into pairs, the pairs
+/// into fours, the fours into eight. The amount's dot is masked out and
+/// weighs nothing, and its last two digits are cents, so its top four digits
+/// weigh 1,000 x.
 fn digits(words: [u64; 3], lens: [usize; 3]) -> Option<[u64; 3]> {
     const DOT: i64 = !(0xFF << 40);
     // SAFETY: plain AVX2 arithmetic on locals; the whole crate is compiled
