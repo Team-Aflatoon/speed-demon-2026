@@ -34,7 +34,7 @@
 //! order exactly one OR finds a given bit clear, so each (group, id) pair is
 //! counted once.
 //!
-//! The plain AVX2 load. The one place that relies on the hardware, not on
+//! Plain vector loads of atomics: the one place that relies on the hardware, not on
 //! Rust's memory model, is the fast path of `Table::find`: it reads a line's
 //! eight `AtomicU64` slots with two 32-byte vector loads, which Rust counts
 //! as plain reads racing with the compare-and-swaps that fill the slots. It
@@ -182,7 +182,9 @@ impl Table {
         }
         // The slot read whole and atomically: a hit is already final.
         let lane = at + hits.trailing_zeros() as usize;
-        // SAFETY: a lane of the bucket's line, which is within the table.
+        // SAFETY: `hits` is an 8-bit mask, so `lane < at + 8`, and `at` is 8 times
+        // the bucket index (below `BUCKETS`), at most `8 * BUCKETS - 8`: a lane of
+        // the bucket's line, inside `slots`.
         let slot = unsafe { self.slots.get_unchecked(lane) }.load(Relaxed);
         (slot & (DENSE as u64 - 1)) as usize - 1
     }

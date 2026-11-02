@@ -234,9 +234,10 @@ fn join((table, _, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut 
         let group = unsafe { map.get_unchecked(entry) }.load(Relaxed);
         let [id, cents, text, name] = f.nums;
         let agg = &mut out.aggs[usize::from(group)];
-        // One record added to its group's `Agg` (`1 << 32` is a record in the
-        // high half of `[6]`). The extremes rarely change, so each is a
-        // well-predicted branch, cheaper than a select and a store.
+        // One record added to its group's `Agg`: the arithmetic of `merge`,
+        // unrolled (`1 << 32` is a record in the high half of `[6]`). The
+        // extremes rarely change, so each is a well-predicted branch, cheaper
+        // than a select and a store.
         (agg[0], agg[1], agg[2]) = (agg[0] + id, agg[1] + cents, agg[2] + text);
         (agg[5], agg[6]) = (agg[5] + name, agg[6] + (1 << 32));
         if cents < agg[3] {
@@ -254,7 +255,10 @@ fn join((table, _, _): Ctx, map: &[AtomicU8], records: &mut [Record], out: &mut 
         let pair = f.region as usize;
         let bit = 1u64 << (pair % 64);
         // SAFETY: `pair / 64` is below `GROUPS * ROW`, the length of `bits`:
-        // the group is below `GROUPS` (a `u8`) and `id` below `ROW_BITS`.
+        // the group is a `u8`, below `GROUPS` (256), and `id` is below
+        // `ROW_BITS` (= DENSE, 2^17), because `Table::insert` dies once the next
+        // id block would pass DENSE - 1. So `pair` is below 2^25 and also fits
+        // the `u32` in `f.region`.
         let word = unsafe { table.bits.get_unchecked(pair / 64) };
         // As a branch, not an add of the flag: only then does LLVM turn the
         // OR and the test into `lock bts`, not a compare-and-swap loop.

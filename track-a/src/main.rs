@@ -542,7 +542,9 @@ fn percentiles(v: &mut [u32], spare: &mut [u32]) -> [u32; 3] {
         return p;
     }
     // Radix select: five cheap passes over the group, about 10 instructions a value in all,
-    // where three quickselects took about 25.
+    // where three quickselects took about 25. The keys rise with the values, so the bins are
+    // ordered value ranges and the selections inside them are exact; float precision only
+    // moves bin edges.
     // Each value gets a key that rises with it: the exponent and top `mant` mantissa bits
     // of its float (of x / 2, which converts as a signed int), so a bin spans about
     // 2^-mant of its values whatever their scale; the latencies are spread over decades,
@@ -558,6 +560,7 @@ fn percentiles(v: &mut [u32], spare: &mut [u32]) -> [u32; 3] {
             (((x >> 1) as i32 as f32).to_bits() >> (23 - mant)).max(127 << mant) - (127 << mant);
         (*k, lo, hi) = (key, lo.min(key), hi.max(key));
     }
+    // `% BINS` never wraps (keys are below `BINS`); it only lets LLVM drop the bounds check.
     keys.iter().for_each(|&k| hist[k as usize % BINS] += 1);
     // The bin of each rank and the rank within it: one scan, as the ranks rise.
     let (mut bin, mut below) = (lo as usize, 0);
